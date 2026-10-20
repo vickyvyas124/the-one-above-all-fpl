@@ -109,15 +109,38 @@ def estimate_points(p, team, fixtures, horizon=5):
 
 st.markdown("""
 <style>
-.block-container {padding-top: 1.5rem; padding-bottom: 2rem; max-width: 1500px;}
+.block-container {padding-top: 1.25rem; padding-bottom: 2rem; max-width: 1600px;}
 [data-testid="stSidebar"] {background: linear-gradient(180deg,#101b35 0%,#182746 100%);}
-[data-testid="stSidebar"] * {color: #f3f6ff !important;}
-.hero {padding: 1.35rem 1.5rem; border-radius: 18px; background: linear-gradient(115deg,#101b35 0%,#244b78 58%,#2d8a78 100%); color: white; margin-bottom: 1rem;}
-.hero h1 {color: white; margin: 0; font-size: 2rem;}
-.hero p {color: #dce9ff; margin: .45rem 0 0 0;}
-.kpi {padding: 1rem; border: 1px solid #e5eaf2; border-radius: 14px; background: #fff; box-shadow: 0 2px 8px rgba(16,27,53,.04);}
-.section-label {font-size: .85rem; text-transform: uppercase; letter-spacing: .08em; color: #64748b;}
-div[data-testid="stDataFrame"] {border-radius: 12px; overflow: hidden;}
+[data-testid="stSidebar"] h1,
+[data-testid="stSidebar"] h2,
+[data-testid="stSidebar"] h3,
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] .stMarkdown,
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] {color:#f3f6ff !important;}
+
+/* Critical readability fix: keep editable values dark on white controls. */
+[data-testid="stSidebar"] input,
+[data-testid="stSidebar"] textarea,
+[data-testid="stSidebar"] [data-baseweb="select"] div,
+[data-testid="stSidebar"] [data-baseweb="input"] input,
+[data-testid="stSidebar"] [data-testid="stNumberInput"] input {
+  color:#172033 !important;
+  -webkit-text-fill-color:#172033 !important;
+  background-color:#ffffff !important;
+  opacity:1 !important;
+}
+[data-testid="stSidebar"] [data-testid="stNumberInput"] button,
+[data-testid="stSidebar"] [data-baseweb="select"] svg {color:#172033 !important; fill:#172033 !important;}
+[data-testid="stSidebar"] [data-testid="stSlider"] [data-testid="stMarkdownContainer"] p {color:#f3f6ff !important;}
+[data-testid="stSidebar"] [data-testid="stCheckbox"] label,
+[data-testid="stSidebar"] [data-testid="stCheckbox"] p {color:#f3f6ff !important;}
+.hero {padding:1.35rem 1.5rem; border-radius:18px; background:linear-gradient(115deg,#101b35 0%,#244b78 58%,#2d8a78 100%); color:white; margin-bottom:1rem;}
+.hero h1 {color:white; margin:0; font-size:2rem;}
+.hero p {color:#dce9ff; margin:.45rem 0 0 0;}
+div[data-testid="stMetric"] {padding:1rem; border:1px solid #e5eaf2; border-radius:14px; background:#fff; box-shadow:0 2px 8px rgba(16,27,53,.04);}
+div[data-testid="stDataFrame"] {border:1px solid #e5eaf2; border-radius:12px; overflow:hidden;}
+h2, h3 {letter-spacing:-.02em;}
 </style>
 <div class="hero">
   <h1>⚽ The-One-Above-All</h1>
@@ -216,6 +239,7 @@ else:
     st.error("No squad names could be matched. Update the name aliases in RECORDED_SQUAD.")
 
 st.subheader("Transfer comparison")
+st.caption("Team ID: 2311669 • Use the settings panel to change team, horizon, bank, transfer count, hit allowance and risk preference.")
 st.write("Choose a player to sell and compare with an affordable replacement at the same position. Budget uses current public price as a rough estimate; actual FPL selling prices may differ.")
 if resolved:
     df = pd.DataFrame(resolved)
@@ -249,24 +273,55 @@ if resolved:
     options["Hit cost"] = 4 if transfer_hit else 0
     options["Projected gain"] = options["Raw gain"] - options["Hit cost"]
     # Risk setting affects the ranking, not the raw point projection.
-    ownership = options["Selected (%)"].fillna(0).astype(float)
-    minutes_reliability = (options["Minutes"].astype(float) / 900.0).clip(0, 1)
-    differential_bonus = (1.0 / (1.0 + ownership)) * (1.0 - ownership.clip(0,100) / 100.0)
+    ownership = options["Selected (%)"].fillna(0).astype(float).clip(0, 100)
+    # Reliability is deliberately stronger than in v1.3: fewer than 300 minutes
+    # should materially reduce confidence in a transfer recommendation.
+    minutes_reliability = (options["Minutes"].astype(float) / 600.0).clip(0.15, 1.0)
+    unknown_status = options["Chance (%)"].isna()
+    doubtful = options["Status"].astype(str).str.lower().eq("d")
+    availability_reliability = pd.Series(1.0, index=options.index)
+    availability_reliability.loc[unknown_status] = 0.88
+    availability_reliability.loc[doubtful] = 0.60
+    unavailable = options["Status"].astype(str).str.lower().isin(["i", "s", "u"])
+    availability_reliability.loc[unavailable] = 0.20
+
+    # Differential upside is capped: low ownership alone must never dominate the model.
+    differential_bonus = (1.0 - ownership.clip(0, 10) / 10.0).clip(0, 1)
+    xgi90 = (options["xG/90"].fillna(0).astype(float) +
+             options["xA/90"].fillna(0).astype(float)).clip(0, 0.8)
+    attacking_bonus = xgi90 / 0.8  # 0..1, based on current public xG/xA fields
+
     if risk == "Conservative":
-        options["Decision score"] = options["Projected gain"] * (0.65 + 0.35 * minutes_reliability)
+        # Strongly discounts low-minute/uncertain players; likely to prefer established minutes.
+        options["Decision score"] = options["Projected gain"] * minutes_reliability * availability_reliability
     elif risk == "Aggressive":
-        options["Decision score"] = options["Projected gain"] + 1.5 * differential_bonus
+        # Mostly preserves upside while giving an explicit bonus to low-owned, attacking differentials.
+        options["Decision score"] = (
+            options["Projected gain"]
+            - 0.15 * (1.0 - minutes_reliability) * options["Projected gain"].clip(lower=0)
+            - 0.25 * (1.0 - availability_reliability) * options["Projected gain"].clip(lower=0)
+            + 1.25 * differential_bonus
+            + 0.75 * attacking_bonus
+        )
     else:
-        options["Decision score"] = options["Projected gain"] + 0.5 * differential_bonus
+        # Moderately discounts uncertainty without discarding projected points.
+        options["Decision score"] = (
+            options["Projected gain"] * (0.45 + 0.55 * minutes_reliability)
+            * availability_reliability
+            + 0.45 * differential_bonus
+            + 0.25 * attacking_bonus
+        )
     options = options.sort_values(["Decision score","Projected gain","Minutes"], ascending=False).head(15)
     if options.empty:
         st.info("No affordable out-of-squad player candidates matched this position under the rough budget estimate.")
     else:
         st.caption(f"Approximate replacement ceiling: £{max_price:.1f}m, using current price + bank. Enter actual selling value separately in your final decision.")
-        st.caption(f"Ranking mode: {risk}. Horizon: {horizon} GWs. Hit penalty: {4 if transfer_hit else 0} points.")
-        st.dataframe(options[["Player","Club","Price (£m)","Form","PPG","Minutes","Status","Chance (%)","xG","xA","xG/90","xA/90",f"Projected {horizon}GW pts","Selected (%)","Projected gain","Decision score"]], use_container_width=True, hide_index=True)
+        st.caption(f"Ranking mode: {risk}. Horizon: {horizon} GWs. Hit penalty: {4 if transfer_hit else 0} points. Decision score now explicitly weights minutes reliability, availability, differential ownership and xG+xA/90.")
+        options["Minutes reliability (%)"] = (minutes_reliability * 100).round(0).astype(int)
+        options["Availability reliability (%)"] = (availability_reliability * 100).round(0).astype(int)
+        st.dataframe(options[["Player","Club","Price (£m)","Form","PPG","Minutes","Minutes reliability (%)","Status","Chance (%)","Availability reliability (%)","xG","xA","xG/90","xA/90",f"Projected {horizon}GW pts","Selected (%)","Projected gain","Decision score"]], use_container_width=True, hide_index=True)
         best=options.iloc[0]
-        st.success(f"Top candidate under {risk.lower()} settings: {best['Player']} ({best['Club']}) — projected gain {best['Projected gain']:+.1f} points over {horizon} GWs. Decision score includes your risk preference; it is not a guaranteed return.")
+        st.success(f"Top candidate under {risk.lower()} settings: {best['Player']} ({best['Club']}) — projected gain {best['Projected gain']:+.1f} points over {horizon} GWs. Decision score includes your risk preference, minutes and availability reliability, ownership and xG/xA signals; it is not a guaranteed return.")
         st.write("Decision rule: only transfer if the gain remains worthwhile after checking availability, actual selling price, expected minutes and the other 14 squad slots. A high projection alone is not a command to transfer.")
 
 st.subheader("What the model does — and does not do")
@@ -274,7 +329,7 @@ st.markdown("""
 - Blends PPG/form with a conservative xG+xA signal, shrinks small samples toward a position baseline, estimates minutes from starts and appearances, penalizes uncertain/unavailable status, and adjusts each scheduled fixture individually. Displays cumulative xG/xA and per-90 rates.
 - Uses public player status and chance-of-playing fields where provided.
 - Does **not** access your FPL password, private `my-team` endpoint, or your personal selling prices.
-- This v1.3 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
+- This v1.5 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
 - Public FPL API is unofficial/undocumented and may change. Data is cached for 30 minutes to reduce requests.
 """)
 st.caption(f"Last refreshed in this session: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. Use the app's refresh/reload to request fresh data.")
