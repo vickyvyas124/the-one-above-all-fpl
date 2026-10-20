@@ -49,36 +49,56 @@ def pos_name(p, types):
     return next((x.get("singular_name_short", "?") for x in types if x["id"] == p.get("element_type")), "?")
 
 def estimate_points(p, team, fixtures, horizon=5):
-    # Transparent baseline model, not an official prediction.
-    # Points-per-game and form are blended, then lightly adjusted for fixture difficulty.
+    # Conservative transparent heuristic, not an official FPL forecast.
     ppg = float(p.get("points_per_game") or 0)
     form = float(p.get("form") or 0)
     minutes = float(p.get("minutes") or 0)
-    mins_factor = min(1.0, minutes / max(1, (int(p.get("starts",0) or 0) * 80))) if p.get("starts") else min(1.0, minutes/450)
-    if minutes == 0:
-        mins_factor = 0.55
-    base = 0.6 * ppg + 0.4 * form
-    if base <= 0:
-        base = max(1.0, float(p.get("total_points") or 0) / max(1, int(p.get("starts",0) or 1)))
-    # Expected upcoming fixture difficulty average. FPL difficulty runs 1-5; neutral is 3.
-    upcoming = [f for f in fixtures if not f.get("finished") and (f.get("team_h") == p.get("team") or f.get("team_a") == p.get("team"))]
-    upcoming.sort(key=lambda f: f.get("event") or 99)
-    upcoming = [f for f in upcoming if f.get("event") is not None][:horizon]
-    if upcoming:
-        diffs=[]
-        for f in upcoming:
-            home = f.get("team_h") == p.get("team")
-            diffs.append(float(f.get("team_h_difficulty" if home else "team_a_difficulty") or 3))
-        avg_diff=sum(diffs)/len(diffs)
-        fixture_factor=max(0.78, min(1.22, 1.0 + (3.0-avg_diff)*0.07))
-    else:
-        avg_diff=3.0
-        fixture_factor=1.0
-    # Forecast per match, scaled by likely minutes and horizon; intentionally conservative.
-    per_match=max(0.0, base) * max(0.45, mins_factor) * fixture_factor
-    return round(per_match * len(upcoming or range(horizon)), 1), round(avg_diff, 2), len(upcoming)
+    starts = int(p.get("starts") or 0)
+    status = str(p.get("status") or "").lower()
+    chance = p.get("chance_of_playing_next_round")
+    pos = p.get("element_type")
+    baseline = {1: 3.2, 2: 3.5, 3: 3.8, 4: 4.0}.get(pos, 3.6)
 
-st.title("⚽ The-One-Above-All — FPL Optimizer")
+    # Shrink small samples toward a modest positional baseline.
+    raw = 0.65 * ppg + 0.35 * form
+    sample_weight = min(0.85, minutes / 900.0)
+    per_match = sample_weight * raw + (1.0 - sample_weight) * baseline
+
+    # Reliability penalty for limited minutes / starts.
+    if minutes <= 0:
+        minutes_factor = 0.45
+    else:
+        avg_minutes = minutes / max(1, starts)
+        minutes_factor = min(1.0, max(0.55, avg_minutes / 80.0))
+        if starts == 0:
+            minutes_factor = min(minutes_factor, 0.65)
+
+    # Missing availability probability is unknown, not guaranteed availability.
+    if status in {"i", "s", "u"}:
+        availability_factor = 0.25
+    elif status == "d":
+        availability_factor = 0.60
+    elif chance is not None:
+        availability_factor = max(0.25, min(1.0, float(chance) / 100.0))
+    else:
+        availability_factor = 0.90
+
+    upcoming = [f for f in fixtures if not f.get("finished")
+                and (f.get("team_h") == p.get("team") or f.get("team_a") == p.get("team"))]
+    upcoming.sort(key=lambda f: (f.get("event") or 99, f.get("kickoff_time") or ""))
+    upcoming = [f for f in upcoming if f.get("event") is not None][:horizon]
+    scores, diffs = [], []
+    for f in upcoming:
+        home = f.get("team_h") == p.get("team")
+        diff = float(f.get("team_h_difficulty" if home else "team_a_difficulty") or 3)
+        diffs.append(diff)
+        factor = max(0.82, min(1.16, 1.0 + (3.0 - diff) * 0.06))
+        scores.append(per_match * minutes_factor * availability_factor * factor)
+    if not scores:
+        return 0.0, 3.0, 0
+    return round(sum(scores), 1), round(sum(diffs) / len(diffs), 2), len(scores)
+
+st.title("⚽ The-One-Above-All — FPL Optimizer v1.1")
 st.caption("Free prototype • Team ID 2311669 • GW8 baseline recorded from your screenshots")
 st.warning("Forecasts are transparent estimates, not official FPL projections. Public endpoints may change; private squad data is not accessed. Confirm injuries and your actual selling prices before making a transfer.")
 
@@ -195,10 +215,10 @@ if resolved:
 
 st.subheader("What the model does — and does not do")
 st.markdown("""
-- Blends season points-per-game and current form (60/40), adjusts for expected minutes and average FPL fixture difficulty, and projects over the selected horizon.
+- Blends season points-per-game and form (65/35), shrinks small samples toward a position baseline, penalizes limited minutes and uncertain/unavailable status, and adjusts each scheduled fixture individually.
 - Uses public player status and chance-of-playing fields where provided.
 - Does **not** access your FPL password, private `my-team` endpoint, or your personal selling prices.
-- This v1 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
+- This v1.1 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
 - Public FPL API is unofficial/undocumented and may change. Data is cached for 30 minutes to reduce requests.
 """)
 st.caption(f"Last refreshed in this session: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. Use the app's refresh/reload to request fresh data.")
