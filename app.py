@@ -1,9 +1,10 @@
 import streamlit as st
 import pandas as pd
 import requests
+import html
 from datetime import datetime, timezone
 
-st.set_page_config(page_title="The-One-Above-All | FPL Optimizer", layout="wide")
+st.set_page_config(page_title="The-One-Above-All | FPL Manager Hub", layout="wide")
 BASE = "https://fantasy.premierleague.com/api"
 
 # Recorded squad from the user's GW8 screenshot. IDs are resolved by player name
@@ -153,26 +154,6 @@ st.markdown("""
 }
 [data-testid="stSidebar"] [data-testid="stNumberInput"] button,
 [data-testid="stSidebar"] [data-baseweb="select"] svg {color:#202238 !important;fill:#202238 !important;}
-[data-testid="stSidebar"] [data-testid="stButton"] button {
-  background:#00ff87 !important;
-  border:1px solid #00ff87 !important;
-  color:#210026 !important;
-  -webkit-text-fill-color:#210026 !important;
-  opacity:1 !important;
-  font-weight:800 !important;
-  box-shadow:0 5px 14px rgba(0,255,135,.12) !important;
-}
-[data-testid="stSidebar"] [data-testid="stButton"] button:hover {
-  background:#7dffbd !important;
-  border-color:#7dffbd !important;
-  color:#210026 !important;
-  -webkit-text-fill-color:#210026 !important;
-}
-[data-testid="stSidebar"] [data-testid="stButton"] button:disabled {
-  opacity:1 !important;
-  color:#210026 !important;
-  -webkit-text-fill-color:#210026 !important;
-}
 [data-testid="stSidebar"] [data-testid="stSlider"] [data-testid="stMarkdownContainer"] p {color:#f6f3fa !important;}
 [data-testid="stSidebar"] [data-testid="stCheckbox"] label,
 [data-testid="stSidebar"] [data-testid="stCheckbox"] p {color:#f6f3fa !important;}
@@ -217,6 +198,59 @@ h2,h3 {letter-spacing:-.025em;}
  .player-tile .tile-pts {font-size:.78rem;}
  .player-tile .tile-top {font-size:.59rem;padding:6px 1px 4px;}
  .bench-grid {grid-template-columns:repeat(2,minmax(0,1fr));}
+}
+
+/* FPL-inspired manager profile + live Gameweek layout */
+.manager-panel {background:#fff;border:1px solid #eee7f0;border-radius:16px;padding:15px 15px 13px;box-shadow:0 4px 18px rgba(55,0,60,.045);margin-bottom:12px;}
+.manager-name {font-size:1.17rem;font-weight:850;color:#37003c;line-height:1.25;margin:0 0 4px 0;}
+.manager-label {font-size:.78rem;color:#75647b;margin:0 0 13px 0;}
+.panel-heading {font-size:1rem;font-weight:800;color:#37003c;border-bottom:1px solid #eee7f0;padding-bottom:9px;margin-bottom:10px;}
+.rank-row {display:flex;justify-content:space-between;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid #f4f0f5;color:#4b4050;font-size:.86rem;}
+.rank-row:last-child {border-bottom:0;}
+.rank-row strong {color:#37003c;font-variant-numeric:tabular-nums;}
+.league-pill {display:flex;justify-content:space-between;gap:8px;background:#faf7fb;border-radius:9px;padding:8px 10px;margin:6px 0;color:#37003c;font-size:.82rem;font-weight:650;}
+.gw-panel {border:1px solid #eee7f0;background:#fff;border-radius:18px;padding:16px;box-shadow:0 4px 18px rgba(55,0,60,.045);}
+.gw-heading {display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;}
+.gw-title {font-size:1.35rem;font-weight:850;color:#37003c;margin:0;}
+.gw-sub {font-size:.78rem;color:#74687b;margin-top:2px;}
+.gw-scoreband {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin:12px 0 16px;}
+.gw-scorebox {background:#f8f4fa;border-radius:11px;padding:10px 7px;text-align:center;min-width:0;}
+.gw-scorebox.featured {background:linear-gradient(135deg,#04d8ef,#5f6cff);color:#fff;}
+.gw-scorebox .num {font-size:clamp(1.1rem,2vw,1.8rem);font-weight:900;color:#37003c;line-height:1.15;}
+.gw-scorebox.featured .num {color:#fff;font-size:clamp(1.55rem,2.6vw,2.25rem);}
+.gw-scorebox .lbl {font-size:.7rem;color:#706179;margin-top:4px;line-height:1.25;}
+.gw-scorebox.featured .lbl {color:#fff;}
+.player-tile {width:clamp(70px,8vw,112px);min-width:0;border-radius:8px;overflow:hidden;text-align:center;background:#fff;box-shadow:0 3px 8px rgba(0,0,0,.15);border:1px solid rgba(255,255,255,.85);}
+.player-tile .tile-avatar {height:60px;display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,#f4eefa,#fff);color:#37003c;}
+.kit-icon {width:54px;height:54px;filter:drop-shadow(0 2px 1px rgba(0,0,0,.12));}
+.player-tile .tile-top {font-size:clamp(.63rem,.85vw,.8rem);padding:6px 2px 5px;}
+.player-tile .tile-meta {padding:4px 2px 6px;font-size:clamp(.59rem,.75vw,.7rem);line-height:1.3;}
+.player-tile .tile-pts {font-size:.88rem;}
+.pitch-wrap {padding:12px 8px 13px;}
+.pitch-title {margin:5px 0 10px;}
+.pitch-row {gap:clamp(3px,1vw,12px);margin:12px auto;}
+.manager-overview-note {background:#faf7fb;border-left:3px solid #00d978;padding:9px 10px;border-radius:8px;color:#625369;font-size:.78rem;line-height:1.45;margin-top:10px;}
+@media(max-width:900px) {
+ .gw-scoreband {grid-template-columns:repeat(2,minmax(0,1fr));}
+ .player-tile {width:23%;max-width:98px;}
+}
+@media(max-width:650px) {
+ .manager-panel {padding:12px;}
+ .gw-panel {padding:10px;}
+ .gw-title {font-size:1.15rem;}
+ .gw-scorebox {padding:8px 4px;}
+ .player-tile {width:23%;max-width:76px;}
+ .player-tile .tile-avatar {height:42px;}
+ .kit-icon {width:40px;height:40px;}
+ .pitch-row {gap:3px;margin:9px auto;}
+ .pitch-title {font-size:.61rem;letter-spacing:.08em;margin:4px 0 8px;}
+}
+[data-testid="stSidebar"] [data-testid="stButton"] button {
+ background:#00ff87 !important;color:#210026 !important;-webkit-text-fill-color:#210026 !important;
+ border:1px solid #00ff87 !important;font-weight:800 !important;opacity:1 !important;
+}
+[data-testid="stSidebar"] [data-testid="stButton"] button:disabled {
+ background:#00ff87 !important;color:#210026 !important;-webkit-text-fill-color:#210026 !important;opacity:1 !important;
 }
 </style>
 <div class="hero">
@@ -305,32 +339,7 @@ try:
 except Exception:
     latest_history = {}
 
-st.markdown(f"<div class='section-intro'>Team overview · public FPL data checked {datetime.now(timezone.utc).strftime('%d %b %Y, %H:%M UTC')}</div>", unsafe_allow_html=True)
-m1,m2,m3,m4 = st.columns(4)
-m1.metric("Next Gameweek", f"GW{gw}")
-m2.metric("Bank available", f"£{bank_m:.1f}m")
-m3.metric("Free transfers", str(free_transfers))
-m4.metric("Planning horizon", f"{horizon} GWs")
-if entry:
-    a,b,c = st.columns(3)
-    a.metric("Overall rank", f"{entry.get('summary_overall_rank', '—'):,}" if isinstance(entry.get('summary_overall_rank'),int) else "—")
-    b.metric("Overall points", f"{entry.get('summary_overall_points','—')}")
-    c.metric("Team value", f"£{(entry.get('last_deadline_value') or 0)/10:.1f}m")
-    st.caption("Rank/points source: public FPL manager profile · cached up to 60 seconds. The official app may update at a different time while FPL processes results. Use Refresh rank & squad to re-query public data.")
-    if latest_history:
-        st.caption(f"Latest completed Gameweek history: GW{latest_history.get('event', '—')} · rank {latest_history.get('overall_rank', '—')} · total {latest_history.get('total_points', '—')}. This can differ from the current profile during updates.")
-else:
-    st.info("Public manager profile could not be loaded. Use the latest rank shown in your FPL app as the authoritative checkpoint.")
-
-if picks_sync_ok:
-    st.success(picks_sync_note)
-else:
-    st.warning(
-        picks_sync_note + " The squad table and transfer scanner are still using your last saved baseline, not guaranteed current picks. "
-        "Use Refresh rank & squad to retry. If the warning remains before the deadline, public data cannot confirm your latest edits; update the recorded squad only via a deliberate code change or wait for public picks to appear."
-    )
-
-# Build squad from public picks when available, otherwise saved screenshot baseline
+# Profile, history and public squad sync loaded above; visual overview is rendered after squad matching.\n\n# Build squad from public picks when available, otherwise saved screenshot baseline
 resolved=[]
 unmatched=[]
 for row in squad_rows:
@@ -358,93 +367,168 @@ for row in squad_rows:
     else:
         unmatched.append(row[2])
 
-st.subheader("My squad")
-st.markdown("<div class='section-intro'>Pitch view uses public picks when available; otherwise it falls back to your recorded lineup screenshot. Confirm XI and bench before the deadline.</div>", unsafe_allow_html=True)
-if unmatched:
-    st.warning("Names not uniquely matched to public data (review manually): " + ", ".join(unmatched))
-if resolved:
-    squad = pd.DataFrame(resolved)
-    def esc(value):
-        import html
-        return html.escape(str(value))
-    projection_col = f"Proj GW{gw}–GW{gw+horizon-1}"
-    squad_lookup = {norm(r["Player"]): r for _, r in squad.iterrows()}
-    aliases = {
-        "Raya": ["raya"], "Egan": ["egan"], "Hall": ["hall"], "Calafiori": ["calafiori"],
-        "Palmer": ["palmer"], "Tavernier": ["tavernier"], "Groß": ["groß","gross"],
-        "Rogers": ["rogers"], "Kostoulas": ["kostoulas"], "João Pedro": ["joãopedro","joaopedro"],
-        "Haaland": ["haaland"], "Tzolakis": ["tzolakis"], "De Cuyper": ["decuyper"],
-        "Schade": ["schade"], "Davis": ["davis"]
-    }
-    def get_squad_record(alias):
-        for key in aliases.get(alias, [norm(alias)]):
-            if norm(key) in squad_lookup:
-                return squad_lookup[norm(key)]
-        matches = [r for k, r in squad_lookup.items() if norm(alias) in k or k in norm(alias)]
-        return matches[0] if len(matches) == 1 else None
-    def tile(alias):
-        r = get_squad_record(alias)
-        if r is None:
-            return f"<div class='player-tile'><div class='tile-top'>{esc(alias)}</div><div class='tile-avatar'>?</div><div class='tile-meta'>Data pending</div></div>"
-        short = str(r["Player"])
-        pts = r.get(projection_col, 0)
-        return (f"<div class='player-tile'><div class='tile-top'>{esc(short)}</div>"
-                f"<div class='tile-avatar'>👕</div><div class='tile-meta'>{esc(r['Club'])} · £{float(r['Price (£m)']):.1f}m<br>"
-                f"<span class='tile-pts'>{float(pts):.1f} pts</span></div></div>")
-    if picks_sync_ok and public_picks_for_display:
-        # Use actual public pick positions and player roles to render the current squad.
-        picks_by_id = {int(p.get("id")): p for p in players}
-        starters = [pk for pk in public_picks_for_display if int(pk.get("position", 99)) <= 11]
-        actual_groups = {1: [], 2: [], 3: [], 4: []}
-        for pick in starters:
-            player = picks_by_id.get(int(pick.get("element", -1)))
-            if player:
-                role = int(player.get("element_type", 0))
-                if role in actual_groups:
-                    actual_groups[role].append(player.get("web_name", "Player"))
-        xi_rows = [
-            ("GOALKEEPER", actual_groups[1]),
-            ("DEFENDERS", actual_groups[2]),
-            ("MIDFIELDERS", actual_groups[3]),
-            ("FORWARDS", actual_groups[4])
-        ]
-        bench_names = []
-        for pick in public_picks_for_display:
-            if int(pick.get("position", 0)) >= 12:
+# FPL-inspired manager profile on the left and Gameweek pitch on the right.
+profile_col, pitch_col = st.columns([0.72, 1.85], gap="large")
+
+with profile_col:
+    live_points = entry.get("summary_overall_points", "—") if entry else "—"
+    live_rank = entry.get("summary_overall_rank", "—") if entry else "—"
+    live_value = entry.get("last_deadline_value") if entry else None
+    value_text = f"£{live_value/10:.1f}m" if isinstance(live_value, (int,float)) else "—"
+    gw_points_summary = entry.get("summary_event_points") if entry else None
+    if gw_points_summary is None:
+        gw_points_summary = latest_history.get("points", "—") if latest_history else "—"
+    gw_rank_summary = entry.get("summary_event_rank") if entry else None
+    if gw_rank_summary is None:
+        gw_rank_summary = latest_history.get("rank", "—") if latest_history else "—"
+    st.markdown(
+        "<div class='manager-panel'>"
+        "<div class='manager-name'>⚽ The-One-Above-All</div>"
+        "<div class='manager-label'>Manager profile · team ID "+str(int(team_id))+"</div>"
+        "<div class='panel-heading'>Points &amp; rankings</div>"
+        f"<div class='rank-row'><span>Overall points</span><strong>{html.escape(str(live_points))}</strong></div>"
+        f"<div class='rank-row'><span>Overall rank</span><strong>{html.escape(f'{live_rank:,}' if isinstance(live_rank,int) else str(live_rank))}</strong></div>"
+        f"<div class='rank-row'><span>Gameweek points</span><strong>{html.escape(str(gw_points_summary))}</strong></div>"
+        f"<div class='rank-row'><span>Gameweek rank</span><strong>{html.escape(f'{gw_rank_summary:,}' if isinstance(gw_rank_summary,int) else str(gw_rank_summary))}</strong></div>"
+        f"<div class='rank-row'><span>Team value</span><strong>{html.escape(value_text)}</strong></div>"
+        "</div>",
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        "<div class='manager-panel'><div class='panel-heading'>Squad controls</div>"
+        f"<div class='rank-row'><span>Bank entered</span><strong>£{bank_m:.1f}m</strong></div>"
+        f"<div class='rank-row'><span>Free transfers entered</span><strong>{free_transfers}</strong></div>"
+        f"<div class='rank-row'><span>Planning horizon</span><strong>{horizon} GWs</strong></div>"
+        f"<div class='rank-row'><span>Risk mode</span><strong>{html.escape(risk)}</strong></div>"
+        "</div>",
+        unsafe_allow_html=True
+    )
+    # Saved, non-live league rank is deliberately labelled as the last screenshot checkpoint.
+    st.markdown(
+        "<div class='manager-panel'><div class='panel-heading'>League tracking</div>"
+        "<div class='league-pill'><span>India league</span><strong>14,002</strong></div>"
+        "<div class='manager-overview-note'>Last manually captured from your FPL screenshot. This figure is not live-synced.</div>"
+        "</div>",
+        unsafe_allow_html=True
+    )
+
+with pitch_col:
+    st.markdown("<div class='gw-heading'><div><div class='gw-title'>Gameweek "+str(latest_history.get("event", gw))+"</div><div class='gw-sub'>Latest recorded Gameweek · starting XI and substitutes</div></div><span class='gw-chip'>NEXT · GW"+str(gw)+"</span></div>", unsafe_allow_html=True)
+    if unmatched:
+        st.warning("Names not uniquely matched to public data (review manually): " + ", ".join(unmatched))
+    if resolved:
+        squad = pd.DataFrame(resolved)
+        def esc(value):
+            import html
+            return html.escape(str(value))
+        projection_col = f"Proj GW{gw}–GW{gw+horizon-1}"
+        squad_lookup = {norm(r["Player"]): r for _, r in squad.iterrows()}
+        aliases = {
+            "Raya": ["raya"], "Egan": ["egan"], "Hall": ["hall"], "Calafiori": ["calafiori"],
+            "Palmer": ["palmer"], "Tavernier": ["tavernier"], "Groß": ["groß","gross"],
+            "Rogers": ["rogers"], "Kostoulas": ["kostoulas"], "João Pedro": ["joãopedro","joaopedro"],
+            "Haaland": ["haaland"], "Tzolakis": ["tzolakis"], "De Cuyper": ["decuyper"],
+            "Schade": ["schade"], "Davis": ["davis"]
+        }
+        def get_squad_record(alias):
+            for key in aliases.get(alias, [norm(alias)]):
+                if norm(key) in squad_lookup:
+                    return squad_lookup[norm(key)]
+            matches = [r for k, r in squad_lookup.items() if norm(alias) in k or k in norm(alias)]
+            return matches[0] if len(matches) == 1 else None
+        club_colors = {
+            "ARS":"#ef0107", "CHE":"#034694", "MCI":"#6cabdd", "LIV":"#c8102e",
+            "NEW":"#242424", "BHA":"#0057b8", "BOU":"#da291c", "BRE":"#e30613",
+            "FUL":"#222222", "EVE":"#003399", "TOT":"#ffffff", "AVL":"#670e36",
+            "CRY":"#1b458f", "MUN":"#da291c", "WHU":"#7a263a", "NFO":"#dd0000",
+            "WOL":"#fdb913", "IPS":"#005a9c", "LEI":"#003090", "SOU":"#d71920"
+        }
+        def tile(alias):
+            r = get_squad_record(alias)
+            if r is None:
+                return f"<div class='player-tile'><div class='tile-top'>{esc(alias)}</div><div class='tile-avatar'>?</div><div class='tile-meta'>Data pending</div></div>"
+            short = str(r["Player"])
+            pts = r.get(projection_col, 0)
+            club = str(r["Club"])
+            color = club_colors.get(club, "#594277")
+            shirt = (f"<svg class='kit-icon' viewBox='0 0 64 64' aria-label='shirt'>"
+                     f"<path d='M21 8 L13 12 L4 28 L14 34 L20 24 L20 56 L44 56 L44 24 L50 34 L60 28 L51 12 L43 8 C39 15 25 15 21 8Z' fill='{color}' stroke='#ffffff' stroke-width='1.7' stroke-linejoin='round'/>"
+                     f"<path d='M24 8 C26 18 38 18 40 8' fill='none' stroke='#f9f6fb' stroke-width='3'/>"
+                     f"<text x='32' y='39' text-anchor='middle' font-size='12' font-weight='900' fill='#ffffff'> {esc(club[:3])} </text></svg>")
+            return (f"<div class='player-tile'><div class='tile-top'>{esc(short)}</div>"
+                    f"<div class='tile-avatar'>{shirt}</div><div class='tile-meta'>{esc(club)} · £{float(r['Price (£m)']):.1f}m<br>"
+                    f"<span class='tile-pts'>{float(pts):.1f} pts</span></div></div>")
+        if picks_sync_ok and public_picks_for_display:
+            # Use actual public pick positions and player roles to render the current squad.
+            picks_by_id = {int(p.get("id")): p for p in players}
+            starters = [pk for pk in public_picks_for_display if int(pk.get("position", 99)) <= 11]
+            actual_groups = {1: [], 2: [], 3: [], 4: []}
+            for pick in starters:
                 player = picks_by_id.get(int(pick.get("element", -1)))
                 if player:
-                    bench_names.append(player.get("web_name", "Player"))
-    else:
-        xi_rows = [
-            ("GOALKEEPER", ["Raya"]),
-            ("DEFENDERS", ["Egan","Hall","Calafiori"]),
-            ("MIDFIELDERS", ["Palmer","Tavernier","Groß","Rogers"]),
-            ("FORWARDS", ["Kostoulas","João Pedro","Haaland"])
-        ]
-        bench_names = ["Tzolakis","De Cuyper","Schade","Davis"]
-    pitch_html = "<div class='pitch-wrap'><div class='pitch-lines'></div><div class='pitch-title'>Starting XI · public picks when available</div>"
-    for label, names in xi_rows:
-        pitch_html += f"<div class='pitch-title'>{label}</div><div class='pitch-row'>"
-        pitch_html += "".join(tile(name) for name in names)
-        pitch_html += "</div>"
-    pitch_html += "<div class='pitch-caption'>Projected points are model estimates over your selected horizon — not Gameweek scores.</div></div>"
-    st.markdown(pitch_html, unsafe_allow_html=True)
-    st.markdown("#### Bench")
-    bench_parts=[]
-    for name in bench_names:
-        r=get_squad_record(name)
-        if r is not None:
-            sub=f"{esc(r['Club'])} · £{float(r['Price (£m)']):.1f}m · {float(r.get(projection_col,0)):.1f} proj."
+                    role = int(player.get("element_type", 0))
+                    if role in actual_groups:
+                        actual_groups[role].append(player.get("web_name", "Player"))
+            xi_rows = [
+                ("GOALKEEPER", actual_groups[1]),
+                ("DEFENDERS", actual_groups[2]),
+                ("MIDFIELDERS", actual_groups[3]),
+                ("FORWARDS", actual_groups[4])
+            ]
+            bench_names = []
+            for pick in public_picks_for_display:
+                if int(pick.get("position", 0)) >= 12:
+                    player = picks_by_id.get(int(pick.get("element", -1)))
+                    if player:
+                        bench_names.append(player.get("web_name", "Player"))
         else:
-            sub="Data pending"
-        bench_parts.append(f"<div class='bench-card'><div class='bench-name'>{esc(name)}</div><div class='bench-sub'>{sub}</div></div>")
-    st.markdown("<div class='bench-grid'>"+"".join(bench_parts)+"</div>", unsafe_allow_html=True)
-    total_current_cost = squad["Price (£m)"].sum()
-    st.caption(f"Public prices sum to £{total_current_cost:.1f}m for matched players. This is not necessarily your squad's purchase/selling value.")
-    with st.expander("View full squad statistics"):
-        st.dataframe(squad.drop(columns=["id"]), use_container_width=True, hide_index=True)
-else:
-    st.error("No squad names could be matched. Update the name aliases in RECORDED_SQUAD.")
+            xi_rows = [
+                ("GOALKEEPER", ["Raya"]),
+                ("DEFENDERS", ["Egan","Hall","Calafiori"]),
+                ("MIDFIELDERS", ["Palmer","Tavernier","Groß","Rogers"]),
+                ("FORWARDS", ["Kostoulas","João Pedro","Haaland"])
+            ]
+            bench_names = ["Tzolakis","De Cuyper","Schade","Davis"]
+        last_gw = latest_history if latest_history else {}
+        current_gw_points = entry.get("summary_event_points") if entry else None
+        if current_gw_points is None:
+            current_gw_points = last_gw.get("points", "—")
+        current_gw_rank = entry.get("summary_event_rank") if entry else None
+        if current_gw_rank is None:
+            current_gw_rank = last_gw.get("rank", "—")
+        scoreband = (
+            "<div class='gw-scoreband'>"
+            f"<div class='gw-scorebox'><div class='num'>{esc(current_gw_rank if current_gw_rank is not None else '—')}</div><div class='lbl'>GW rank</div></div>"
+            f"<div class='gw-scorebox featured'><div class='num'>{esc(current_gw_points if current_gw_points is not None else '—')}</div><div class='lbl'>Latest points</div></div>"
+            f"<div class='gw-scorebox'><div class='num'>{esc(entry.get('summary_overall_rank', '—') if entry else '—')}</div><div class='lbl'>Overall rank</div></div>"
+            f"<div class='gw-scorebox'><div class='num'>{esc(entry.get('summary_overall_points', '—') if entry else '—')}</div><div class='lbl'>Total points</div></div>"
+            "</div>"
+        )
+        st.markdown(scoreband, unsafe_allow_html=True)
+        pitch_html = "<div class='pitch-wrap'><div class='pitch-lines'></div><div class='pitch-title'>Starting XI · public picks when available</div>"
+        for label, names in xi_rows:
+            pitch_html += f"<div class='pitch-title'>{label}</div><div class='pitch-row'>"
+            pitch_html += "".join(tile(name) for name in names)
+            pitch_html += "</div>"
+        pitch_html += "<div class='pitch-caption'>Projected points are model estimates over your selected horizon — not Gameweek scores.</div></div>"
+        st.markdown(pitch_html, unsafe_allow_html=True)
+        st.markdown("#### Bench")
+        bench_parts=[]
+        for name in bench_names:
+            r=get_squad_record(name)
+            if r is not None:
+                sub=f"{esc(r['Club'])} · £{float(r['Price (£m)']):.1f}m · {float(r.get(projection_col,0)):.1f} proj."
+            else:
+                sub="Data pending"
+            bench_parts.append(f"<div class='bench-card'><div class='bench-name'>{esc(name)}</div><div class='bench-sub'>{sub}</div></div>")
+        st.markdown("<div class='bench-grid'>"+"".join(bench_parts)+"</div>", unsafe_allow_html=True)
+        total_current_cost = squad["Price (£m)"].sum()
+        st.caption(f"Public prices sum to £{total_current_cost:.1f}m for matched players. This is not necessarily your squad's purchase/selling value.")
+        with st.expander("View full squad statistics"):
+            st.dataframe(squad.drop(columns=["id"]), use_container_width=True, hide_index=True)
+    else:
+        st.error("No squad names could be matched. Update the name aliases in RECORDED_SQUAD.")
+
 
 st.subheader("Automatic transfer recommendations")
 st.caption("Team ID: 2311669 • The optimizer scans every matched squad player and searches for legal, affordable replacements.")
@@ -676,7 +760,7 @@ st.markdown("""
 - Blends PPG/form with a conservative xG+xA signal, shrinks small samples toward a position baseline, estimates minutes from starts and appearances, penalizes uncertain/unavailable status, and adjusts each scheduled fixture individually. Displays cumulative xG/xA and per-90 rates.
 - Uses public player status and chance-of-playing fields where provided.
 - Does **not** access your FPL password, private `my-team` endpoint, or your personal selling prices.
-- This v2.1 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
+- This v2.2 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
 - Public FPL API is unofficial/undocumented and may change. Player/fixture data is cached for 30 minutes; manager profile/rank for 60 seconds; public picks/history for 2 minutes.
 - A sidebar **Refresh rank & squad** button clears data caches and reruns the dashboard.
 - Squad sync attempts to use all 15 players from `entry/{id}/event/{gw}/picks/` for the next Gameweek. If the picks endpoint doesn't provide all 15 (especially before deadline), the app clearly falls back to the saved screenshot baseline.
