@@ -49,37 +49,46 @@ def pos_name(p, types):
     return next((x.get("singular_name_short", "?") for x in types if x["id"] == p.get("element_type")), "?")
 
 def estimate_points(p, team, fixtures, horizon=5):
-    # Conservative transparent heuristic, not an official FPL forecast.
-    ppg = float(p.get("points_per_game") or 0)
-    form = float(p.get("form") or 0)
-    minutes = float(p.get("minutes") or 0)
-    starts = int(p.get("starts") or 0)
+    """Transparent heuristic using form, PPG, xG/xA, minutes and availability."""
+    def num(key):
+        try:
+            return float(p.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    ppg, form = num("points_per_game"), num("form")
+    minutes, starts = num("minutes"), int(num("starts"))
     status = str(p.get("status") or "").lower()
     chance = p.get("chance_of_playing_next_round")
     pos = p.get("element_type")
     baseline = {1: 3.2, 2: 3.5, 3: 3.8, 4: 4.0}.get(pos, 3.6)
 
-    # Shrink small samples toward a modest positional baseline.
-    raw = 0.65 * ppg + 0.35 * form
+    # FPL bootstrap cumulative expected-goal fields, converted to per-90 rates.
+    xg90 = num("expected_goals") / max(minutes, 90) * 90
+    xa90 = num("expected_assists") / max(minutes, 90) * 90
+    goal_threat = xg90 + xa90
+    # Conservative signal; do not let noisy xG/xA overwhelm historical points.
+    attacking_signal = min(1.5, goal_threat * 2.0)
+    raw = 0.50 * ppg + 0.25 * form + 0.25 * (baseline + attacking_signal)
     sample_weight = min(0.85, minutes / 900.0)
     per_match = sample_weight * raw + (1.0 - sample_weight) * baseline
 
-    # Reliability penalty for limited minutes / starts.
     if minutes <= 0:
-        minutes_factor = 0.45
+        expected_minutes = 35.0
+    elif starts > 0:
+        avg_start_minutes = minutes / starts
+        start_rate = min(1.0, starts / max(1.0, num("starts") + num("substitute_appearances")))
+        expected_minutes = min(90.0, avg_start_minutes) * (0.65 + 0.35 * start_rate)
     else:
-        avg_minutes = minutes / max(1, starts)
-        minutes_factor = min(1.0, max(0.55, avg_minutes / 80.0))
-        if starts == 0:
-            minutes_factor = min(minutes_factor, 0.65)
+        expected_minutes = min(60.0, minutes / max(1.0, num("appearances")))
 
-    # Missing availability probability is unknown, not guaranteed availability.
+    minutes_factor = max(0.35, min(1.0, expected_minutes / 80.0))
     if status in {"i", "s", "u"}:
-        availability_factor = 0.25
+        availability_factor = 0.20
     elif status == "d":
-        availability_factor = 0.60
+        availability_factor = 0.55
     elif chance is not None:
-        availability_factor = max(0.25, min(1.0, float(chance) / 100.0))
+        availability_factor = max(0.20, min(1.0, float(chance) / 100.0))
     else:
         availability_factor = 0.90
 
@@ -92,13 +101,13 @@ def estimate_points(p, team, fixtures, horizon=5):
         home = f.get("team_h") == p.get("team")
         diff = float(f.get("team_h_difficulty" if home else "team_a_difficulty") or 3)
         diffs.append(diff)
-        factor = max(0.82, min(1.16, 1.0 + (3.0 - diff) * 0.06))
-        scores.append(per_match * minutes_factor * availability_factor * factor)
+        fixture_factor = max(0.82, min(1.16, 1.0 + (3.0 - diff) * 0.06))
+        scores.append(per_match * minutes_factor * availability_factor * fixture_factor)
     if not scores:
         return 0.0, 3.0, 0
     return round(sum(scores), 1), round(sum(diffs) / len(diffs), 2), len(scores)
 
-st.title("⚽ The-One-Above-All — FPL Optimizer v1.1")
+st.title("⚽ The-One-Above-All — FPL Optimizer v1.2")
 st.caption("Free prototype • Team ID 2311669 • GW8 baseline recorded from your screenshots")
 st.warning("Forecasts are transparent estimates, not official FPL projections. Public endpoints may change; private squad data is not accessed. Confirm injuries and your actual selling prices before making a transfer.")
 
@@ -161,7 +170,15 @@ for row in RECORDED_SQUAD:
             "Minutes": int(p.get("minutes") or 0), "Status": p.get("status","?"),
             "Chance (%)": p.get("chance_of_playing_next_round"),
             f"Proj GW{gw}–GW{gw+horizon-1}": pts, "Avg FDR": diff,
-            "Selected (%)": float(p.get("selected_by_percent") or 0), "id": p["id"],
+             "xG": round(float(p.get("expected_goals") or 0), 2),
+            "xA": round(float(p.get("expected_assists") or 0), 2),
+            "xG/90": round(float(p.get("expected_goals") or 0) / max(90, int(p.get("minutes") or 0)) * 90, 3),
+            "xA/90": round(float(p.get("expected_assists") or 0) / max(90, int(p.get("minutes") or 0)) * 90, 3),
+             "xG": round(float(p.get("expected_goals") or 0), 2),
+        "xA": round(float(p.get("expected_assists") or 0), 2),
+        "xG/90": round(float(p.get("expected_goals") or 0) / max(90, int(p.get("minutes") or 0)) * 90, 3),
+        "xA/90": round(float(p.get("expected_assists") or 0) / max(90, int(p.get("minutes") or 0)) * 90, 3),
+        "Selected (%)": float(p.get("selected_by_percent") or 0), "id": p["id"],
         })
     else:
         unmatched.append(row[2])
@@ -189,6 +206,14 @@ if resolved:
         "Minutes": int(p.get("minutes") or 0), "Status": p.get("status","?"),
         "Chance (%)": p.get("chance_of_playing_next_round"),
         f"Projected {horizon}GW pts": estimate_points(p, teams.get(p.get("team"),{}).get("short_name","?"), fixtures, horizon)[0],
+         "xG": round(float(p.get("expected_goals") or 0), 2),
+            "xA": round(float(p.get("expected_assists") or 0), 2),
+            "xG/90": round(float(p.get("expected_goals") or 0) / max(90, int(p.get("minutes") or 0)) * 90, 3),
+            "xA/90": round(float(p.get("expected_assists") or 0) / max(90, int(p.get("minutes") or 0)) * 90, 3),
+             "xG": round(float(p.get("expected_goals") or 0), 2),
+        "xA": round(float(p.get("expected_assists") or 0), 2),
+        "xG/90": round(float(p.get("expected_goals") or 0) / max(90, int(p.get("minutes") or 0)) * 90, 3),
+        "xA/90": round(float(p.get("expected_assists") or 0) / max(90, int(p.get("minutes") or 0)) * 90, 3),
         "Selected (%)": float(p.get("selected_by_percent") or 0), "id": p["id"],
     } for p in players])
     # Current squad selector
@@ -208,17 +233,17 @@ if resolved:
         st.info("No affordable out-of-squad player candidates matched this position under the rough budget estimate.")
     else:
         st.caption(f"Approximate replacement ceiling: £{max_price:.1f}m, using current price + bank. Enter actual selling value separately in your final decision.")
-        st.dataframe(options[["Player","Club","Price (£m)","Form","PPG","Minutes","Status","Chance (%)",f"Projected {horizon}GW pts","Selected (%)","Projected gain"]], use_container_width=True, hide_index=True)
+        st.dataframe(options[["Player","Club","Price (£m)","Form","PPG","Minutes","Status","Chance (%)","xG","xA","xG/90","xA/90",f"Projected {horizon}GW pts","Selected (%)","Projected gain"]], use_container_width=True, hide_index=True)
         best=options.iloc[0]
         st.success(f"Model's top rough candidate for {sell_name}: {best['Player']} ({best['Club']}) — projected gain {best['Projected gain']:+.1f} points over {horizon} GWs before uncertainty/transfer-hit adjustments.")
         st.write("Decision rule: only transfer if the gain remains worthwhile after checking availability, actual selling price, expected minutes and the other 14 squad slots. A high projection alone is not a command to transfer.")
 
 st.subheader("What the model does — and does not do")
 st.markdown("""
-- Blends season points-per-game and form (65/35), shrinks small samples toward a position baseline, penalizes limited minutes and uncertain/unavailable status, and adjusts each scheduled fixture individually.
+- Blends PPG/form with a conservative xG+xA signal, shrinks small samples toward a position baseline, estimates minutes from starts and appearances, penalizes uncertain/unavailable status, and adjusts each scheduled fixture individually. Displays cumulative xG/xA and per-90 rates.
 - Uses public player status and chance-of-playing fields where provided.
 - Does **not** access your FPL password, private `my-team` endpoint, or your personal selling prices.
-- This v1.1 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
+- This v1.2 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
 - Public FPL API is unofficial/undocumented and may change. Data is cached for 30 minutes to reduce requests.
 """)
 st.caption(f"Last refreshed in this session: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. Use the app's refresh/reload to request fresh data.")
