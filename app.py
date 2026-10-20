@@ -79,7 +79,7 @@ def resolve_player(row, players):
 def pos_name(p, types):
     return next((x.get("singular_name_short", "?") for x in types if x["id"] == p.get("element_type")), "?")
 
-def estimate_points(p, team, fixtures, horizon=5):
+def estimate_points(p, team, fixtures, horizon=5, start_gw=None):
     """Transparent heuristic using form, PPG, xG/xA, minutes and availability."""
     def num(key):
         try:
@@ -124,9 +124,18 @@ def estimate_points(p, team, fixtures, horizon=5):
         availability_factor = 0.90
 
     upcoming = [f for f in fixtures if not f.get("finished")
+                and f.get("event") is not None
                 and (f.get("team_h") == p.get("team") or f.get("team_a") == p.get("team"))]
+    if start_gw is not None:
+        # Horizon counts distinct Gameweeks. Keep every fixture within them,
+        # including two fixtures assigned to the same Gameweek (DGW).
+        upcoming = [f for f in upcoming
+                    if int(start_gw) <= int(f["event"]) < int(start_gw) + int(horizon)]
+    else:
+        event_ids = sorted({int(f["event"]) for f in upcoming})
+        target_ids = set(event_ids[:int(horizon)])
+        upcoming = [f for f in upcoming if int(f["event"]) in target_ids]
     upcoming.sort(key=lambda f: (f.get("event") or 99, f.get("kickoff_time") or ""))
-    upcoming = [f for f in upcoming if f.get("event") is not None][:horizon]
     scores, diffs = [], []
     for f in upcoming:
         home = f.get("team_h") == p.get("team")
@@ -346,9 +355,10 @@ for row in squad_rows:
     p=resolve_player(row, players)
     if p:
         teamname=teams.get(p.get("team"),{}).get("short_name","?")
-        pts,diff,nfx=estimate_points(p, teamname, fixtures, horizon)
+        pts,diff,nfx=estimate_points(p, teamname, fixtures, horizon, start_gw=gw)
         resolved.append({
             "Player": p.get("web_name"), "Position": pos_name(p,types), "Club": teamname,
+            "Team ID": int(p.get("team")) if p.get("team") is not None else None,
             "Price (£m)": round((p.get("now_cost") or 0)/10,1),
             "Form": float(p.get("form") or 0), "PPG": float(p.get("points_per_game") or 0),
             "Minutes": int(p.get("minutes") or 0), "Status": p.get("status","?"),
@@ -386,9 +396,9 @@ with profile_col:
         "<div class='manager-name'>⚽ The-One-Above-All</div>"
         "<div class='manager-label'>Manager profile · team ID "+str(int(team_id))+"</div>"
         "<div class='panel-heading'>Points &amp; rankings</div>"
-        f"<div class='rank-row'><span>Overall points</span><strong>{html.escape(str(live_points))}</strong></div>"
+        f"<div class='rank-row'><span>Season total points</span><strong>{html.escape(str(live_points))}</strong></div>"
         f"<div class='rank-row'><span>Overall rank</span><strong>{html.escape(f'{live_rank:,}' if isinstance(live_rank,int) else str(live_rank))}</strong></div>"
-        f"<div class='rank-row'><span>Gameweek points</span><strong>{html.escape(str(gw_points_summary))}</strong></div>"
+        f"<div class='rank-row'><span>Points earned this Gameweek</span><strong>{html.escape(str(gw_points_summary))}</strong></div>"
         f"<div class='rank-row'><span>Gameweek rank</span><strong>{html.escape(f'{gw_rank_summary:,}' if isinstance(gw_rank_summary,int) else str(gw_rank_summary))}</strong></div>"
         f"<div class='rank-row'><span>Team value</span><strong>{html.escape(value_text)}</strong></div>"
         "</div>",
@@ -530,6 +540,132 @@ with pitch_col:
         st.error("No squad names could be matched. Update the name aliases in RECORDED_SQUAD.")
 
 
+st.subheader("Fixtures & double-Gameweek planner")
+st.markdown(
+    "<div class='section-intro'>Your squad's fixtures across the selected planning window, including home/away opponents and official FPL fixture difficulty (FDR). Easier fixtures generally have a lower FDR.</div>",
+    unsafe_allow_html=True
+)
+
+# The slider's horizon counts distinct Gameweeks, not a fixed number of fixture rows.
+available_gws = sorted({
+    int(ev.get("id")) for ev in events
+    if ev.get("id") is not None and int(ev.get("id")) >= int(gw)
+})
+target_gws = available_gws[:int(horizon)]
+if not target_gws:
+    target_gws = list(range(int(gw), int(gw) + int(horizon)))
+
+# Count assigned fixtures per club per Gameweek, including every row in a DGW.
+club_gw_counts = {}
+for fx in fixtures:
+    eid = fx.get("event")
+    if eid is None or int(eid) not in target_gws:
+        continue
+    for club_id in (fx.get("team_h"), fx.get("team_a")):
+        if club_id is not None:
+            key = (int(eid), int(club_id))
+            club_gw_counts[key] = club_gw_counts.get(key, 0) + 1
+
+fixture_matrix_rows = []
+if resolved:
+    squad_df_for_fx = pd.DataFrame(resolved)
+    for _, player in squad_df_for_fx.iterrows():
+        team_id_value = player.get("Team ID")
+        if pd.isna(team_id_value):
+            continue
+        club_id = int(team_id_value)
+        row = {
+            "Player": player.get("Player", "—"),
+            "Club": player.get("Club", "—"),
+        }
+        fixture_count = 0
+        dgw_summary = []
+        for event_id in target_gws:
+            weekly = [
+                fx for fx in fixtures
+                if fx.get("event") is not None
+                and int(fx.get("event")) == int(event_id)
+                and not fx.get("finished")
+                and club_id in (fx.get("team_h"), fx.get("team_a"))
+            ]
+            weekly.sort(key=lambda fx: fx.get("kickoff_time") or "")
+            fixture_count += len(weekly)
+            cell_parts = []
+            for fx in weekly:
+                is_home = int(fx.get("team_h")) == club_id
+                opp_id = fx.get("team_a") if is_home else fx.get("team_h")
+                opponent = teams.get(opp_id, {}).get("short_name", "TBC")
+                difficulty_key = "team_h_difficulty" if is_home else "team_a_difficulty"
+                fdr = fx.get(difficulty_key)
+                venue = "H" if is_home else "A"
+                fdr_label = f"FDR {fdr}" if fdr is not None else "FDR ?"
+                cell_parts.append(f"{opponent} ({venue}) · {fdr_label}")
+            if not cell_parts:
+                row[f"GW{event_id}"] = "TBC / no assigned fixture"
+            else:
+                is_double = len(weekly) > 1
+                row[f"GW{event_id}"] = " + ".join(cell_parts) + (" · DGW" if is_double else "")
+                if is_double:
+                    dgw_summary.append(f"GW{event_id} ×{len(weekly)}")
+        row["Fixture count"] = fixture_count
+        row["Double GWs"] = ", ".join(dgw_summary) if dgw_summary else "—"
+        fixture_matrix_rows.append(row)
+
+if fixture_matrix_rows:
+    fixture_df = pd.DataFrame(fixture_matrix_rows)
+    st.dataframe(fixture_df, use_container_width=True, hide_index=True)
+    dgw_players = [f"{r['Player']} ({r['Double GWs']})" for r in fixture_matrix_rows if r["Double GWs"] != "—"]
+    if dgw_players:
+        st.success("Double-Gameweek watch for your squad: " + "; ".join(dgw_players))
+    else:
+        st.info("No double Gameweek is currently assigned to your squad within this horizon. Postponed matches become visible here once FPL assigns them to a Gameweek.")
+else:
+    st.warning("Fixture matrix is unavailable until at least one squad player matches public FPL data.")
+
+with st.expander("View all published fixtures in these Gameweeks"):
+    all_fixtures = []
+    for fx in fixtures:
+        eid = fx.get("event")
+        if eid is None or int(eid) not in target_gws or fx.get("finished"):
+            continue
+        home_id, away_id = fx.get("team_h"), fx.get("team_a")
+        if home_id is None or away_id is None:
+            continue
+        home_team = teams.get(home_id, {}).get("name", teams.get(home_id, {}).get("short_name", "Home"))
+        away_team = teams.get(away_id, {}).get("name", teams.get(away_id, {}).get("short_name", "Away"))
+        kickoff = fx.get("kickoff_time")
+        if kickoff:
+            try:
+                kickoff_label = pd.to_datetime(kickoff, utc=True).strftime("%a %d %b · %H:%M UTC")
+            except Exception:
+                kickoff_label = str(kickoff)
+        else:
+            kickoff_label = "Kick-off TBC"
+        is_dgw_fixture = (
+            club_gw_counts.get((int(eid), int(home_id)), 0) > 1
+            or club_gw_counts.get((int(eid), int(away_id)), 0) > 1
+        )
+        all_fixtures.append({
+            "Gameweek": int(eid),
+            "Kick-off": kickoff_label,
+            "Fixture": f"{home_team} vs {away_team}",
+            "Home FDR": fx.get("team_h_difficulty"),
+            "Away FDR": fx.get("team_a_difficulty"),
+            "Double-GW flag": "DGW fixture" if is_dgw_fixture else "",
+        })
+    if all_fixtures:
+        all_fixtures_df = pd.DataFrame(all_fixtures).sort_values(["Gameweek", "Kick-off"])
+        st.dataframe(all_fixtures_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No unpublished fixtures have been assigned to this horizon yet.")
+
+st.markdown(
+    f"<div class='manager-overview-note'>Planning window: GW{target_gws[0] if target_gws else gw}–GW{target_gws[-1] if target_gws else gw + horizon - 1}. "
+    "Double Gameweeks are identified only when multiple fixtures have already been assigned to the same Gameweek in public FPL data. "
+    "The app cannot reliably predict an unannounced DGW date in advance.</div>",
+    unsafe_allow_html=True
+)
+
 st.subheader("Automatic transfer recommendations")
 st.caption("Team ID: 2311669 • The optimizer scans every matched squad player and searches for legal, affordable replacements.")
 st.write("Recommendations are generated automatically from projected points, risk settings, estimated budget and the three-per-club rule. They are decision support, not automatic transfers.")
@@ -542,7 +678,7 @@ if resolved:
         "Form": float(p.get("form") or 0), "PPG": float(p.get("points_per_game") or 0),
         "Minutes": int(p.get("minutes") or 0), "Status": p.get("status","?"),
         "Chance (%)": p.get("chance_of_playing_next_round"),
-        f"Projected {horizon}GW pts": estimate_points(p, teams.get(p.get("team"),{}).get("short_name","?"), fixtures, horizon)[0],
+        f"Projected {horizon}GW pts": estimate_points(p, teams.get(p.get("team"),{}).get("short_name","?"), fixtures, horizon, start_gw=gw)[0],
          "xG": round(float(p.get("expected_goals") or 0), 2),
             "xA": round(float(p.get("expected_assists") or 0), 2),
             "xG/90": round(float(p.get("expected_goals") or 0) / max(90, int(p.get("minutes") or 0)) * 90, 3),
@@ -760,7 +896,7 @@ st.markdown("""
 - Blends PPG/form with a conservative xG+xA signal, shrinks small samples toward a position baseline, estimates minutes from starts and appearances, penalizes uncertain/unavailable status, and adjusts each scheduled fixture individually. Displays cumulative xG/xA and per-90 rates.
 - Uses public player status and chance-of-playing fields where provided.
 - Does **not** access your FPL password, private `my-team` endpoint, or your personal selling prices.
-- This v2.2 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
+- This v2.3 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
 - Public FPL API is unofficial/undocumented and may change. Player/fixture data is cached for 30 minutes; manager profile/rank for 60 seconds; public picks/history for 2 minutes.
 - A sidebar **Refresh rank & squad** button clears data caches and reruns the dashboard.
 - Squad sync attempts to use all 15 players from `entry/{id}/event/{gw}/picks/` for the next Gameweek. If the picks endpoint doesn't provide all 15 (especially before deadline), the app clearly falls back to the saved screenshot baseline.
