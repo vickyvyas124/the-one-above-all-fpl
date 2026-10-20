@@ -1,58 +1,21 @@
-# The-One-Above-All FPL Optimizer v1
-
-A free Streamlit dashboard using public, read-only Fantasy Premier League endpoints. No paid app, API key, FPL password, or account cookie is required.
-
-## Run locally
-
-1. Install Python 3.10 or newer from https://www.python.org/downloads/
-2. Unzip this folder.
-3. Open a terminal/Command Prompt inside the folder.
-4. Create a virtual environment (recommended):
-
-   Windows:
-   ```powershell
-   py -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   ```
-
-   macOS/Linux:
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   ```
-
-5. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-6. Start dashboard:
-   ```bash
-   streamlit run app.py
-   ```
-7. Open the local URL Streamlit prints (usually http://localhost:8501).
-
-## What is included
-
-- Public player/fixture data retrieval and 30-minute cache.
-- Manager profile lookup for team ID 2311669 when public endpoint is available.
-- Squad seeded from the GW8 screenshot shared in ChatGPT.
-- A transparent, heuristic expected-points baseline over a selectable 1–8 Gameweek horizon.
-- Affordable replacement shortlist by position using current public prices plus bank.
-- Status/form/PPG/minutes/ownership columns.
-
-## Important limitations
-
-- This is a v1 prototype. The public FPL API is unofficial and may change.
-- Public API endpoints do not reveal the exact current private squad, selling prices, bench order, or private transfer state. Those remain seeded from screenshots and should be verified manually.
-- Current public prices are not the same as your personal selling prices.
-- Forecasts are not official predictions or guarantees. The heuristic blends form and points per game and adjusts for fixture difficulty; it is not a trained model.
-- The dashboard does not log in to FPL, use cookies, or submit transfers.
-- It is not yet a full 15-player mathematical squad optimizer. Next upgrades: xG/xA-based forecasts, predicted minutes/injury news, complete legal-transfer search, captain/bench optimization, saved forecast history and scheduled refresh/deployment.
-
-## Scheduled refresh
-
-The app refreshes its public API cache when data is older than 30 minutes and the dashboard is rerun/reloaded. It does not run in the background when your computer is off or the app is closed. For scheduled runs, deploy to a free hosting tier that supports Streamlit or run a local scheduled task; provider limits and uptime can change. Avoid adding FPL login credentials to a public deployment.
-
-## Privacy
-
-Only the public team ID is used to request the public manager profile. No FPL password or private account data is requested.
+The-One-Above-All FPL Manager Hub v2.7
+A phone-friendly Streamlit dashboard for public FPL manager data, fixture-aware projections, transfer shortlists, chip guidance and forecast validation.
+Run / deploy
+Main file: `app.py`
+Python requirements: `requirements.txt`
+Streamlit Community Cloud entrypoint: `app.py`
+No FPL password or private cookie is requested.
+v2.7 additions
+Fetches cached per-player match history for the recorded squad and a bounded pool of leading transfer candidates.
+Blends a capped recent-points signal and recent minutes/appearance trend into the existing fixture-adjusted forecast.
+Exhaustively checks legal formations from the current 15-player squad and recommends the starting XI, captain, vice-captain and bench order for the next Gameweek.
+Keeps the prior heuristic as a baseline.
+Automatically freezes one forecast per upcoming Gameweek when the app is opened before the deadline; once saved, it is not overwritten.
+After a Gameweek is officially marked finished by FPL, retrieves actual player points/minutes and compares MAE/bias for both projections.
+CSV export/restore lets you back up results because hosted app filesystems can be ephemeral.
+Important limits
+FPL's JSON API is public but unofficial/undocumented and may change.
+Forecast logging runs when the dashboard is visited; it is not a scheduled background job. It needs at least one visit before the Gameweek deadline to record a pre-deadline forecast.
+History enrichment is intentionally bounded to avoid hundreds of player API calls. Players outside this pool still receive the baseline projection until included in the pool.
+Forecasts are heuristic, not a validated ML model, and do not guarantee rankings or points.
+A global transfer optimizer that rebuilds the full 15-player squad in one search, and properly calibrated probability/confidence, are future steps. The current transfer shortlist tests one transfer at a time.
