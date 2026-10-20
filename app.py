@@ -389,30 +389,35 @@ with st.sidebar:
         )
 
 rank_change_places = None
-rank_change_label = "Not enough completed GameWeeks"
-finished_gw_ids = {
-    int(ev.get("id")) for ev in events
-    if ev.get("id") is not None and ev.get("finished")
-}
-completed_rank_history = [
-    row for row in season_history
-    if int(row.get("event", -1)) in finished_gw_ids
-    and isinstance(row.get("overall_rank"), (int, float))
-]
-if len(completed_rank_history) >= 2:
-    previous_completed = completed_rank_history[-2]
-    latest_completed = completed_rank_history[-1]
-    prev_rank = previous_completed.get("overall_rank")
-    latest_rank = latest_completed.get("overall_rank")
-    rank_change_places = int(prev_rank) - int(latest_rank)
-    prev_gw = previous_completed.get("event", "—")
-    latest_gw = latest_completed.get("event", "—")
+rank_change_label = "Not enough rank-history rows yet"
+# Do not gate rank history on bootstrap's event.finished flag: FPL can show
+# points/ranks in the manager UI before that flag catches up. Use the latest
+# two actual history rows with numeric overall ranks, ordered by Gameweek.
+rank_history_rows = sorted(
+    [
+        row for row in season_history
+        if row.get("event") is not None
+        and isinstance(row.get("overall_rank"), (int, float))
+        and int(row.get("overall_rank") or 0) > 0
+    ],
+    key=lambda row: int(row.get("event", 0))
+)
+if len(rank_history_rows) >= 2:
+    previous_rank_row = rank_history_rows[-2]
+    latest_rank_row = rank_history_rows[-1]
+    prev_rank = int(previous_rank_row["overall_rank"])
+    latest_rank = int(latest_rank_row["overall_rank"])
+    rank_change_places = prev_rank - latest_rank
+    prev_gw = int(previous_rank_row["event"])
+    latest_gw = int(latest_rank_row["event"])
     if rank_change_places > 0:
         rank_change_label = f"↑ {rank_change_places:,} places gained (GW{prev_gw}→GW{latest_gw})"
     elif rank_change_places < 0:
         rank_change_label = f"↓ {abs(rank_change_places):,} places lost (GW{prev_gw}→GW{latest_gw})"
     else:
         rank_change_label = f"No change (GW{prev_gw}→GW{latest_gw})"
+else:
+    rank_history_rows = rank_history_rows[-2:]
 
 # Profile, history and public squad sync loaded above; visual overview is rendered after squad matching.\n\n# Build squad from public picks when available, otherwise saved screenshot baseline
 resolved=[]
@@ -467,6 +472,7 @@ with profile_col:
         f"<div class='rank-row'><span>Points earned this Gameweek</span><strong>{html.escape(str(gw_points_summary))}</strong></div>"
         f"<div class='rank-row'><span>Gameweek rank</span><strong>{html.escape(f'{gw_rank_summary:,}' if isinstance(gw_rank_summary,int) else str(gw_rank_summary))}</strong></div>"
         f"<div class='rank-row'><span>Overall-rank movement</span><strong>{html.escape(rank_change_label)}</strong></div>"
+        f"<div class='manager-overview-note'>Rank movement is calculated from the latest two Gameweek history entries with overall-rank values. If GW7 is not present in the public history yet, this will keep showing the newest available comparison until FPL publishes GW7's rank.</div>"
         f"<div class='rank-row'><span>Team value</span><strong>{html.escape(value_text)}</strong></div>"
         "</div>",
         unsafe_allow_html=True
@@ -1365,7 +1371,7 @@ st.markdown("""
 - Blends PPG/form with a conservative xG+xA signal, shrinks small samples toward a position baseline, estimates minutes from starts and appearances, penalizes uncertain/unavailable status, and adjusts each scheduled fixture individually. Displays cumulative xG/xA and per-90 rates.
 - Uses public player status and chance-of-playing fields where provided.
 - Does **not** access your FPL password, private `my-team` endpoint, or your personal selling prices.
-- This v2.5 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
+- This v2.6 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
 - Public FPL API is unofficial/undocumented and may change. Player/fixture data is cached for 30 minutes; manager profile/rank for 60 seconds; public picks/history for 2 minutes.
 - A sidebar **Refresh rank & squad** button clears data caches and reruns the dashboard.
 - Squad sync attempts to use all 15 players from `entry/{id}/event/{gw}/picks/` for the next Gameweek. If the picks endpoint doesn't provide all 15 (especially before deadline), the app clearly falls back to the saved screenshot baseline.
