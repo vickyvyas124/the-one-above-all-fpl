@@ -107,18 +107,39 @@ def estimate_points(p, team, fixtures, horizon=5):
         return 0.0, 3.0, 0
     return round(sum(scores), 1), round(sum(diffs) / len(diffs), 2), len(scores)
 
-st.title("⚽ The-One-Above-All — FPL Optimizer v1.2")
-st.caption("Free prototype • Team ID 2311669 • GW8 baseline recorded from your screenshots")
-st.warning("Forecasts are transparent estimates, not official FPL projections. Public endpoints may change; private squad data is not accessed. Confirm injuries and your actual selling prices before making a transfer.")
+st.markdown("""
+<style>
+.block-container {padding-top: 1.5rem; padding-bottom: 2rem; max-width: 1500px;}
+[data-testid="stSidebar"] {background: linear-gradient(180deg,#101b35 0%,#182746 100%);}
+[data-testid="stSidebar"] * {color: #f3f6ff !important;}
+.hero {padding: 1.35rem 1.5rem; border-radius: 18px; background: linear-gradient(115deg,#101b35 0%,#244b78 58%,#2d8a78 100%); color: white; margin-bottom: 1rem;}
+.hero h1 {color: white; margin: 0; font-size: 2rem;}
+.hero p {color: #dce9ff; margin: .45rem 0 0 0;}
+.kpi {padding: 1rem; border: 1px solid #e5eaf2; border-radius: 14px; background: #fff; box-shadow: 0 2px 8px rgba(16,27,53,.04);}
+.section-label {font-size: .85rem; text-transform: uppercase; letter-spacing: .08em; color: #64748b;}
+div[data-testid="stDataFrame"] {border-radius: 12px; overflow: hidden;}
+</style>
+<div class="hero">
+  <h1>⚽ The-One-Above-All</h1>
+  <p>Personal FPL decision desk · Team 2311669 · Five-Gameweek planning</p>
+</div>
+""", unsafe_allow_html=True)
+st.info("Forecasts are estimates, not official FPL projections. Confirm player availability and your personal selling prices before transferring.")
 
 with st.sidebar:
-    st.header("Optimizer settings")
+    st.header("⚙️ Optimizer settings")
+    st.caption("These controls change the calculations below.")
     team_id = st.number_input("FPL Team ID", min_value=1, value=2311669, step=1)
-    horizon = st.slider("Projection horizon (Gameweeks)", 1, 8, 5)
-    bank_m = st.number_input("Bank (£m)", min_value=0.0, max_value=20.0, value=0.7, step=0.1)
-    free_transfers = st.selectbox("Free transfers available", [1,2,3,4,5], index=0)
-    transfer_hit = st.checkbox("Allow a -4 hit if model sees a gain", value=False)
-    risk = st.select_slider("Risk appetite", options=["Conservative","Moderate","Aggressive"], value="Moderate")
+    horizon = st.slider("Projection horizon (Gameweeks)", 1, 8, 5,
+                         help="How many upcoming Gameweeks to include in player projections and transfer gains.")
+    bank_m = st.number_input("Bank (£m)", min_value=0.0, max_value=20.0, value=0.7, step=0.1,
+                             help="Added to the selling player's current public price to estimate an affordable replacement. Actual selling price may differ.")
+    free_transfers = st.selectbox("Free transfers available", [1,2,3,4,5], index=0,
+                                  help="Used in the decision guidance; the current shortlist compares one transfer at a time.")
+    transfer_hit = st.checkbox("Allow a -4 hit if model sees a gain", value=False,
+                                help="If enabled, subtracts four points from the projected gain before ranking. A hit should only be considered for a clear multi-week advantage.")
+    risk = st.select_slider("Risk appetite", options=["Conservative","Moderate","Aggressive"], value="Moderate",
+                             help="Conservative favors established minutes; Moderate balances projected gain and differential upside; Aggressive gives more weight to low-ownership upside.")
     st.caption("Squad is seeded from your latest screenshot. Verify names/prices below.")
 
 try:
@@ -224,18 +245,28 @@ if resolved:
     options = candidates[(candidates["Position"]==sell["Position"]) &
                          (~candidates["Player"].isin(squad_names)) &
                          (candidates["Price (£m)"] <= max_price)].copy()
-    options["Projected gain"] = options[f"Projected {horizon}GW pts"] - float(sell[f"Proj GW{gw}–GW{gw+horizon-1}"])
-    if not transfer_hit:
-        # Show all legal one-transfer options; transfer count is accounted for in recommendation text.
-        pass
-    options = options.sort_values(["Projected gain","Minutes"], ascending=False).head(15)
+    options["Raw gain"] = options[f"Projected {horizon}GW pts"] - float(sell[f"Proj GW{gw}–GW{gw+horizon-1}"])
+    options["Hit cost"] = 4 if transfer_hit else 0
+    options["Projected gain"] = options["Raw gain"] - options["Hit cost"]
+    # Risk setting affects the ranking, not the raw point projection.
+    ownership = options["Selected (%)"].fillna(0).astype(float)
+    minutes_reliability = (options["Minutes"].astype(float) / 900.0).clip(0, 1)
+    differential_bonus = (1.0 / (1.0 + ownership)) * (1.0 - ownership.clip(0,100) / 100.0)
+    if risk == "Conservative":
+        options["Decision score"] = options["Projected gain"] * (0.65 + 0.35 * minutes_reliability)
+    elif risk == "Aggressive":
+        options["Decision score"] = options["Projected gain"] + 1.5 * differential_bonus
+    else:
+        options["Decision score"] = options["Projected gain"] + 0.5 * differential_bonus
+    options = options.sort_values(["Decision score","Projected gain","Minutes"], ascending=False).head(15)
     if options.empty:
         st.info("No affordable out-of-squad player candidates matched this position under the rough budget estimate.")
     else:
         st.caption(f"Approximate replacement ceiling: £{max_price:.1f}m, using current price + bank. Enter actual selling value separately in your final decision.")
-        st.dataframe(options[["Player","Club","Price (£m)","Form","PPG","Minutes","Status","Chance (%)","xG","xA","xG/90","xA/90",f"Projected {horizon}GW pts","Selected (%)","Projected gain"]], use_container_width=True, hide_index=True)
+        st.caption(f"Ranking mode: {risk}. Horizon: {horizon} GWs. Hit penalty: {4 if transfer_hit else 0} points.")
+        st.dataframe(options[["Player","Club","Price (£m)","Form","PPG","Minutes","Status","Chance (%)","xG","xA","xG/90","xA/90",f"Projected {horizon}GW pts","Selected (%)","Projected gain","Decision score"]], use_container_width=True, hide_index=True)
         best=options.iloc[0]
-        st.success(f"Model's top rough candidate for {sell_name}: {best['Player']} ({best['Club']}) — projected gain {best['Projected gain']:+.1f} points over {horizon} GWs before uncertainty/transfer-hit adjustments.")
+        st.success(f"Top candidate under {risk.lower()} settings: {best['Player']} ({best['Club']}) — projected gain {best['Projected gain']:+.1f} points over {horizon} GWs. Decision score includes your risk preference; it is not a guaranteed return.")
         st.write("Decision rule: only transfer if the gain remains worthwhile after checking availability, actual selling price, expected minutes and the other 14 squad slots. A high projection alone is not a command to transfer.")
 
 st.subheader("What the model does — and does not do")
@@ -243,7 +274,7 @@ st.markdown("""
 - Blends PPG/form with a conservative xG+xA signal, shrinks small samples toward a position baseline, estimates minutes from starts and appearances, penalizes uncertain/unavailable status, and adjusts each scheduled fixture individually. Displays cumulative xG/xA and per-90 rates.
 - Uses public player status and chance-of-playing fields where provided.
 - Does **not** access your FPL password, private `my-team` endpoint, or your personal selling prices.
-- This v1.2 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
+- This v1.3 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
 - Public FPL API is unofficial/undocumented and may change. Data is cached for 30 minutes to reduce requests.
 """)
 st.caption(f"Last refreshed in this session: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. Use the app's refresh/reload to request fresh data.")
