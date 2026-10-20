@@ -36,27 +36,21 @@ def norm(s):
     return "".join(ch.lower() for ch in str(s) if ch.isalnum())
 
 def resolve_player(row, players):
-    # Try full name before a possibly ambiguous web_name alias. This prevents
-    # a common surname/alias match from blocking a unique full-name match.
+    # Prefer exact full-name matches before short aliases; aliases like Palmer
+    # can be ambiguous when several players share a common display name.
     full_name = norm(row[0])
     alias = norm(row[2])
-
     full_matches = [
         p for p in players
         if norm(p.get("first_name", "") + " " + p.get("second_name", "")) == full_name
     ]
     if len(full_matches) == 1:
         return full_matches[0]
-
     alias_matches = [p for p in players if norm(p.get("web_name", "")) == alias]
     if len(alias_matches) == 1:
         return alias_matches[0]
-
-    # Final conservative fallback: only use a unique partial web-name match.
     partial = [p for p in players if alias and alias in norm(p.get("web_name", ""))]
-    if len(partial) == 1:
-        return partial[0]
-    return None
+    return partial[0] if len(partial) == 1 else None
 
 def pos_name(p, types):
     return next((x.get("singular_name_short", "?") for x in types if x["id"] == p.get("element_type")), "?")
@@ -122,42 +116,75 @@ def estimate_points(p, team, fixtures, horizon=5):
 
 st.markdown("""
 <style>
-.block-container {padding-top: 1.25rem; padding-bottom: 2rem; max-width: 1600px;}
-[data-testid="stSidebar"] {background: linear-gradient(180deg,#101b35 0%,#182746 100%);}
-[data-testid="stSidebar"] h1,
-[data-testid="stSidebar"] h2,
-[data-testid="stSidebar"] h3,
-[data-testid="stSidebar"] label,
-[data-testid="stSidebar"] p,
-[data-testid="stSidebar"] .stMarkdown,
-[data-testid="stSidebar"] [data-testid="stWidgetLabel"] {color:#f3f6ff !important;}
-
-/* Critical readability fix: keep editable values dark on white controls. */
-[data-testid="stSidebar"] input,
-[data-testid="stSidebar"] textarea,
+:root {--pl-purple:#37003c;--pl-lime:#00ff87;--pl-cyan:#04f5ff;--ink:#202238;--muted:#6b7280;}
+.block-container {padding-top:1rem;padding-bottom:2.5rem;max-width:1540px;}
+[data-testid="stSidebar"] {background:linear-gradient(180deg,#19051d 0%,#37003c 60%,#24142b 100%);}
+[data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3,
+[data-testid="stSidebar"] label,[data-testid="stSidebar"] p,[data-testid="stSidebar"] .stMarkdown,
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] {color:#f6f3fa !important;}
+[data-testid="stSidebar"] input,[data-testid="stSidebar"] textarea,
 [data-testid="stSidebar"] [data-baseweb="select"] div,
 [data-testid="stSidebar"] [data-baseweb="input"] input,
 [data-testid="stSidebar"] [data-testid="stNumberInput"] input {
-  color:#172033 !important;
-  -webkit-text-fill-color:#172033 !important;
-  background-color:#ffffff !important;
-  opacity:1 !important;
+ color:#202238 !important;-webkit-text-fill-color:#202238 !important;background:#fff !important;opacity:1 !important;
 }
 [data-testid="stSidebar"] [data-testid="stNumberInput"] button,
-[data-testid="stSidebar"] [data-baseweb="select"] svg {color:#172033 !important; fill:#172033 !important;}
-[data-testid="stSidebar"] [data-testid="stSlider"] [data-testid="stMarkdownContainer"] p {color:#f3f6ff !important;}
+[data-testid="stSidebar"] [data-baseweb="select"] svg {color:#202238 !important;fill:#202238 !important;}
+[data-testid="stSidebar"] [data-testid="stSlider"] [data-testid="stMarkdownContainer"] p {color:#f6f3fa !important;}
 [data-testid="stSidebar"] [data-testid="stCheckbox"] label,
-[data-testid="stSidebar"] [data-testid="stCheckbox"] p {color:#f3f6ff !important;}
-.hero {padding:1.35rem 1.5rem; border-radius:18px; background:linear-gradient(115deg,#101b35 0%,#244b78 58%,#2d8a78 100%); color:white; margin-bottom:1rem;}
-.hero h1 {color:white; margin:0; font-size:2rem;}
-.hero p {color:#dce9ff; margin:.45rem 0 0 0;}
-div[data-testid="stMetric"] {padding:1rem; border:1px solid #e5eaf2; border-radius:14px; background:#fff; box-shadow:0 2px 8px rgba(16,27,53,.04);}
-div[data-testid="stDataFrame"] {border:1px solid #e5eaf2; border-radius:12px; overflow:hidden;}
-h2, h3 {letter-spacing:-.02em;}
+[data-testid="stSidebar"] [data-testid="stCheckbox"] p {color:#f6f3fa !important;}
+.hero {padding:1.4rem 1.6rem;border-radius:20px;background:linear-gradient(115deg,#210026 0%,#37003c 48%,#563b83 100%);color:#fff;margin-bottom:1.1rem;box-shadow:0 12px 32px rgba(55,0,60,.16);position:relative;overflow:hidden;}
+.hero:after {content:"";position:absolute;width:260px;height:260px;border-radius:50%;right:-65px;top:-130px;background:rgba(0,255,135,.12);}
+.hero-top {display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;}
+.hero h1 {color:#fff;margin:0;font-size:clamp(1.55rem,3vw,2.3rem);font-weight:850;letter-spacing:-.04em;}
+.hero p {color:#e8dced;margin:.4rem 0 0 0;font-size:.95rem;}
+.gw-chip {display:inline-block;background:#00ff87;color:#210026;padding:.42rem .8rem;border-radius:999px;font-weight:800;font-size:.86rem;}
+.kicker {font-size:.75rem;text-transform:uppercase;letter-spacing:.11em;color:#d7c9df;font-weight:700;margin-bottom:.2rem;}
+div[data-testid="stMetric"] {padding:.85rem 1rem;border:1px solid #ebe7ef;border-radius:15px;background:linear-gradient(180deg,#fff,#fbf9fc);box-shadow:0 4px 14px rgba(33,0,38,.05);}
+div[data-testid="stMetricLabel"] {color:#686173;font-weight:650;}
+div[data-testid="stMetricValue"] {color:#37003c;font-weight:850;}
+div[data-testid="stDataFrame"] {border:1px solid #e9e4ee;border-radius:13px;overflow:hidden;}
+h2,h3 {letter-spacing:-.025em;}
+.pitch-wrap {background:#0e7b45;border-radius:20px;padding:16px 12px 18px;position:relative;overflow:hidden;border:4px solid #fff;box-shadow:0 6px 20px rgba(12,90,52,.12);}
+.pitch-wrap:before {content:"";position:absolute;inset:0;background:repeating-linear-gradient(0deg,rgba(255,255,255,.035) 0,rgba(255,255,255,.035) 48px,rgba(0,0,0,.025) 48px,rgba(0,0,0,.025) 96px);pointer-events:none;}
+.pitch-lines {position:absolute;inset:10px;border:1.5px solid rgba(255,255,255,.28);border-radius:10px;pointer-events:none;}
+.pitch-lines:before {content:"";position:absolute;left:0;right:0;top:50%;border-top:1.5px solid rgba(255,255,255,.27);}
+.pitch-lines:after {content:"";position:absolute;width:90px;height:90px;left:50%;top:50%;transform:translate(-50%,-50%);border:1.5px solid rgba(255,255,255,.25);border-radius:50%;}
+.pitch-title {position:relative;z-index:1;text-align:center;color:#d9ffe9;font-weight:800;text-transform:uppercase;letter-spacing:.14em;font-size:.72rem;margin:2px 0 13px;}
+.pitch-row {position:relative;z-index:1;display:flex;justify-content:center;align-items:stretch;gap:clamp(5px,1.5vw,18px);margin:15px auto;max-width:920px;}
+.player-tile {width:clamp(74px,10vw,128px);min-width:0;border-radius:12px;overflow:hidden;text-align:center;background:#f8fafc;box-shadow:0 5px 10px rgba(0,0,0,.18);border:1px solid rgba(255,255,255,.8);}
+.player-tile .tile-top {background:linear-gradient(135deg,#37003c,#594277);color:#fff;padding:7px 3px 5px;font-weight:800;font-size:clamp(.68rem,1vw,.86rem);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.player-tile .tile-avatar {height:42px;display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,#f4eefa,#fff);color:#37003c;font-size:1.35rem;font-weight:900;}
+.player-tile .tile-meta {padding:5px 3px;color:#333044;font-size:clamp(.62rem,.8vw,.75rem);line-height:1.3;}
+.player-tile .tile-pts {font-weight:900;color:#37003c;font-size:.95rem;}
+.pitch-caption {position:relative;z-index:1;text-align:center;color:#e4ffef;font-size:.78rem;margin-top:10px;}
+.bench-grid {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;}
+.bench-card {background:#f5f2f8;border:1px solid #e6deeb;border-radius:12px;padding:10px;text-align:center;}
+.bench-name {font-weight:800;color:#37003c;font-size:.84rem;}
+.bench-sub {color:#6b6473;font-size:.76rem;margin-top:3px;}
+.section-intro {color:#777083;font-size:.92rem;margin-top:-.4rem;margin-bottom:.7rem;}
+@media (max-width:650px) {
+ .block-container {padding-left:.65rem;padding-right:.65rem;}
+ .hero {padding:1.05rem;border-radius:15px;}
+ .pitch-wrap {padding:10px 5px;}
+ .pitch-row {gap:4px;margin:10px auto;}
+ .player-tile {width:22%;border-radius:8px;}
+ .player-tile .tile-avatar {height:31px;font-size:1.05rem;}
+ .player-tile .tile-meta {font-size:.59rem;padding:4px 1px;}
+ .player-tile .tile-pts {font-size:.78rem;}
+ .player-tile .tile-top {font-size:.59rem;padding:6px 1px 4px;}
+ .bench-grid {grid-template-columns:repeat(2,minmax(0,1fr));}
+}
 </style>
 <div class="hero">
-  <h1>⚽ The-One-Above-All</h1>
-  <p>Personal FPL decision desk · Team 2311669 · Five-Gameweek planning</p>
+  <div class="hero-top">
+    <div>
+      <div class="kicker">Fantasy Premier League · Manager dashboard</div>
+      <h1>⚽ The-One-Above-All</h1>
+      <p>Squad hub · Transfer intelligence · Five-Gameweek planning</p>
+    </div>
+    <div class="gw-chip">NEXT GAMEWEEK · AUTO DATA</div>
+  </div>
 </div>
 """, unsafe_allow_html=True)
 st.info("Forecasts are estimates, not official FPL projections. Confirm player availability and your personal selling prices before transferring.")
@@ -199,18 +226,19 @@ try:
 except Exception:
     pass
 
-c1,c2,c3,c4 = st.columns(4)
-c1.metric("Next Gameweek", f"GW{gw}")
-c2.metric("Public data players", len(players))
-c3.metric("Recorded bank", f"£{bank_m:.1f}m")
-c4.metric("Projection horizon", f"{horizon} GWs")
+st.markdown(f"<div class='section-intro'>Team overview · public FPL data checked {datetime.now(timezone.utc).strftime('%d %b %Y, %H:%M UTC')}</div>", unsafe_allow_html=True)
+m1,m2,m3,m4 = st.columns(4)
+m1.metric("Next Gameweek", f"GW{gw}")
+m2.metric("Bank available", f"£{bank_m:.1f}m")
+m3.metric("Free transfers", str(free_transfers))
+m4.metric("Planning horizon", f"{horizon} GWs")
 if entry:
     a,b,c = st.columns(3)
-    a.metric("Latest public overall rank", f"{entry.get('summary_overall_rank', '—'):,}" if isinstance(entry.get('summary_overall_rank'),int) else "—")
+    a.metric("Overall rank", f"{entry.get('summary_overall_rank', '—'):,}" if isinstance(entry.get('summary_overall_rank'),int) else "—")
     b.metric("Overall points", f"{entry.get('summary_overall_points','—')}")
-    c.metric("Team value (public profile)", f"£{(entry.get('last_deadline_value') or 0)/10:.1f}m")
+    c.metric("Team value", f"£{(entry.get('last_deadline_value') or 0)/10:.1f}m")
 else:
-    st.info("Could not load public manager profile right now. Your saved screenshot remains the manual baseline: 491 points, rank 581,139, India league rank 12,964.")
+    st.info("Public manager profile could not be loaded. Use the latest rank shown in your FPL app as the authoritative checkpoint.")
 
 # Build name-resolved squad from saved baseline
 resolved=[]
@@ -240,14 +268,67 @@ for row in RECORDED_SQUAD:
     else:
         unmatched.append(row[2])
 
-st.subheader("Your recorded squad — current public player data")
+st.subheader("My squad")
+st.markdown("<div class='section-intro'>Pitch view seeded from your last lineup screenshot. Confirm your final XI and bench before the deadline.</div>", unsafe_allow_html=True)
 if unmatched:
     st.warning("Names not uniquely matched to public data (review manually): " + ", ".join(unmatched))
 if resolved:
     squad = pd.DataFrame(resolved)
-    st.dataframe(squad.drop(columns=["id"]), use_container_width=True, hide_index=True)
+    def esc(value):
+        import html
+        return html.escape(str(value))
+    projection_col = f"Proj GW{gw}–GW{gw+horizon-1}"
+    squad_lookup = {norm(r["Player"]): r for _, r in squad.iterrows()}
+    aliases = {
+        "Raya": ["raya"], "Egan": ["egan"], "Hall": ["hall"], "Calafiori": ["calafiori"],
+        "Palmer": ["palmer"], "Tavernier": ["tavernier"], "Groß": ["groß","gross"],
+        "Rogers": ["rogers"], "Kostoulas": ["kostoulas"], "João Pedro": ["joãopedro","joaopedro"],
+        "Haaland": ["haaland"], "Tzolakis": ["tzolakis"], "De Cuyper": ["decuyper"],
+        "Schade": ["schade"], "Davis": ["davis"]
+    }
+    def get_squad_record(alias):
+        for key in aliases.get(alias, [norm(alias)]):
+            if norm(key) in squad_lookup:
+                return squad_lookup[norm(key)]
+        matches = [r for k, r in squad_lookup.items() if norm(alias) in k or k in norm(alias)]
+        return matches[0] if len(matches) == 1 else None
+    def tile(alias):
+        r = get_squad_record(alias)
+        if r is None:
+            return f"<div class='player-tile'><div class='tile-top'>{esc(alias)}</div><div class='tile-avatar'>?</div><div class='tile-meta'>Data pending</div></div>"
+        short = str(r["Player"])
+        pts = r.get(projection_col, 0)
+        return (f"<div class='player-tile'><div class='tile-top'>{esc(short)}</div>"
+                f"<div class='tile-avatar'>👕</div><div class='tile-meta'>{esc(r['Club'])} · £{float(r['Price (£m)']):.1f}m<br>"
+                f"<span class='tile-pts'>{float(pts):.1f} pts</span></div></div>")
+    xi_rows = [
+        ("GOALKEEPER", ["Raya"]),
+        ("DEFENDERS", ["Egan","Hall","Calafiori"]),
+        ("MIDFIELDERS", ["Palmer","Tavernier","Groß","Rogers"]),
+        ("FORWARDS", ["Kostoulas","João Pedro","Haaland"])
+    ]
+    pitch_html = "<div class='pitch-wrap'><div class='pitch-lines'></div><div class='pitch-title'>Starting XI · 3–4–3 · recorded lineup</div>"
+    for label, names in xi_rows:
+        pitch_html += f"<div class='pitch-title'>{label}</div><div class='pitch-row'>"
+        pitch_html += "".join(tile(name) for name in names)
+        pitch_html += "</div>"
+    pitch_html += "<div class='pitch-caption'>Projected points are model estimates over your selected horizon — not Gameweek scores.</div></div>"
+    st.markdown(pitch_html, unsafe_allow_html=True)
+    st.markdown("#### Bench")
+    bench_names = ["Tzolakis","De Cuyper","Schade","Davis"]
+    bench_parts=[]
+    for name in bench_names:
+        r=get_squad_record(name)
+        if r is not None:
+            sub=f"{esc(r['Club'])} · £{float(r['Price (£m)']):.1f}m · {float(r.get(projection_col,0)):.1f} proj."
+        else:
+            sub="Data pending"
+        bench_parts.append(f"<div class='bench-card'><div class='bench-name'>{esc(name)}</div><div class='bench-sub'>{sub}</div></div>")
+    st.markdown("<div class='bench-grid'>"+"".join(bench_parts)+"</div>", unsafe_allow_html=True)
     total_current_cost = squad["Price (£m)"].sum()
-    st.caption(f"Sum of current public prices for matched players: £{total_current_cost:.1f}m. This is not necessarily your squad's purchase/selling value.")
+    st.caption(f"Public prices sum to £{total_current_cost:.1f}m for matched players. This is not necessarily your squad's purchase/selling value.")
+    with st.expander("View full squad statistics"):
+        st.dataframe(squad.drop(columns=["id"]), use_container_width=True, hide_index=True)
 else:
     st.error("No squad names could be matched. Update the name aliases in RECORDED_SQUAD.")
 
@@ -368,28 +449,11 @@ if resolved:
         st.dataframe(best_each[["Sell","Sell club","Buy","Buy club","Position","Buy price (£m)","Budget ceiling (£m)","Club count after transfer","Outgoing projected pts","Incoming projected pts","Projected gain","Minutes reliability (%)","Availability reliability (%)","Ownership (%)","Decision score","Verdict"]], use_container_width=True, hide_index=True)
         top = best_each.iloc[0]
         if unmatched:
-            st.warning(
-                "The move list is only provisional: one or more squad players are not matched to current public FPL records. "
-                "Do not act on the top move until all 15 players are matched, because club-limit checks may be incomplete."
-            )
-            st.markdown(
-                f"**Quick summary:** The model currently ranks **{top['Sell']} → {top['Buy']}** at an estimated **{top['Projected gain']:+.1f} points** over {horizon} Gameweeks, "
-                f"but this is **not an actionable recommendation** until squad matching is complete. You have **{free_transfers} free transfer(s)** recorded."
-            )
-        elif top["Sell"] == "Haaland":
-            st.warning(
-                "Captaincy check required: Haaland is the captain in your last recorded lineup. "
-                "This version does not fully model the captaincy opportunity cost of selling a premium captain, so do not execute this swap based on the projection alone."
-            )
-            if float(top["Projected gain"]) > 0:
-                st.markdown(
-                    f"**Quick summary:** The model ranks **{top['Sell']} → {top['Buy']}** at **{top['Projected gain']:+.1f} points** over {horizon} Gameweeks, "
-                    f"but the captaincy trade-off is not priced into this recommendation. Verify captain options, current form, availability and your actual selling price before deciding."
-                )
-            else:
-                st.markdown(
-                    f"**Quick summary:** No positive-gain move is recommended on the current estimates. **Keep the captaincy implications in mind** before considering a premium forward sale."
-                )
+            st.warning("Automatic recommendations are provisional because one or more squad players are not matched to public FPL data. Verify the full squad and club counts before acting.")
+            st.markdown(f"**Quick summary:** Top model-ranked move is **{top['Sell']} → {top['Buy']}** at an estimated **{top['Projected gain']:+.1f} points** over {horizon} Gameweeks, but this is not actionable until squad matching is complete.")
+        elif str(top["Sell"]).lower() == "haaland":
+            st.warning("Captaincy check required: Haaland was captain in your last recorded lineup. This model does not fully price the opportunity cost of replacing your captain.")
+            st.markdown(f"**Quick summary:** The model ranks **Haaland → {top['Buy']}** at **{top['Projected gain']:+.1f} points** over {horizon} Gameweeks, but do not act before comparing captaincy options and verifying actual selling price and team news.")
         elif float(top["Projected gain"]) > 0:
             st.success(f"Top automatic move under {risk.lower()} settings: {top['Sell']} → {top['Buy']} ({top['Buy club']}), projected {top['Projected gain']:+.1f} points over {horizon} GWs. Verdict: {top['Verdict']}. Check team news and actual selling price before acting.")
             if float(top["Projected gain"]) >= 5 and float(top["Minutes reliability (%)"]) >= 70 and float(top["Availability reliability (%)"]) >= 80:
@@ -498,7 +562,7 @@ st.markdown("""
 - Blends PPG/form with a conservative xG+xA signal, shrinks small samples toward a position baseline, estimates minutes from starts and appearances, penalizes uncertain/unavailable status, and adjusts each scheduled fixture individually. Displays cumulative xG/xA and per-90 rates.
 - Uses public player status and chance-of-playing fields where provided.
 - Does **not** access your FPL password, private `my-team` endpoint, or your personal selling prices.
-- This v1.8 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
+- This v1.9 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
 - Public FPL API is unofficial/undocumented and may change. Data is cached for 30 minutes to reduce requests.
 """)
 st.caption(f"Last refreshed in this session: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. Use the app's refresh/reload to request fresh data.")
