@@ -36,14 +36,27 @@ def norm(s):
     return "".join(ch.lower() for ch in str(s) if ch.isalnum())
 
 def resolve_player(row, players):
-    # Match exact normalized display name first, then web_name; show unmatched instead of guessing.
-    candidates = [p for p in players if norm(p.get("web_name","")) == norm(row[2])]
-    if not candidates:
-        candidates = [p for p in players if norm(p.get("first_name","")+" "+p.get("second_name","")) == norm(row[0])]
-    if not candidates:
-        # cautious partial match using web_name only if unique
-        candidates = [p for p in players if norm(row[2]) in norm(p.get("web_name",""))]
-    return candidates[0] if len(candidates) == 1 else None
+    # Try full name before a possibly ambiguous web_name alias. This prevents
+    # a common surname/alias match from blocking a unique full-name match.
+    full_name = norm(row[0])
+    alias = norm(row[2])
+
+    full_matches = [
+        p for p in players
+        if norm(p.get("first_name", "") + " " + p.get("second_name", "")) == full_name
+    ]
+    if len(full_matches) == 1:
+        return full_matches[0]
+
+    alias_matches = [p for p in players if norm(p.get("web_name", "")) == alias]
+    if len(alias_matches) == 1:
+        return alias_matches[0]
+
+    # Final conservative fallback: only use a unique partial web-name match.
+    partial = [p for p in players if alias and alias in norm(p.get("web_name", ""))]
+    if len(partial) == 1:
+        return partial[0]
+    return None
 
 def pos_name(p, types):
     return next((x.get("singular_name_short", "?") for x in types if x["id"] == p.get("element_type")), "?")
@@ -354,7 +367,30 @@ if resolved:
         st.caption(f"Risk mode: {risk} • Horizon: {horizon} GWs • Transfer hit applied: {hit_cost_auto} points. Prices use public prices plus bank as an approximation.")
         st.dataframe(best_each[["Sell","Sell club","Buy","Buy club","Position","Buy price (£m)","Budget ceiling (£m)","Club count after transfer","Outgoing projected pts","Incoming projected pts","Projected gain","Minutes reliability (%)","Availability reliability (%)","Ownership (%)","Decision score","Verdict"]], use_container_width=True, hide_index=True)
         top = best_each.iloc[0]
-        if float(top["Projected gain"]) > 0:
+        if unmatched:
+            st.warning(
+                "The move list is only provisional: one or more squad players are not matched to current public FPL records. "
+                "Do not act on the top move until all 15 players are matched, because club-limit checks may be incomplete."
+            )
+            st.markdown(
+                f"**Quick summary:** The model currently ranks **{top['Sell']} → {top['Buy']}** at an estimated **{top['Projected gain']:+.1f} points** over {horizon} Gameweeks, "
+                f"but this is **not an actionable recommendation** until squad matching is complete. You have **{free_transfers} free transfer(s)** recorded."
+            )
+        elif top["Sell"] == "Haaland":
+            st.warning(
+                "Captaincy check required: Haaland is the captain in your last recorded lineup. "
+                "This version does not fully model the captaincy opportunity cost of selling a premium captain, so do not execute this swap based on the projection alone."
+            )
+            if float(top["Projected gain"]) > 0:
+                st.markdown(
+                    f"**Quick summary:** The model ranks **{top['Sell']} → {top['Buy']}** at **{top['Projected gain']:+.1f} points** over {horizon} Gameweeks, "
+                    f"but the captaincy trade-off is not priced into this recommendation. Verify captain options, current form, availability and your actual selling price before deciding."
+                )
+            else:
+                st.markdown(
+                    f"**Quick summary:** No positive-gain move is recommended on the current estimates. **Keep the captaincy implications in mind** before considering a premium forward sale."
+                )
+        elif float(top["Projected gain"]) > 0:
             st.success(f"Top automatic move under {risk.lower()} settings: {top['Sell']} → {top['Buy']} ({top['Buy club']}), projected {top['Projected gain']:+.1f} points over {horizon} GWs. Verdict: {top['Verdict']}. Check team news and actual selling price before acting.")
             if float(top["Projected gain"]) >= 5 and float(top["Minutes reliability (%)"]) >= 70 and float(top["Availability reliability (%)"]) >= 80:
                 summary_action = "This is worth investigating as a potential transfer."
@@ -462,7 +498,7 @@ st.markdown("""
 - Blends PPG/form with a conservative xG+xA signal, shrinks small samples toward a position baseline, estimates minutes from starts and appearances, penalizes uncertain/unavailable status, and adjusts each scheduled fixture individually. Displays cumulative xG/xA and per-90 rates.
 - Uses public player status and chance-of-playing fields where provided.
 - Does **not** access your FPL password, private `my-team` endpoint, or your personal selling prices.
-- This v1.7 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
+- This v1.8 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
 - Public FPL API is unofficial/undocumented and may change. Data is cached for 30 minutes to reduce requests.
 """)
 st.caption(f"Last refreshed in this session: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. Use the app's refresh/reload to request fresh data.")
