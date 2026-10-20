@@ -153,6 +153,26 @@ st.markdown("""
 }
 [data-testid="stSidebar"] [data-testid="stNumberInput"] button,
 [data-testid="stSidebar"] [data-baseweb="select"] svg {color:#202238 !important;fill:#202238 !important;}
+[data-testid="stSidebar"] [data-testid="stButton"] button {
+  background:#00ff87 !important;
+  border:1px solid #00ff87 !important;
+  color:#210026 !important;
+  -webkit-text-fill-color:#210026 !important;
+  opacity:1 !important;
+  font-weight:800 !important;
+  box-shadow:0 5px 14px rgba(0,255,135,.12) !important;
+}
+[data-testid="stSidebar"] [data-testid="stButton"] button:hover {
+  background:#7dffbd !important;
+  border-color:#7dffbd !important;
+  color:#210026 !important;
+  -webkit-text-fill-color:#210026 !important;
+}
+[data-testid="stSidebar"] [data-testid="stButton"] button:disabled {
+  opacity:1 !important;
+  color:#210026 !important;
+  -webkit-text-fill-color:#210026 !important;
+}
 [data-testid="stSidebar"] [data-testid="stSlider"] [data-testid="stMarkdownContainer"] p {color:#f6f3fa !important;}
 [data-testid="stSidebar"] [data-testid="stCheckbox"] label,
 [data-testid="stSidebar"] [data-testid="stCheckbox"] p {color:#f6f3fa !important;}
@@ -296,7 +316,7 @@ if entry:
     a.metric("Overall rank", f"{entry.get('summary_overall_rank', '—'):,}" if isinstance(entry.get('summary_overall_rank'),int) else "—")
     b.metric("Overall points", f"{entry.get('summary_overall_points','—')}")
     c.metric("Team value", f"£{(entry.get('last_deadline_value') or 0)/10:.1f}m")
-    st.caption("Rank/points come from the public manager profile (60-second cache). Press Refresh rank & squad if it differs from your FPL app; FPL processing can still lag.")
+    st.caption("Rank/points source: public FPL manager profile · cached up to 60 seconds. The official app may update at a different time while FPL processes results. Use Refresh rank & squad to re-query public data.")
     if latest_history:
         st.caption(f"Latest completed Gameweek history: GW{latest_history.get('event', '—')} · rank {latest_history.get('overall_rank', '—')} · total {latest_history.get('total_points', '—')}. This can differ from the current profile during updates.")
 else:
@@ -305,7 +325,10 @@ else:
 if picks_sync_ok:
     st.success(picks_sync_note)
 else:
-    st.warning(picks_sync_note + " If FPL does not expose editable picks before the deadline, changes made now may not sync until the public picks endpoint updates.")
+    st.warning(
+        picks_sync_note + " The squad table and transfer scanner are still using your last saved baseline, not guaranteed current picks. "
+        "Use Refresh rank & squad to retry. If the warning remains before the deadline, public data cannot confirm your latest edits; update the recorded squad only via a deliberate code change or wait for public picks to appear."
+    )
 
 # Build squad from public picks when available, otherwise saved screenshot baseline
 resolved=[]
@@ -653,7 +676,7 @@ st.markdown("""
 - Blends PPG/form with a conservative xG+xA signal, shrinks small samples toward a position baseline, estimates minutes from starts and appearances, penalizes uncertain/unavailable status, and adjusts each scheduled fixture individually. Displays cumulative xG/xA and per-90 rates.
 - Uses public player status and chance-of-playing fields where provided.
 - Does **not** access your FPL password, private `my-team` endpoint, or your personal selling prices.
-- This v2.0 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
+- This v2.1 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
 - Public FPL API is unofficial/undocumented and may change. Player/fixture data is cached for 30 minutes; manager profile/rank for 60 seconds; public picks/history for 2 minutes.
 - A sidebar **Refresh rank & squad** button clears data caches and reruns the dashboard.
 - Squad sync attempts to use all 15 players from `entry/{id}/event/{gw}/picks/` for the next Gameweek. If the picks endpoint doesn't provide all 15 (especially before deadline), the app clearly falls back to the saved screenshot baseline.
