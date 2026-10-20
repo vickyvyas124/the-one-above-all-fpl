@@ -32,6 +32,29 @@ def get_json(path):
     r.raise_for_status()
     return r.json()
 
+@st.cache_data(ttl=60, show_spinner=False)
+def get_manager_profile(team_id):
+    """Short-cache public profile so rank/points refresh more frequently."""
+    r = requests.get(f"{BASE}/entry/{int(team_id)}/", timeout=20,
+                     headers={"User-Agent":"Mozilla/5.0 FPL-Optimizer/2.0"})
+    r.raise_for_status()
+    return r.json()
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_entry_picks(team_id, gameweek):
+    """Public picks for a specific Gameweek; may not expose editable picks before deadline."""
+    r = requests.get(f"{BASE}/entry/{int(team_id)}/event/{int(gameweek)}/picks/",
+                     timeout=20, headers={"User-Agent":"Mozilla/5.0 FPL-Optimizer/2.0"})
+    r.raise_for_status()
+    return r.json()
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_entry_history(team_id):
+    r = requests.get(f"{BASE}/entry/{int(team_id)}/history/",
+                     timeout=20, headers={"User-Agent":"Mozilla/5.0 FPL-Optimizer/2.0"})
+    r.raise_for_status()
+    return r.json()
+
 def norm(s):
     return "".join(ch.lower() for ch in str(s) if ch.isalnum())
 
@@ -203,7 +226,13 @@ with st.sidebar:
                                 help="If enabled, subtracts four points from the projected gain before ranking. A hit should only be considered for a clear multi-week advantage.")
     risk = st.select_slider("Risk appetite", options=["Conservative","Moderate","Aggressive"], value="Moderate",
                              help="Conservative favors established minutes; Moderate balances projected gain and differential upside; Aggressive gives more weight to low-ownership upside.")
-    st.caption("Squad is seeded from your latest screenshot. Verify names/prices below.")
+    if st.button("↻ Refresh rank & squad", use_container_width=True):
+        get_manager_profile.clear()
+        get_entry_picks.clear()
+        get_entry_history.clear()
+        get_json.clear()
+        st.rerun()
+    st.caption("Rank refreshes from the public manager profile. Squad uses public Gameweek picks when available.")
 
 try:
     boot = get_json("bootstrap-static/")
@@ -222,9 +251,39 @@ current_event = next((e for e in events if e.get("is_current")), None)
 gw = next_event.get("id") if next_event else ((current_event.get("id",7)+1) if current_event else 8)
 entry = {}
 try:
-    entry = get_json(f"entry/{int(team_id)}/")
+    entry = get_manager_profile(int(team_id))
 except Exception:
     pass
+
+# Public endpoints do not require the user's FPL password. Prefer the selected
+# upcoming Gameweek's public picks if the full 15-player list is available.
+squad_rows = RECORDED_SQUAD
+public_picks_for_display = []
+picks_sync_ok = False
+picks_sync_note = "Public picks for the upcoming Gameweek were not available; using the saved squad baseline."
+try:
+    picks_payload = get_entry_picks(int(team_id), int(gw))
+    picks = picks_payload.get("picks", []) if isinstance(picks_payload, dict) else []
+    elements_by_id = {int(p["id"]): p for p in players}
+    if len(picks) == 15 and all(int(pk.get("element", -1)) in elements_by_id for pk in picks):
+        dynamic_rows = []
+        for pick in sorted(picks, key=lambda x: int(x.get("position", 99))):
+            player = elements_by_id[int(pick["element"])]
+            full_name = (player.get("first_name", "") + " " + player.get("second_name", "")).strip()
+            dynamic_rows.append((full_name, pos_name(player, types), player.get("web_name", full_name)))
+        squad_rows = dynamic_rows
+        public_picks_for_display = sorted(picks, key=lambda x: int(x.get("position", 99)))
+        picks_sync_ok = True
+        picks_sync_note = f"Squad loaded from public picks for GW{gw}; the lineup and bench tiles will use these picks."
+except Exception:
+    pass
+
+try:
+    history_payload = get_entry_history(int(team_id))
+    season_history = history_payload.get("current", []) if isinstance(history_payload, dict) else []
+    latest_history = season_history[-1] if season_history else {}
+except Exception:
+    latest_history = {}
 
 st.markdown(f"<div class='section-intro'>Team overview · public FPL data checked {datetime.now(timezone.utc).strftime('%d %b %Y, %H:%M UTC')}</div>", unsafe_allow_html=True)
 m1,m2,m3,m4 = st.columns(4)
@@ -237,13 +296,21 @@ if entry:
     a.metric("Overall rank", f"{entry.get('summary_overall_rank', '—'):,}" if isinstance(entry.get('summary_overall_rank'),int) else "—")
     b.metric("Overall points", f"{entry.get('summary_overall_points','—')}")
     c.metric("Team value", f"£{(entry.get('last_deadline_value') or 0)/10:.1f}m")
+    st.caption("Rank/points come from the public manager profile (60-second cache). Press Refresh rank & squad if it differs from your FPL app; FPL processing can still lag.")
+    if latest_history:
+        st.caption(f"Latest completed Gameweek history: GW{latest_history.get('event', '—')} · rank {latest_history.get('overall_rank', '—')} · total {latest_history.get('total_points', '—')}. This can differ from the current profile during updates.")
 else:
     st.info("Public manager profile could not be loaded. Use the latest rank shown in your FPL app as the authoritative checkpoint.")
 
-# Build name-resolved squad from saved baseline
+if picks_sync_ok:
+    st.success(picks_sync_note)
+else:
+    st.warning(picks_sync_note + " If FPL does not expose editable picks before the deadline, changes made now may not sync until the public picks endpoint updates.")
+
+# Build squad from public picks when available, otherwise saved screenshot baseline
 resolved=[]
 unmatched=[]
-for row in RECORDED_SQUAD:
+for row in squad_rows:
     p=resolve_player(row, players)
     if p:
         teamname=teams.get(p.get("team"),{}).get("short_name","?")
@@ -269,7 +336,7 @@ for row in RECORDED_SQUAD:
         unmatched.append(row[2])
 
 st.subheader("My squad")
-st.markdown("<div class='section-intro'>Pitch view seeded from your last lineup screenshot. Confirm your final XI and bench before the deadline.</div>", unsafe_allow_html=True)
+st.markdown("<div class='section-intro'>Pitch view uses public picks when available; otherwise it falls back to your recorded lineup screenshot. Confirm XI and bench before the deadline.</div>", unsafe_allow_html=True)
 if unmatched:
     st.warning("Names not uniquely matched to public data (review manually): " + ", ".join(unmatched))
 if resolved:
@@ -301,13 +368,38 @@ if resolved:
         return (f"<div class='player-tile'><div class='tile-top'>{esc(short)}</div>"
                 f"<div class='tile-avatar'>👕</div><div class='tile-meta'>{esc(r['Club'])} · £{float(r['Price (£m)']):.1f}m<br>"
                 f"<span class='tile-pts'>{float(pts):.1f} pts</span></div></div>")
-    xi_rows = [
-        ("GOALKEEPER", ["Raya"]),
-        ("DEFENDERS", ["Egan","Hall","Calafiori"]),
-        ("MIDFIELDERS", ["Palmer","Tavernier","Groß","Rogers"]),
-        ("FORWARDS", ["Kostoulas","João Pedro","Haaland"])
-    ]
-    pitch_html = "<div class='pitch-wrap'><div class='pitch-lines'></div><div class='pitch-title'>Starting XI · 3–4–3 · recorded lineup</div>"
+    if picks_sync_ok and public_picks_for_display:
+        # Use actual public pick positions and player roles to render the current squad.
+        picks_by_id = {int(p.get("id")): p for p in players}
+        starters = [pk for pk in public_picks_for_display if int(pk.get("position", 99)) <= 11]
+        actual_groups = {1: [], 2: [], 3: [], 4: []}
+        for pick in starters:
+            player = picks_by_id.get(int(pick.get("element", -1)))
+            if player:
+                role = int(player.get("element_type", 0))
+                if role in actual_groups:
+                    actual_groups[role].append(player.get("web_name", "Player"))
+        xi_rows = [
+            ("GOALKEEPER", actual_groups[1]),
+            ("DEFENDERS", actual_groups[2]),
+            ("MIDFIELDERS", actual_groups[3]),
+            ("FORWARDS", actual_groups[4])
+        ]
+        bench_names = []
+        for pick in public_picks_for_display:
+            if int(pick.get("position", 0)) >= 12:
+                player = picks_by_id.get(int(pick.get("element", -1)))
+                if player:
+                    bench_names.append(player.get("web_name", "Player"))
+    else:
+        xi_rows = [
+            ("GOALKEEPER", ["Raya"]),
+            ("DEFENDERS", ["Egan","Hall","Calafiori"]),
+            ("MIDFIELDERS", ["Palmer","Tavernier","Groß","Rogers"]),
+            ("FORWARDS", ["Kostoulas","João Pedro","Haaland"])
+        ]
+        bench_names = ["Tzolakis","De Cuyper","Schade","Davis"]
+    pitch_html = "<div class='pitch-wrap'><div class='pitch-lines'></div><div class='pitch-title'>Starting XI · public picks when available</div>"
     for label, names in xi_rows:
         pitch_html += f"<div class='pitch-title'>{label}</div><div class='pitch-row'>"
         pitch_html += "".join(tile(name) for name in names)
@@ -315,7 +407,6 @@ if resolved:
     pitch_html += "<div class='pitch-caption'>Projected points are model estimates over your selected horizon — not Gameweek scores.</div></div>"
     st.markdown(pitch_html, unsafe_allow_html=True)
     st.markdown("#### Bench")
-    bench_names = ["Tzolakis","De Cuyper","Schade","Davis"]
     bench_parts=[]
     for name in bench_names:
         r=get_squad_record(name)
@@ -562,7 +653,10 @@ st.markdown("""
 - Blends PPG/form with a conservative xG+xA signal, shrinks small samples toward a position baseline, estimates minutes from starts and appearances, penalizes uncertain/unavailable status, and adjusts each scheduled fixture individually. Displays cumulative xG/xA and per-90 rates.
 - Uses public player status and chance-of-playing fields where provided.
 - Does **not** access your FPL password, private `my-team` endpoint, or your personal selling prices.
-- This v1.9 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
-- Public FPL API is unofficial/undocumented and may change. Data is cached for 30 minutes to reduce requests.
+- This v2.0 is a transparent baseline, not a trained machine-learning model. It does not yet optimize the entire 15-player squad simultaneously, model price changes, or estimate rank probabilities.
+- Public FPL API is unofficial/undocumented and may change. Player/fixture data is cached for 30 minutes; manager profile/rank for 60 seconds; public picks/history for 2 minutes.
+- A sidebar **Refresh rank & squad** button clears data caches and reruns the dashboard.
+- Squad sync attempts to use all 15 players from `entry/{id}/event/{gw}/picks/` for the next Gameweek. If the picks endpoint doesn't provide all 15 (especially before deadline), the app clearly falls back to the saved screenshot baseline.
+- The app does not access the authenticated `/my-team/{id}/` endpoint and does not ask for or store an FPL password/cookie. This means the latest editable pre-deadline team might not always be publicly available.
 """)
 st.caption(f"Last refreshed in this session: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. Use the app's refresh/reload to request fresh data.")
