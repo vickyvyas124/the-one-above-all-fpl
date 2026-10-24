@@ -180,6 +180,20 @@ class HistoricalBacktestTests(unittest.TestCase):
         self.assertTrue((blank["prediction_model"] == 0).all())
         self.assertTrue((blank["prediction_expected_minutes"] == 0).all())
 
+    def test_fixture_code_lookup_supplies_missing_gameweek_column(self):
+        raw = self.synthetic_raw().rename(columns={"fixture": "fixture_code"})
+        fixture_table = (raw[["fixture_code", "round"]].drop_duplicates()
+                         .rename(columns={"fixture_code": "code", "round": "event"}))
+        raw = raw.drop(columns=["round"])
+        # The 2025-26 archive is missing round/event; its companion fixture table
+        # maps each fixture_code to the official FPL event/Gameweek.
+        with patch.object(historical_backtest, "fetch_csv", side_effect=[raw, fixture_table]):
+            grouped = historical_backtest.season_frame("2025-26", "synthetic-player-file")
+        self.assertEqual(set(grouped["gameweek"].unique()), {1, 2, 3, 4})
+        gw2 = grouped[grouped["gameweek"] == 2]
+        self.assertTrue((gw2["fixture_count"] == 2).all())
+        self.assertEqual(gw2["player_id"].nunique(), 4)
+
     def test_target_gw_points_do_not_leak_into_target_prediction(self):
         with patch.object(historical_backtest, "fetch_csv", return_value=self.synthetic_raw()):
             grouped = historical_backtest.season_frame("2025-26", "synthetic")
