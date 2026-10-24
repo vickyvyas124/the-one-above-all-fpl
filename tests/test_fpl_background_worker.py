@@ -1,4 +1,5 @@
 import sys
+import os
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8,6 +9,7 @@ from unittest.mock import patch
 import pandas as pd
 
 import fpl_background_worker
+import fpl_snapshot_store
 
 
 class BackgroundWorkerArtifactTests(unittest.TestCase):
@@ -22,7 +24,7 @@ class BackgroundWorkerArtifactTests(unittest.TestCase):
                 "actual_points_5gw": 0, "actual_minutes_5gw": 0,
             })
             pd.DataFrame([old], columns=fpl_background_worker.COLUMNS).to_csv(log_path, index=False)
-            deadline = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+            deadline = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
             bootstrap = {
                 "elements": [{"id": 7, "team": 1, "element_type": 3, "status": "a", "minutes": 90}],
                 "teams": [{"id": 1, "short_name": "TST"}],
@@ -38,21 +40,41 @@ class BackgroundWorkerArtifactTests(unittest.TestCase):
                     return bootstrap
                 if path == "fixtures/":
                     return []
+                if path == "element-summary/7/":
+                    return {"history": []}
+                if path == "entry/2311669/event/2/picks/":
+                    return {"picks": []}
+                if path == "entry/2311669/":
+                    return {"bank": 0, "free_transfers": None}
                 if path == "event/1/live/":
                     return {"elements": [{"id": 7, "stats": {"total_points": 6, "minutes": 90}}]}
                 raise AssertionError(f"Unexpected API path: {path}")
 
-            with patch.object(fpl_background_worker, "get_json", side_effect=fake_get_json), \
+            def fake_record(path, *args, **kwargs):
+                payload = fake_get_json(path)
+                body = __import__("json").dumps(payload).encode()
+                return payload, fpl_snapshot_store.payload_record(
+                    body=body, url=f"https://example.test/{path}", status_code=200,
+                    fetched_at_utc=datetime.now(timezone.utc),
+                )
+
+            snapshot_dir = Path(temp) / "snapshots"
+            with patch.dict(os.environ, {"FPL_SNAPSHOT_DIR": str(snapshot_dir)}), \
+                 patch.object(fpl_background_worker, "get_json", side_effect=fake_get_json), \
+                 patch.object(fpl_background_worker, "get_json_with_record", side_effect=fake_record), \
                  patch.object(fpl_background_worker, "season_label", return_value="2026-27"), \
-                 patch.object(fpl_background_worker, "fetch_history_signals") as history_fetch, \
                  patch.object(sys, "argv", ["fpl_background_worker.py", "--csv-path", str(log_path)]):
                 self.assertEqual(fpl_background_worker.main(), 0)
-                history_fetch.assert_not_called()
 
             result = pd.read_csv(log_path)
             self.assertEqual(len(result), 1)
             self.assertEqual(set(result["gameweek"]), {1})
             self.assertEqual(float(result.loc[0, "actual_points"]), 6.0)
+            manifest_path = snapshot_dir / "2026-27" / "gw02" / "6h" / "manifest.json"
+            self.assertTrue(manifest_path.exists())
+            manifest = __import__("json").loads(manifest_path.read_text())
+            self.assertFalse(manifest["forecast"]["included"])
+            self.assertEqual(manifest["model"]["status"], "missing")
 
     def test_unreadable_existing_log_is_preserved_and_worker_fails_closed(self):
         with TemporaryDirectory(dir=Path.cwd()) as temp:

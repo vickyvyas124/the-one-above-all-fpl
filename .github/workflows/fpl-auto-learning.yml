@@ -15,6 +15,9 @@ concurrency:
 
 jobs:
   update-forecasts:
+    # Persistent writes to fpl-data must never run from feature branches,
+    # including manually dispatched workflow runs.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -56,10 +59,95 @@ jobs:
           fi
           echo "FPL_DATA_DIR=$DATA_DIR" >> "$GITHUB_ENV"
 
+      - name: Prepare snapshot workspace and restore append-only diagnostics
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SNAPSHOT_DIR="$RUNNER_TEMP/fpl-snapshots"
+          mkdir -p "$SNAPSHOT_DIR"
+          DIAGNOSTICS_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/diagnostics.jsonl?ref=fpl-snapshots"
+          HTTP_STATUS="$(curl --silent --show-error --location --output "$SNAPSHOT_DIR/diagnostics.jsonl" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'Accept: application/vnd.github.raw+json' \
+            --write-out '%{http_code}' "$DIAGNOSTICS_URL")"
+          if [[ "$HTTP_STATUS" == '404' ]]; then
+            : > "$SNAPSHOT_DIR/diagnostics.jsonl"
+          elif [[ "$HTTP_STATUS" != '200' ]]; then
+            echo "Unable to read persistent snapshot diagnostics (HTTP $HTTP_STATUS)." >&2
+            exit 1
+          fi
+          INDEX_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/reconciliation-index.json?ref=fpl-snapshots"
+          INDEX_STATUS="$(curl --silent --show-error --location --output "$SNAPSHOT_DIR/reconciliation-index.json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'Accept: application/vnd.github.raw+json' \
+            --write-out '%{http_code}' "$INDEX_URL")"
+          if [[ "$INDEX_STATUS" == '404' ]]; then
+            printf '{}\n' > "$SNAPSHOT_DIR/reconciliation-index.json"
+          elif [[ "$INDEX_STATUS" != '200' ]]; then
+            echo "Unable to read score reconciliation index (HTTP $INDEX_STATUS)." >&2
+            exit 1
+          fi
+
+      - name: Record snapshot workspace before capture
+        id: snapshot-before
+        shell: bash
+        run: |
+          set -euo pipefail
+          find "$RUNNER_TEMP/fpl-snapshots" -type f -print0 | sort -z | xargs -0 -r sha256sum | sha256sum \
+            | cut -d ' ' -f 1 > "$RUNNER_TEMP/snapshot-store-before.sha256"
+
       - name: Snapshot forecasts and reconcile actual scores
+        id: snapshot-run
         env:
           FPL_TEAM_ID: '2311669'
-        run: python fpl_background_worker.py --csv-path "$FPL_DATA_DIR/forecast_log.csv"
+          FPL_SNAPSHOT_DIR: ${{ runner.temp }}/fpl-snapshots
+          FPL_SNAPSHOT_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python fpl_background_worker.py --csv-path "$FPL_DATA_DIR/forecast_log.csv"
+          find "$RUNNER_TEMP/fpl-snapshots" -type f -print0 | sort -z | xargs -0 -r sha256sum | sha256sum \
+            | cut -d ' ' -f 1 > "$RUNNER_TEMP/snapshot-store-after.sha256"
+          if cmp -s "$RUNNER_TEMP/snapshot-store-before.sha256" "$RUNNER_TEMP/snapshot-store-after.sha256"; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Persist new snapshots to dedicated branch
+        if: steps.snapshot-run.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          SOURCE="$RUNNER_TEMP/fpl-snapshots"
+          DATA_DIR="$RUNNER_TEMP/fpl-snapshot-branch"
+          if git ls-remote --exit-code --heads "$REMOTE_URL" fpl-snapshots >/dev/null 2>&1; then
+            git clone --depth 1 --filter=blob:none --no-checkout --single-branch \
+              --branch fpl-snapshots "$REMOTE_URL" "$DATA_DIR"
+            git -C "$DATA_DIR" read-tree HEAD
+          else
+            mkdir -p "$DATA_DIR"
+            git -C "$DATA_DIR" init -b fpl-snapshots
+            git -C "$DATA_DIR" remote add origin "$REMOTE_URL"
+          fi
+          cp -a "$SOURCE/." "$DATA_DIR/"
+          git -C "$DATA_DIR" config user.name 'github-actions[bot]'
+          git -C "$DATA_DIR" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          for item in "$SOURCE"/*; do
+            [[ -e "$item" ]] || continue
+            git -C "$DATA_DIR" add -- "${item#"$SOURCE"/}"
+          done
+          if ! git -C "$DATA_DIR" diff --cached --quiet; then
+            git -C "$DATA_DIR" commit -m 'Capture immutable FPL deadline snapshot'
+            git -C "$DATA_DIR" push origin HEAD:fpl-snapshots
+          else
+            echo 'Snapshot branch already contains all captured data.'
+          fi
 
       - name: Persist log updates
         env:
