@@ -25,7 +25,7 @@ jobs:
           cache: pip
 
       - name: Install backtest dependencies
-        run: python -m pip install --disable-pip-version-check pandas requests
+        run: python -m pip install --disable-pip-version-check numpy pandas requests
 
       - name: Validate engine and metrics
         run: python -m unittest discover -s tests -v
@@ -52,10 +52,11 @@ jobs:
           cp "$RUNNER_TEMP/historical-output/historical_backtest_summary.csv" "$DATA_DIR/"
           cp "$RUNNER_TEMP/historical-output/historical_backtest_gameweeks.csv" "$DATA_DIR/"
           cp "$RUNNER_TEMP/historical-output/historical_backtest_metadata.json" "$DATA_DIR/"
+          cp "$RUNNER_TEMP/historical-output/trained_fpl_model.json" "$DATA_DIR/"
           cd "$DATA_DIR"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add historical_backtest_summary.csv historical_backtest_gameweeks.csv historical_backtest_metadata.json
+          git add historical_backtest_summary.csv historical_backtest_gameweeks.csv historical_backtest_metadata.json trained_fpl_model.json
           if ! git diff --cached --quiet; then
             git commit -m 'Update historical FPL backtest results [skip ci]'
             git push origin HEAD:fpl-data
