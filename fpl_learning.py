@@ -15,6 +15,7 @@ from typing import Any, Mapping
 import numpy as np
 
 MODEL_VERSION = "3.0"
+FEATURE_POLICY = "point_in_time_lagged_no_target_schedule_v1"
 POSITION_FEATURES = ["position_GKP", "position_DEF", "position_MID", "position_FWD"]
 NUMERIC_FEATURES = [
     "season_mean_prev",
@@ -62,6 +63,10 @@ def make_feature_row(
         season_mean = fallback_season_mean
     if recent_mean is None:
         recent_mean = fallback_recent_mean
+    # Historical archives do not record what fixture assignments were known at
+    # each old deadline. Keep the public model schema stable, but make schedule
+    # fields neutral in both training and inference. The engine applies the live
+    # published fixture count after predicting a single-fixture expectation.
     row.update({
         "season_mean_prev": _safe_float(season_mean),
         "recent_mean_prev": _safe_float(recent_mean),
@@ -70,8 +75,8 @@ def make_feature_row(
         "recent_start_rate_prev": _safe_float(hist.get("recent_start_rate")),
         "season_xgi_per90_prev": _safe_float(hist.get("season_xgi_per90"), fallback_xgi_per90),
         "recent_xgi_per90_prev": _safe_float(hist.get("recent_xgi_per90"), fallback_xgi_per90),
-        "fixture_count": float(max(0, min(3, int(fixture_count)))),
-        "home_share": max(0.0, min(1.0, _safe_float(home_share, 0.5))),
+        "fixture_count": 1.0,
+        "home_share": 0.5,
     })
     return row
 
@@ -88,6 +93,8 @@ def fit_ridge_model(frame, *, source_seasons: list[str] | None = None, alpha: fl
         clean[col] = pd.to_numeric(clean[col], errors="coerce")
     clean = clean.replace([np.inf, -np.inf], np.nan).dropna(subset=[TARGET_COLUMN])
     clean[FEATURES] = clean[FEATURES].fillna(0.0)
+    clean["fixture_count"] = 1.0
+    clean["home_share"] = 0.5
     if len(clean) < 500:
         raise ValueError(f"Need at least 500 labelled player-Gameweeks to fit; got {len(clean)}")
 
@@ -104,6 +111,7 @@ def fit_ridge_model(frame, *, source_seasons: list[str] | None = None, alpha: fl
     beta = np.linalg.solve(gram + float(alpha) * np.eye(gram.shape[0]), z.T @ y_centered)
     return {
         "model_version": MODEL_VERSION,
+        "feature_policy": FEATURE_POLICY,
         "model_type": "standardized_ridge_regression",
         "target": "total FPL points in target Gameweek",
         "features": list(FEATURES),
@@ -121,7 +129,8 @@ def fit_ridge_model(frame, *, source_seasons: list[str] | None = None, alpha: fl
 
 def predict_features(model: Mapping[str, Any] | None, row: Mapping[str, Any]) -> float | None:
     """Return non-negative expected points for one Gameweek, or None without a valid model."""
-    if not model or str(model.get("model_version")) != MODEL_VERSION:
+    if (not model or str(model.get("model_version")) != MODEL_VERSION
+            or model.get("feature_policy") != FEATURE_POLICY):
         return None
     try:
         features = list(model["features"])
@@ -148,6 +157,8 @@ def save_model(model: Mapping[str, Any], path: str | Path) -> None:
 def load_model(path: str | Path) -> dict[str, Any] | None:
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        return payload if str(payload.get("model_version")) == MODEL_VERSION and payload.get("features") == FEATURES else None
+        return payload if (str(payload.get("model_version")) == MODEL_VERSION
+                           and payload.get("features") == FEATURES
+                           and payload.get("feature_policy") == FEATURE_POLICY) else None
     except (OSError, ValueError, TypeError):
         return None

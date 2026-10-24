@@ -1,4 +1,7 @@
 import unittest
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import numpy as np
 import pandas as pd
 
@@ -58,13 +61,14 @@ class FutureModelTests(unittest.TestCase):
             fixture_count=2, home_share=0.5,
         )
         self.assertEqual(set(row), set(fpl_learning.FEATURES))
-        self.assertEqual(row["fixture_count"], 2.0)
+        self.assertEqual(row["fixture_count"], 1.0)
+        self.assertEqual(row["home_share"], 0.5)
         self.assertEqual(row["position_FWD"], 1.0)
 
     def test_invalid_model_falls_back_cleanly(self):
         self.assertIsNone(fpl_learning.predict_features({"model_version": "2.9"}, {}))
 
-    def test_model_fixture_features_distinguish_schedule(self):
+    def test_schedule_features_are_neutralized_in_training_and_inference(self):
         frame = self.training_frame()
         model = fpl_learning.fit_ridge_model(frame)
         base = fpl_learning.make_feature_row(
@@ -72,8 +76,18 @@ class FutureModelTests(unittest.TestCase):
             "recent_minutes_per_fixture": 75, "recent_appearance_rate": .9,
             "recent_start_rate": .8, "season_xgi_per90": .5, "recent_xgi_per90": .6},
             fixture_count=1, home_share=0.5)
-        double = dict(base, fixture_count=2.0)
-        self.assertGreater(fpl_learning.predict_features(model, double), fpl_learning.predict_features(model, base))
+        double = dict(base, fixture_count=2.0, home_share=1.0)
+        self.assertEqual(fpl_learning.predict_features(model, double), fpl_learning.predict_features(model, base))
+        self.assertEqual(model["feature_policy"], fpl_learning.FEATURE_POLICY)
+
+    def test_old_artifact_without_feature_policy_is_rejected(self):
+        model = fpl_learning.fit_ridge_model(self.training_frame())
+        model.pop("feature_policy")
+        self.assertIsNone(fpl_learning.predict_features(model, {}))
+        with TemporaryDirectory(dir=Path.cwd()) as temp:
+            path = Path(temp) / "model.json"
+            path.write_text(json.dumps(model), encoding="utf-8")
+            self.assertIsNone(fpl_learning.load_model(path))
 
     def test_engine_uses_model_for_future_gameweeks_and_returns_fixture_total(self):
         model = fpl_learning.fit_ridge_model(self.training_frame())

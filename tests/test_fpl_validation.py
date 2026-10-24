@@ -1,4 +1,7 @@
 import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import pandas as pd
@@ -151,6 +154,8 @@ class HistoricalBacktestTests(unittest.TestCase):
                         "element_type": position, "expected_goals": .1 * player_id,
                         "expected_assists": .05 * player_id, "was_home": fixture_no % 2 == 1,
                         "fixture": fixture_id, "team_code": team_code, "web_name": f"P{player_id}",
+                        "kickoff_time": (datetime(2025, 8, 1, tzinfo=timezone.utc)
+                                         + timedelta(days=(gw - 1) * 7 + fixture_no - 1)).isoformat(),
                     })
         return pd.DataFrame(rows)
 
@@ -161,6 +166,8 @@ class HistoricalBacktestTests(unittest.TestCase):
         gw2 = grouped[grouped["gameweek"] == 2]
         self.assertTrue((gw2["fixture_count"] == 2).all())
         self.assertEqual(gw2["player_id"].nunique(), 4)
+        panel = historical_backtest.add_point_in_time_features(grouped)
+        self.assertFalse((historical_backtest._single_fixture_rows(panel)["gameweek"] == 2).any())
 
     def test_known_schedule_blank_gameweek_is_not_assumed_single_fixture(self):
         raw = self.synthetic_raw()
@@ -177,16 +184,18 @@ class HistoricalBacktestTests(unittest.TestCase):
             panel = historical_backtest.add_point_in_time_features(grouped)
         blank = panel[(panel["team_key"] == "A") & (panel["gameweek"] == 3)]
         self.assertTrue((blank["fixture_count"] == 0).all())
-        self.assertTrue((blank["prediction_model"] == 0).all())
-        self.assertTrue((blank["prediction_expected_minutes"] == 0).all())
+        # The proxy does not leak the final target schedule into a prediction.
+        self.assertTrue((blank["prediction_model"] >= 0).all())
+        self.assertTrue((blank["prediction_expected_minutes"] >= 0).all())
+        self.assertTrue((blank["fixture_count_feature"] == 1).all())
 
     def test_fixture_code_lookup_supplies_missing_gameweek_column(self):
         raw = self.synthetic_raw().rename(columns={"fixture": "fixture_code"})
-        fixture_table = (raw[["fixture_code", "round"]].drop_duplicates()
+        fixture_table = (raw[["fixture_code", "round", "kickoff_time"]].drop_duplicates()
                          .rename(columns={"fixture_code": "code", "round": "event"}))
-        raw = raw.drop(columns=["round"])
+        raw = raw.drop(columns=["round", "kickoff_time"])
         # The 2025-26 archive is missing round/event; its companion fixture table
-        # maps each fixture_code to the official FPL event/Gameweek.
+        # maps each fixture_code to the official FPL event/Gameweek and kickoff.
         with patch.object(historical_backtest, "fetch_csv", side_effect=[raw, fixture_table]):
             grouped = historical_backtest.season_frame("2025-26", "synthetic-player-file")
         self.assertEqual(set(grouped["gameweek"].unique()), {1, 2, 3, 4})
@@ -199,11 +208,105 @@ class HistoricalBacktestTests(unittest.TestCase):
             grouped = historical_backtest.season_frame("2025-26", "synthetic")
         original = historical_backtest.add_point_in_time_features(grouped)
         altered = grouped.copy()
-        altered.loc[(altered["player_id"] == 1) & (altered["gameweek"] == 3), "actual_points"] = 999
+        target = (altered["player_id"] == 1) & (altered["gameweek"] == 3)
+        altered.loc[target, ["actual_points", "minutes", "xg", "xa"]] = [999, 90, 9, 9]
+        altered.loc[target, ["fixture_count", "was_home"]] = [3, 1.0]
         altered_features = historical_backtest.add_point_in_time_features(altered)
         original_prediction = original.loc[(original["player_id"] == 1) & (original["gameweek"] == 3), "prediction_model"].iloc[0]
         altered_prediction = altered_features.loc[(altered_features["player_id"] == 1) & (altered_features["gameweek"] == 3), "prediction_model"].iloc[0]
         self.assertAlmostEqual(float(original_prediction), float(altered_prediction))
+
+    def test_late_prior_fixture_stats_are_excluded_until_available(self):
+        raw = self.synthetic_raw()
+        late = (raw["round"] == 2) & (raw["fixture"] == "A-2-2")
+        raw.loc[late, "kickoff_time"] = datetime(2025, 8, 20, tzinfo=timezone.utc).isoformat()
+        with patch.object(historical_backtest, "fetch_csv", return_value=raw):
+            grouped = historical_backtest.season_frame("2025-26", "synthetic")
+        first = historical_backtest.add_point_in_time_features(grouped)
+        changed = grouped.copy()
+        changed.loc[(changed["player_id"] == 1) & (changed["gameweek"] == 2), "actual_points"] += 500
+        second = historical_backtest.add_point_in_time_features(changed)
+        p1 = first.loc[(first["player_id"] == 1) & (first["gameweek"] == 3), "prediction_model"].iloc[0]
+        p2 = second.loc[(second["player_id"] == 1) & (second["gameweek"] == 3), "prediction_model"].iloc[0]
+        self.assertAlmostEqual(float(p1), float(p2))
+
+    def test_fixtureless_nonzero_stats_fail_closed(self):
+        raw = self.synthetic_raw()
+        raw.loc[0, "fixture"] = None
+        raw.loc[0, "total_points"] = 3
+        with patch.object(historical_backtest, "fetch_csv", return_value=raw):
+            with self.assertRaisesRegex(ValueError, "without a fixture identifier"):
+                historical_backtest.season_frame("2025-26", "synthetic")
+
+    def test_missing_player_identifier_fails_closed(self):
+        raw = self.synthetic_raw()
+        raw.loc[0, "element"] = None
+        with patch.object(historical_backtest, "fetch_csv", return_value=raw):
+            with self.assertRaisesRegex(ValueError, "player identifiers"):
+                historical_backtest.season_frame("2025-26", "synthetic")
+
+    def test_missing_team_identifier_fails_closed(self):
+        raw = self.synthetic_raw()
+        raw.loc[0, "team_code"] = None
+        with patch.object(historical_backtest, "fetch_csv", return_value=raw):
+            with self.assertRaisesRegex(ValueError, "team identifiers"):
+                historical_backtest.season_frame("2025-26", "synthetic")
+
+    def test_duplicate_player_fixture_fails_closed(self):
+        raw = self.synthetic_raw()
+        raw = pd.concat([raw, raw.iloc[[0]]], ignore_index=True)
+        with patch.object(historical_backtest, "fetch_csv", return_value=raw):
+            with self.assertRaisesRegex(ValueError, "duplicate player/fixture"):
+                historical_backtest.season_frame("2025-26", "synthetic")
+
+    def test_out_of_range_gameweek_fails_closed(self):
+        raw = self.synthetic_raw()
+        raw.loc[0, "round"] = 39
+        with patch.object(historical_backtest, "fetch_csv", return_value=raw):
+            with self.assertRaisesRegex(ValueError, "outside 1..38"):
+                historical_backtest.season_frame("2025-26", "synthetic")
+
+    def test_duplicate_fixture_lookup_fails_closed(self):
+        raw = self.synthetic_raw().rename(columns={"fixture": "fixture_code"}).drop(columns=["round"])
+        fixture_table = pd.DataFrame({"code": ["A-1-1", "A-1-1"], "event": [1, 1]})
+        with patch.object(historical_backtest, "fetch_csv", side_effect=[raw, fixture_table]):
+            with self.assertRaisesRegex(ValueError, "duplicate fixture identifiers"):
+                historical_backtest.season_frame("2025-26", "synthetic")
+
+    def test_unassigned_postponed_fixture_fails_closed(self):
+        raw = self.synthetic_raw().rename(columns={"fixture": "fixture_code"}).drop(columns=["round"])
+        fixture_table = pd.DataFrame({"code": ["A-1-1"], "event": [None]})
+        with patch.object(historical_backtest, "fetch_csv", side_effect=[raw, fixture_table]):
+            with self.assertRaisesRegex(ValueError, "unassigned/postponed"):
+                historical_backtest.season_frame("2025-26", "synthetic")
+
+    def test_missing_gw_without_verified_lookup_fails_closed(self):
+        raw = self.synthetic_raw().drop(columns=["round"])
+        with patch.object(historical_backtest, "fetch_csv", return_value=raw):
+            with self.assertRaisesRegex(ValueError, "no fixture lookup"):
+                historical_backtest.season_frame("2024-25", "synthetic")
+
+    def test_missing_kickoff_timestamp_fails_closed(self):
+        raw = self.synthetic_raw().drop(columns=["kickoff_time"])
+        with patch.object(historical_backtest, "fetch_csv", return_value=raw):
+            with self.assertRaisesRegex(ValueError, "kickoff timestamps"):
+                historical_backtest.season_frame("2024-25", "synthetic")
+
+    def test_incomplete_run_preserves_existing_model_and_reports(self):
+        with TemporaryDirectory(dir=Path.cwd()) as temp:
+            out = Path(temp)
+            model_path = out / "trained_fpl_model.json"
+            summary_path = out / "historical_backtest_summary.csv"
+            model_path.write_text("known-good-model", encoding="utf-8")
+            summary_path.write_text("known-good-summary", encoding="utf-8")
+            with patch("sys.argv", ["historical_backtest.py", "--out-dir", temp, "--seasons", "2023-24", "2024-25"]), \
+                 patch.object(historical_backtest, "fetch_csv", side_effect=RuntimeError("network down")):
+                self.assertEqual(historical_backtest.main(), 1)
+            self.assertEqual(model_path.read_text(encoding="utf-8"), "known-good-model")
+            self.assertEqual(summary_path.read_text(encoding="utf-8"), "known-good-summary")
+            manifest = pd.read_json(out / "historical_backtest_failure.json", typ="series")
+            self.assertEqual(manifest["status"], "incomplete")
+            self.assertEqual(manifest["skipped_seasons"], ["2023-24", "2024-25"])
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import re
 import os
 from pathlib import Path
 import fpl_engine
+import fpl_learning
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -85,7 +86,9 @@ def get_trained_model_payload():
         r = requests.get(TRAINED_MODEL_URL, timeout=8, headers={"User-Agent":"The-One-Above-All-FPL/3.0"})
         r.raise_for_status()
         payload = r.json()
-        if str(payload.get("model_version")) != "3.0" or not payload.get("coefficients"):
+        if (str(payload.get("model_version")) != fpl_learning.MODEL_VERSION
+                or payload.get("feature_policy") != fpl_learning.FEATURE_POLICY
+                or not payload.get("coefficients")):
             return None
         return payload
     except Exception:
