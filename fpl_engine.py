@@ -1,27 +1,132 @@
 """Shared FPL projection core used by the dashboard and scheduled forecast worker.
 
-This is a transparent heuristic model, not a trained or validated machine-learning model.
+When a versioned historical model artifact is available, future Gameweek points are
+predicted by that trained model. A transparent heuristic remains as a safe fallback.
 """
 from datetime import datetime, timezone
 import math
 
+import fpl_learning
+
+# Set by the dashboard (remote artifact) or worker (persistent fpl-data branch).
+TRAINED_MODEL = None
+
 def make_history_signal(summary):
+    """Build the same lagged signals used by the trained model and fallback scorer."""
     history = summary.get("history", []) if isinstance(summary, dict) else []
     history = sorted([r for r in history if isinstance(r, dict)], key=lambda r: int(r.get("round") or 0))
     recent = history[-5:]
     played = [r for r in recent if float(r.get("minutes") or 0) > 0]
-    points = [float(r.get("total_points") or 0) for r in played]
+    points_played = [float(r.get("total_points") or 0) for r in played]
     minutes_all = [float(r.get("minutes") or 0) for r in recent]
     starts = [1 if float(r.get("starts") or 0) > 0 else 0 for r in recent]
+    all_points = [float(r.get("total_points") or 0) for r in history]
+    all_minutes = [float(r.get("minutes") or 0) for r in history]
+    all_xgi = [float(r.get("expected_goals") or 0) + float(r.get("expected_assists") or 0) for r in history]
+    recent_xgi = [float(r.get("expected_goals") or 0) + float(r.get("expected_assists") or 0) for r in recent]
+    recent_min_sum = sum(minutes_all)
+    all_min_sum = sum(all_minutes)
     return {
         "sample_matches": len(recent),
         "played_matches": len(played),
-        "recent_points_per_appearance": (sum(points) / len(points)) if points else None,
+        "recent_points_per_appearance": (sum(points_played) / len(points_played)) if points_played else None,
+        "recent_points_per_gw": (sum(float(r.get("total_points") or 0) for r in recent) / len(recent)) if recent else None,
+        "season_points_per_gw": (sum(all_points) / len(all_points)) if all_points else None,
         "recent_minutes_per_fixture": (sum(minutes_all) / len(minutes_all)) if minutes_all else None,
         "recent_appearance_rate": (len(played) / len(recent)) if recent else None,
         "recent_start_rate": (sum(starts) / len(starts)) if starts else None,
+        "season_xgi_per90": (sum(all_xgi) / max(90.0, all_min_sum) * 90.0) if all_xgi else None,
+        "recent_xgi_per90": (sum(recent_xgi) / max(90.0, recent_min_sum) * 90.0) if recent_xgi else None,
         "last_history_gw": int(recent[-1].get("round") or 0) if recent else None,
+        "history_total_gws": len(history),
     }
+
+
+def _availability_override(p, weeks_ahead=0):
+    """Apply current status only to the nearest GW, not unchanged through a five-GW horizon.
+
+    Historical minutes already learn typical absence/rotation risk. Without a separate
+    injury-return model, don't assume today's status flag persists into later Gameweeks.
+    """
+    if int(weeks_ahead) > 0:
+        return 1.0
+    status = str(p.get("status") or "").lower()
+    chance = p.get("chance_of_playing_next_round")
+    if status in {"i", "s", "u"}:
+        return 0.20
+    if status == "d":
+        if chance is not None:
+            try:
+                return max(0.20, min(1.0, float(chance) / 100.0))
+            except (TypeError, ValueError):
+                pass
+        return 0.55
+    if chance is not None:
+        try:
+            return max(0.20, min(1.0, float(chance) / 100.0))
+        except (TypeError, ValueError):
+            return 1.0
+    return 1.0
+
+
+def _upcoming_fixtures(p, fixtures, horizon=5, start_gw=None):
+    upcoming = [f for f in fixtures if not f.get("finished")
+                and f.get("event") is not None
+                and (f.get("team_h") == p.get("team") or f.get("team_a") == p.get("team"))]
+    if start_gw is not None:
+        upcoming = [f for f in upcoming
+                    if int(start_gw) <= int(f["event"]) < int(start_gw) + int(horizon)]
+    else:
+        event_ids = sorted({int(f["event"]) for f in upcoming})
+        target_ids = set(event_ids[:int(horizon)])
+        upcoming = [f for f in upcoming if int(f["event"]) in target_ids]
+    upcoming.sort(key=lambda f: (f.get("event") or 99, f.get("kickoff_time") or ""))
+    return upcoming
+
+
+def _estimate_points_trained(p, fixtures, hist, horizon=5, start_gw=None):
+    """Score each future Gameweek with the historical model artifact."""
+    upcoming = _upcoming_fixtures(p, fixtures, horizon, start_gw)
+    if not upcoming or not TRAINED_MODEL:
+        return None
+    from collections import defaultdict
+    by_event = defaultdict(list)
+    for fixture in upcoming:
+        by_event[int(fixture["event"])].append(fixture)
+    total, diffs, total_fixtures = 0.0, [], 0
+    first_event = min(by_event) if by_event else None
+    position = p.get("element_type")
+    minutes = float(p.get("minutes") or 0)
+    fallback_xgi90 = (float(p.get("expected_goals") or 0) + float(p.get("expected_assists") or 0)) / max(90.0, minutes) * 90.0
+    for event_id, event_fixtures in sorted(by_event.items()):
+        fixture_count = len(event_fixtures)
+        home_count = sum(1 for f in event_fixtures if f.get("team_h") == p.get("team"))
+        home_share = home_count / max(1, fixture_count)
+        feature_row = fpl_learning.make_feature_row(
+            position=position, history_signal=hist,
+            fixture_count=fixture_count, home_share=home_share,
+            fallback_season_mean=float(p.get("points_per_game") or 0),
+            fallback_recent_mean=float(p.get("form") or 0),
+            fallback_xgi_per90=fallback_xgi90,
+        )
+        predicted = fpl_learning.predict_features(TRAINED_MODEL, feature_row)
+        if predicted is None:
+            return None
+        per_fixture_factors = []
+        for f in event_fixtures:
+            home = f.get("team_h") == p.get("team")
+            diff = float(f.get("team_h_difficulty" if home else "team_a_difficulty") or 3)
+            diffs.append(diff)
+            per_fixture_factors.append(max(0.82, min(1.16, 1.0 + (3.0 - diff) * 0.06)))
+        fixture_factor = sum(per_fixture_factors) / len(per_fixture_factors) if per_fixture_factors else 1.0
+        # The trained model already knows recent-minute and non-appearance patterns;
+        # explicit FPL injury/doubt flags are applied as a current override only.
+        horizon_start = int(start_gw) if start_gw is not None else int(first_event or event_id)
+        total += predicted * _availability_override(p, weeks_ahead=(event_id - horizon_start)) * fixture_factor
+        total_fixtures += fixture_count
+    if total_fixtures == 0:
+        return 0.0, 3.0, 0
+    return round(max(0.0, total), 1), round(sum(diffs) / len(diffs), 2), total_fixtures
 
 def _estimate_minutes_parts(p, history_signal=None):
     """Return expected minutes before availability risk and a separate availability factor."""
@@ -104,7 +209,13 @@ def estimate_expected_minutes(p, history_signal=None, fixture_count=1):
 
 
 def estimate_points(p, team, fixtures, horizon=5, start_gw=None, use_history=True, history_signals=None, calibration_offsets=None):
-    """Transparent fixture-level projection; recent player match history is a capped signal."""
+    """Use the trained historical model when available; retain a transparent fallback."""
+    hist_for_model = (history_signals or {}).get(int(p.get("id", -1)), {}) if use_history else {}
+    if use_history and TRAINED_MODEL:
+        trained = _estimate_points_trained(p, fixtures, hist_for_model, horizon=horizon, start_gw=start_gw)
+        if trained is not None:
+            return trained
+
     def num(key):
         try:
             return float(p.get(key) or 0)
@@ -124,7 +235,7 @@ def estimate_points(p, team, fixtures, horizon=5, start_gw=None, use_history=Tru
     attacking_signal = min(1.5, (xg90 + xa90) * 2.0)
     raw = 0.50 * ppg + 0.25 * form + 0.25 * (baseline + attacking_signal)
 
-    hist = (history_signals or {}).get(int(p.get("id", -1)), {}) if use_history else {}
+    hist = hist_for_model
     recent_pts = hist.get("recent_points_per_appearance")
     played_count = int(hist.get("played_matches") or 0)
     if recent_pts is not None and played_count > 0:
@@ -138,17 +249,7 @@ def estimate_points(p, team, fixtures, horizon=5, start_gw=None, use_history=Tru
     expected_minutes, availability_factor = _estimate_minutes_parts(p, hist)
     minutes_factor = max(0.35, min(1.0, expected_minutes / 80.0))
 
-    upcoming = [f for f in fixtures if not f.get("finished")
-                and f.get("event") is not None
-                and (f.get("team_h") == p.get("team") or f.get("team_a") == p.get("team"))]
-    if start_gw is not None:
-        upcoming = [f for f in upcoming
-                    if int(start_gw) <= int(f["event"]) < int(start_gw) + int(horizon)]
-    else:
-        event_ids = sorted({int(f["event"]) for f in upcoming})
-        target_ids = set(event_ids[:int(horizon)])
-        upcoming = [f for f in upcoming if int(f["event"]) in target_ids]
-    upcoming.sort(key=lambda f: (f.get("event") or 99, f.get("kickoff_time") or ""))
+    upcoming = _upcoming_fixtures(p, fixtures, horizon, start_gw)
     scores, diffs = [], []
     for f in upcoming:
         home = f.get("team_h") == p.get("team")
