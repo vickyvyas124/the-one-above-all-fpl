@@ -288,12 +288,23 @@ def resolve_player(row, players):
 def pos_name(p, types):
     return next((x.get("singular_name_short", "?") for x in types if x["id"] == p.get("element_type")), "?")
 
-def estimate_points(p, team, fixtures, horizon=5, start_gw=None, use_history=True):
-    """Delegate the shared forecast formula to the same module used by automation."""
+def estimate_points(
+    p, team, fixtures, horizon=5, start_gw=None, use_history=True,
+    history_signals=None, calibration_offsets=None,
+):
+    """Delegate to the shared engine, allowing callers to override optional inputs.
+
+    ``None`` means use the dashboard's current shared values; an explicit empty
+    dict means deliberately disable history/calibration for baseline snapshots.
+    """
+    if history_signals is None:
+        history_signals = PLAYER_HISTORY_SIGNALS
+    if calibration_offsets is None:
+        calibration_offsets = MODEL_CALIBRATION_OFFSETS
     return fpl_engine.estimate_points(
         p, team, fixtures, horizon=horizon, start_gw=start_gw,
-        use_history=use_history, history_signals=PLAYER_HISTORY_SIGNALS,
-        calibration_offsets=MODEL_CALIBRATION_OFFSETS,
+        use_history=use_history, history_signals=history_signals,
+        calibration_offsets=calibration_offsets,
     )
 
 st.markdown("""
