@@ -23,6 +23,86 @@ def make_history_signal(summary):
         "last_history_gw": int(recent[-1].get("round") or 0) if recent else None,
     }
 
+def _estimate_minutes_parts(p, history_signal=None):
+    """Return expected minutes before availability risk and a separate availability factor."""
+    def num(key):
+        try:
+            return float(p.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    minutes, starts = num("minutes"), int(num("starts"))
+    if minutes <= 0:
+        expected_minutes = 35.0
+    elif starts > 0:
+        average_start_minutes = minutes / starts
+        starts_subs = starts + num("substitute_appearances")
+        start_rate = min(1.0, starts / max(1.0, starts_subs))
+        expected_minutes = min(90.0, average_start_minutes) * (0.65 + 0.35 * start_rate)
+    else:
+        expected_minutes = min(60.0, minutes / max(1.0, num("appearances")))
+
+    hist = history_signal or {}
+    recent_minutes = hist.get("recent_minutes_per_fixture")
+    recent_sample = int(hist.get("sample_matches") or 0)
+    if recent_minutes is not None and recent_sample >= 3:
+        expected_minutes = 0.60 * expected_minutes + 0.40 * float(recent_minutes)
+    expected_minutes = max(0.0, min(90.0, expected_minutes))
+
+    status = str(p.get("status") or "").lower()
+    chance = p.get("chance_of_playing_next_round")
+    if status in {"i", "s", "u"}:
+        availability_factor = 0.20
+    elif status == "d":
+        availability_factor = 0.55
+    elif chance is not None:
+        try:
+            availability_factor = max(0.20, min(1.0, float(chance) / 100.0))
+        except (TypeError, ValueError):
+            availability_factor = 0.90
+    else:
+        availability_factor = 0.90
+    return expected_minutes, availability_factor
+
+
+def team_fixture_count(fixtures, team_id, gameweek):
+    """Count the team's scheduled fixtures in one Gameweek; a blank returns zero."""
+    if team_id is None or gameweek is None:
+        return 0
+    count = 0
+    try:
+        team_id, gameweek = int(team_id), int(gameweek)
+    except (TypeError, ValueError):
+        return 0
+    for fixture in fixtures or []:
+        try:
+            if int(fixture.get("event") or 0) != gameweek:
+                continue
+            if fixture.get("team_h") != team_id and fixture.get("team_a") != team_id:
+                continue
+            if not fixture.get("finished"):
+                count += 1
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return count
+
+
+def estimate_expected_minutes(p, history_signal=None, fixture_count=1):
+    """Expected total minutes in a Gameweek, including availability and fixture count.
+
+    A blank Gameweek is zero; a Double Gameweek can exceed 90 expected minutes.
+    This aligns the minutes diagnostic with actual minutes summed over the event.
+    """
+    try:
+        fixtures_n = max(0, min(3, int(fixture_count)))
+    except (TypeError, ValueError):
+        fixtures_n = 1
+    if fixtures_n == 0:
+        return 0.0
+    expected_minutes, availability_factor = _estimate_minutes_parts(p, history_signal)
+    return round(expected_minutes * availability_factor * fixtures_n, 1)
+
+
 def estimate_points(p, team, fixtures, horizon=5, start_gw=None, use_history=True, history_signals=None, calibration_offsets=None):
     """Transparent fixture-level projection; recent player match history is a capped signal."""
     def num(key):
@@ -55,35 +135,8 @@ def estimate_points(p, team, fixtures, horizon=5, start_gw=None, use_history=Tru
     sample_weight = min(0.85, minutes / 900.0)
     per_match = sample_weight * raw + (1.0 - sample_weight) * baseline
 
-    if minutes <= 0:
-        expected_minutes = 35.0
-    elif starts > 0:
-        avg_start_minutes = minutes / starts
-        appearance_count = max(1.0, num("appearances"))
-        starts_subs = starts + num("substitute_appearances")
-        start_rate = min(1.0, starts / max(1.0, starts_subs))
-        expected_minutes = min(90.0, avg_start_minutes) * (0.65 + 0.35 * start_rate)
-    else:
-        expected_minutes = min(60.0, minutes / max(1.0, num("appearances")))
-
-    recent_minutes = hist.get("recent_minutes_per_fixture")
-    recent_sample = int(hist.get("sample_matches") or 0)
-    if recent_minutes is not None and recent_sample >= 3:
-        # Latest five team fixtures are a useful check on season-long minutes, including DNPs.
-        expected_minutes = 0.60 * expected_minutes + 0.40 * float(recent_minutes)
+    expected_minutes, availability_factor = _estimate_minutes_parts(p, hist)
     minutes_factor = max(0.35, min(1.0, expected_minutes / 80.0))
-
-    if status in {"i", "s", "u"}:
-        availability_factor = 0.20
-    elif status == "d":
-        availability_factor = 0.55
-    elif chance is not None:
-        try:
-            availability_factor = max(0.20, min(1.0, float(chance) / 100.0))
-        except (TypeError, ValueError):
-            availability_factor = 0.90
-    else:
-        availability_factor = 0.90
 
     upcoming = [f for f in fixtures if not f.get("finished")
                 and f.get("event") is not None
@@ -120,7 +173,7 @@ def estimate_points(p, team, fixtures, horizon=5, start_gw=None, use_history=Tru
 
 
 def derive_calibration(forecast_rows, target_gameweek, min_completed_gws=4):
-    """Learn capped position-level bias corrections from prior v2.8 snapshots.
+    """Learn capped position-level bias corrections from prior v2.9 snapshots.
 
     Input may be a list of dictionaries or a pandas DataFrame (iterable of row dicts
     is preferred). Returns (offsets, metadata). No calibration occurs before four
@@ -136,7 +189,7 @@ def derive_calibration(forecast_rows, target_gameweek, min_completed_gws=4):
             gw = int(row.get("gameweek"))
             if gw >= int(target_gameweek):
                 continue
-            if str(row.get("model_version", "")) != "2.8":
+            if str(row.get("model_version", "")) != "2.9":
                 continue
             actual = float(row.get("actual_points"))
             predicted = float(row.get("projection_model"))
