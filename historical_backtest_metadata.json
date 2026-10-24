@@ -1,10 +1,21 @@
 {
-  "created_at_utc": "2026-10-24T15:15:55+00:00",
-  "source_note": "Unofficial historical datasets; results are a lagged-stat proxy, not a perfect recreation of historical live API snapshots.",
+  "created_at_utc": "2026-10-24T15:51:12+00:00",
+  "source_note": "Historical data is used to train a ridge-regression model on lagged player form/minutes/xGI and target Gameweek schedule. Out-of-season metrics use only preceding seasons. Archived data is not an exact replay of historical live API snapshots.",
   "success_seasons": [
     "2023-24",
     "2024-25",
     "2025-26"
   ],
-  "failures": []
+  "failures": [],
+  "deployed_model": {
+    "model_version": "3.0",
+    "model_type": "standardized_ridge_regression",
+    "training_rows": 82801,
+    "source_seasons": [
+      "2023-24",
+      "2024-25",
+      "2025-26"
+    ],
+    "feature_count": 13
+  }
 }
