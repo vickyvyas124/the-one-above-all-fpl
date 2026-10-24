@@ -28,7 +28,7 @@ jobs:
           cache: pip
 
       - name: Install worker dependencies
-        run: python -m pip install --disable-pip-version-check requests pandas
+        run: python -m pip install --disable-pip-version-check numpy requests pandas
 
       - name: Run engine validation tests
         run: python -m unittest discover -s tests -v
