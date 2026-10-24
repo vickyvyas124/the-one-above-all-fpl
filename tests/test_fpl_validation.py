@@ -191,11 +191,11 @@ class HistoricalBacktestTests(unittest.TestCase):
 
     def test_fixture_code_lookup_supplies_missing_gameweek_column(self):
         raw = self.synthetic_raw().rename(columns={"fixture": "fixture_code"})
-        fixture_table = (raw[["fixture_code", "round"]].drop_duplicates()
+        fixture_table = (raw[["fixture_code", "round", "kickoff_time"]].drop_duplicates()
                          .rename(columns={"fixture_code": "code", "round": "event"}))
-        raw = raw.drop(columns=["round"])
+        raw = raw.drop(columns=["round", "kickoff_time"])
         # The 2025-26 archive is missing round/event; its companion fixture table
-        # maps each fixture_code to the official FPL event/Gameweek.
+        # maps each fixture_code to the official FPL event/Gameweek and kickoff.
         with patch.object(historical_backtest, "fetch_csv", side_effect=[raw, fixture_table]):
             grouped = historical_backtest.season_frame("2025-26", "synthetic-player-file")
         self.assertEqual(set(grouped["gameweek"].unique()), {1, 2, 3, 4})

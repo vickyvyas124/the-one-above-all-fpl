@@ -99,6 +99,7 @@ def season_frame(season: str, url: str) -> pd.DataFrame:
     team_col = pick_column(raw, ["team_code", "team", "team_id", "team_id_x", "team_name"])
     name_col = pick_column(raw, ["web_name", "name", "second_name", "player_name"], required=False)
 
+    fixture_data = None
     if gw_col:
         gameweek_values = pd.to_numeric(raw[gw_col], errors="coerce")
     elif season in FIXTURE_SOURCES:
@@ -145,7 +146,8 @@ def season_frame(season: str, url: str) -> pd.DataFrame:
         kickoff_values = pd.to_datetime(raw[kickoff_col], errors="coerce", utc=True)
         kickoff_has_clock = raw[kickoff_col].astype("string").str.contains(r"\d{1,2}:\d{2}", regex=True, na=False)
     elif season in FIXTURE_SOURCES:
-        fixture_data = fetch_csv(FIXTURE_SOURCES[season])
+        if fixture_data is None:
+            fixture_data = fetch_csv(FIXTURE_SOURCES[season])
         fixture_code_col = pick_column(fixture_data, ["code", "fixture_code", "fixture", "fixture_id", "id"])
         fixture_kickoff_col = pick_column(fixture_data, ["kickoff_time", "kickoff", "date", "match_date"])
         kickoff_map = pd.DataFrame({
