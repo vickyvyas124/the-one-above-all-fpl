@@ -118,11 +118,15 @@ def _estimate_points_trained(p, fixtures, hist, horizon=5, start_gw=None):
             diff = float(f.get("team_h_difficulty" if home else "team_a_difficulty") or 3)
             diffs.append(diff)
             per_fixture_factors.append(max(0.82, min(1.16, 1.0 + (3.0 - diff) * 0.06)))
-        fixture_factor = sum(per_fixture_factors) / len(per_fixture_factors) if per_fixture_factors else 1.0
-        # The trained model already knows recent-minute and non-appearance patterns;
-        # explicit FPL injury/doubt flags are applied as a current override only.
+        # Historical archives do not contain deadline-time fixture difficulty or
+        # schedule snapshots. Model output is a single-fixture expectation; apply
+        # only the live published fixture count here. Fixture difficulty remains a
+        # diagnostic and cannot silently change a proxy-validated model score.
+        # The trained model learns single-fixture target rows; doubles are scaled
+        # using the schedule actually published for the live target Gameweek.
+        # Explicit availability is a live-only override for the nearest GW.
         horizon_start = int(start_gw) if start_gw is not None else int(first_event or event_id)
-        total += predicted * _availability_override(p, weeks_ahead=(event_id - horizon_start)) * fixture_factor
+        total += predicted * fixture_count * _availability_override(p, weeks_ahead=(event_id - horizon_start))
         total_fixtures += fixture_count
     if total_fixtures == 0:
         return 0.0, 3.0, 0

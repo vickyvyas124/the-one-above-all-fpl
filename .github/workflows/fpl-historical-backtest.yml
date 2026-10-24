@@ -36,7 +36,7 @@ jobs:
         run: python historical_backtest.py --out-dir "$RUNNER_TEMP/historical-output"
 
       - name: Persist historical backtest reports to fpl-data
-        if: always()
+        if: steps.replay-historical.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -78,16 +78,27 @@ jobs:
           import sys
           from pathlib import Path
 
+          if "${{ steps.replay-historical.outcome }}" != "success":
+              failure_path = Path(os.environ["REPORT_DIR"]) / "historical_backtest_failure.json"
+              if failure_path.exists():
+                  failure = json.loads(failure_path.read_text(encoding="utf-8"))
+                  print(f"::error::Historical run incomplete. Evaluated={failure.get('evaluated_seasons')}; skipped={failure.get('skipped_seasons')}; failures={failure.get('failures')}")
+              else:
+                  print("::error::Historical backtest failed before producing a failure manifest.")
+              sys.exit(1)
+
           metadata_path = Path(os.environ["REPORT_DIR"]) / "historical_backtest_metadata.json"
           if not metadata_path.exists():
               print(f"::error::Historical backtest metadata not found: {metadata_path}")
               sys.exit(1)
           metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
           failures = metadata.get("failures", [])
-          if failures:
+          requested = metadata.get("requested_seasons", [])
+          evaluated = metadata.get("evaluated_seasons", [])
+          if metadata.get("status") != "complete" or failures or requested != evaluated:
               for item in failures:
                   print(f"::error title=Historical dataset failed::{item.get('season', 'unknown')}: {item.get('error', 'unknown error')}")
-              print("::error::Backtest reports were saved where possible, but the full configured season set was not evaluated.")
+              print(f"::error::Backtest incomplete; requested={requested}; evaluated={evaluated}; skipped={metadata.get('skipped_seasons', [])}. No model should be published.")
               sys.exit(1)
           print("All configured historical seasons were evaluated successfully.")
           PY
