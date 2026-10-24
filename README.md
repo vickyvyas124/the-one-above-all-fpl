@@ -1,47 +1,58 @@
-# The-One-Above-All FPL Manager Hub — v2.8
+# The-One-Above-All FPL Manager Hub — v2.9 Validation Release
 
-A Streamlit dashboard for team analysis, fixture planning, captain/vice-captain advice, transfer HOLD/ACT guidance, chip timing and forecast validation. It uses public FPL endpoints and does not ask for FPL passwords or submit transfers to your account.
+A Streamlit FPL dashboard for squad review, fixture planning, captain/vice-captain advice, transfer HOLD/ACT guidance, chip timing and validation of player-point forecasts. It uses public FPL endpoints and does not ask for FPL passwords or submit transfers.
 
-## What's new in v2.8
+## Why v2.9 exists
 
-- **Transfer discipline:** defaults to HOLD. A move must clear a multi-Gameweek projected gain threshold, incoming-player minutes and availability reliability gates, legality/affordability checks, and a larger threshold when taking a hit or moving a captaincy-relevant player. Low ownership only changes ranking between candidates; it cannot override the points gate.
-- **Timing guidance:** if a promising move is seen more than 24 hours before the deadline, the app advises monitoring rather than transferring immediately. Nearer the deadline, it asks for a final news/price check.
-- **Budget sync:** attempts to derive bank and free transfers from the public manager profile, history, transfers and chip history. The free-transfer total is reconstructed, not guaranteed by a documented live API field. A manual override remains available. Confirm bank and FTs against the official FPL app before a transfer.
-- **Selling-price estimate:** uses public pick purchase-price data where available and estimates the FPL sell-on price. Verify the official selling price on the Transfers page.
-- **Chip timing:** compares current projected opportunities with later Gameweeks whose fixtures are already published. Future fixtures and player projections can change; use as decision support.
-- **One shared XI/captain model:** the captain shortlist uses the model-selected legal XI rather than a separate old lineup when all 15 squad members are matched.
-- **Scheduled forecast learning:** GitHub Actions runs every 15 minutes, captures one pre-deadline forecast in the six-hour window, and reconciles actual points/minutes after an event is marked finished. The persistent log is stored on a separate `fpl-data` branch so normal dashboard redeploys don't erase it.
-- **Capped online calibration:** after at least four earlier completed Gameweeks of v2.8 forecasts, the model can apply small, position-level bias corrections. This is simple online calibration, not a trained machine-learning model. The model must be judged by backtests before relying on it.
+This is a **validation release**, not a claim that the model is already more accurate. It freezes model weights while comparing our forecasts to a baseline and FPL's live `ep_next` benchmark, records expected minutes separately, and adds a leakage-conscious retrospective proxy backtest over prior seasons.
 
-## Deploy from the GitHub web interface
+## What's new in v2.9
 
-1. Extract the ZIP on your laptop.
-2. Open your repository: `https://github.com/vickyvyas124/the-one-above-all-fpl`.
-3. On the default branch (`main`), replace `app.py`, `requirements.txt` and `README.md` with the files from this package. Add `fpl_engine.py`, `fpl_background_worker.py` and the seed `forecast_log.csv` to the repository root.
-4. Create the workflow file: choose **Add file → Create new file**, name it exactly `.github/workflows/fpl-auto-learning.yml`, then paste the contents of this package's `.github/workflows/fpl-auto-learning.yml` and commit it to `main`.
-5. Ensure the workflow has write permission: in GitHub, open **Settings → Actions → General → Workflow permissions**, select **Read and write permissions**, and save if needed. The workflow needs permission to create/update the `fpl-data` branch.
-6. Open the **Actions** tab, select **FPL Auto Learning Log**, and click **Run workflow** once to test it. Check the run logs and confirm it succeeds. The first successful run creates `fpl-data`; later runs update only the CSV branch, not the Streamlit app code.
-7. Open the Streamlit app and refresh. Once the `fpl-data` branch exists and contains `forecast_log.csv`, the app reads that persistent log automatically. CSV downloads are optional backups, not weekly tasks.
+- **Benchmark against `ep_next`:** the scheduled worker stores FPL's live `ep_next` value from the same pre-deadline snapshot as the model and baseline. Historical scraped `xP` is not used as a benchmark because the archive timing may include post-match updates.
+- **One- and five-Gameweek validation:** the worker stores one-GW projections and five-GW projected totals, and reconciles each with actual results only after the relevant events finish.
+- **Ranking metrics:** dashboard reports Spearman rank correlation, top-10/top-20 capture, MAE, bias and `ep_next` comparison on the matched benchmark cohort. Top-k metrics are useful diagnostics, not guarantees of fantasy points. Captain regret is measured only when a complete public squad was available pre-deadline, so the recorded XI/captain decision does not use hindsight.
+- **Minutes diagnostic:** records an explicit expected-minutes forecast and reports expected-minutes MAE/bias separately from points error. Expected minutes are scaled to scheduled fixture count, so a blank Gameweek is zero and a Double Gameweek can exceed 90 minutes.
+- **Consistent feature coverage:** the scheduled worker fetches player history for the full player pool with bounded concurrency and retries. Each row records whether the history signal was successfully enriched and the sample count.
+- **Historical replay:** `historical_backtest.py` evaluates archived 2023–24, 2024–25 and 2025–26 Gameweeks using lagged-only inputs. Where archived fixture/team identifiers are available, the replay distinguishes blanks from single and double Gameweeks using team fixture schedule counts. It deliberately excludes archived same-GW `xP`/`ep_next` values that can contain timing leakage. The replay is a historical proxy, not an exact recreation of what the live API showed before each old deadline.
+- **Previous-season context:** manager panel displays past-season final points/rank alongside the current partial season. A final-season score must not be compared directly to this year's partial score as if it were a like-for-like checkpoint.
+- **Frozen weights:** online bias correction is paused during validation so metrics are not changing as the model is being evaluated. Any future calibration must be supported by held-out results.
+- **Automated storage:** scheduled GitHub Actions persists forecasts and results on the separate `fpl-data` branch. CSV download is optional backup only.
 
-## How the scheduled job works
+## Deploy through the GitHub web interface
 
-- The workflow must be committed to the repository's default branch (`main`). GitHub scheduled workflows run from the default branch and may be delayed. If the workflow is disabled or fails, forecasts will not be captured reliably.
-- It only creates a *prospective* snapshot in the six hours before a deadline. It never fabricates a pre-deadline prediction after a deadline has passed.
-- When FPL marks a Gameweek finished, it fills actual player points and minutes for previously saved forecasts.
-- The first GW8 forecast supplied by the user is preserved as seed data. Because it was created by v2.7, it has no v2.8 model-version tag and is not used to calibrate v2.8.
-- The worker logs public-data errors to the GitHub Actions run. If the FPL API changes or becomes unavailable, inspect the failed run before assuming the backtest is up to date.
+1. Download and extract the v2.9 ZIP on your laptop.
+2. Open `https://github.com/vickyvyas124/the-one-above-all-fpl` and stay on `main`.
+3. Replace the following root files with the package versions: `app.py`, `fpl_engine.py`, `fpl_background_worker.py`, `fpl_validation.py`, `historical_backtest.py`, `requirements.txt`, and `README.md`. Leave the repository-root `forecast_log.csv` alone; the package does not contain a replacement. Never replace `fpl-data/forecast_log.csv`.
+4. Add or replace `tests/test_fpl_validation.py` at the exact path `tests/test_fpl_validation.py`. In the web editor, use **Add file → Create new file** and enter that full path if the `tests` folder does not exist.
+5. Replace `.github/workflows/fpl-auto-learning.yml` with the package version. It keeps the existing **FPL Auto Learning Log** workflow name and runs the unit tests before updating data.
+6. Add `.github/workflows/fpl-historical-backtest.yml` from the package. In the browser, choose **Add file → Create new file** and enter that exact path.
+7. Commit the changes to `main`. Streamlit should redeploy.
+8. Open **Actions → Historical FPL Backtest → Run workflow**. This manual job downloads the configured archives, runs the point-in-time proxy replay, and saves `historical_backtest_summary.csv`, `historical_backtest_gameweeks.csv`, and `historical_backtest_metadata.json` on `fpl-data`.
+9. Open **Actions → FPL Auto Learning Log** and ensure scheduled runs remain green. Open Streamlit and refresh; the historical summary should appear after it has been committed to `fpl-data`.
 
-## Model and safety notes
+**Data safety:** the `fpl-data` branch is the source of truth for the persistent forecast log. Leave its existing `forecast_log.csv` in place; this package intentionally does not include a replacement seed CSV. Both workflows use the same GitHub Actions concurrency group so they do not push updates to `fpl-data` simultaneously. The worker migrates old headers by adding missing columns and marks missing model versions as `legacy-unknown`; those rows are preserved but excluded from v2.9 metrics.
 
-The points model is currently a transparent heuristic with capped recency influence, not an official FPL projection and not a validated ML model. The online calibration only makes small, regularized adjustments after sufficient prior v2.8 observations. It does **not** automatically change formula weights every week or guarantee better points/rank. We keep a baseline and report MAE so improvements can be measured.
+## Interpretation guidance
 
-The auto bank/free-transfer values and selling prices can be wrong if public endpoint fields lag or omit transactions/chips. Verify them against the official FPL UI. All transfer and chip decisions are recommendations only; no changes are submitted to the user's FPL account.
+- An individual Gameweek is noisy. Do not change the model based on one lucky or unlucky result.
+- Compare model, baseline and live `ep_next` for the same player/Gameweek set and forecast timestamp.
+- MAE measures point error; Spearman measures ranking; top-k capture measures overlap with the highest actual scorers; minutes error diagnoses likely playing-time mistakes. No one metric should decide the model.
+- Current-season five-GW validation only appears after the full horizon has completed. Older-season historical replay is a separate proxy and should not be compared directly to the live `ep_next` benchmark.
+- FPL archived gameweek data is not a perfect snapshot of what was known before every historic deadline. Features are lagged, archived post-match expected-points fields are excluded, and all limitations are written to the metadata report.
+- The model remains a heuristic. It does not automatically rewrite its entire strategy and does not guarantee rank gains or a top-10 finish.
+
+## Scheduled worker
+
+`fpl_background_worker.py` captures one snapshot during the six-hour pre-deadline window and reconciles one-GW and five-GW actuals when FPL marks the associated events finished. The worker will migrate older CSV schemas without erasing the stored rows. GitHub Actions requires repository `contents: write` permission to persist updates on `fpl-data`.
 
 ## Files
 
-- `app.py`: Streamlit dashboard.
-- `fpl_engine.py`: shared point-projection and calibration functions used by the dashboard and worker.
-- `fpl_background_worker.py`: scheduled forecast snapshot and result reconciliation.
-- `.github/workflows/fpl-auto-learning.yml`: GitHub Actions schedule and persistence logic.
-- `forecast_log.csv`: the user's existing GW8 forecast seed.
-- `requirements.txt`: dashboard dependencies.
+- `app.py` — Streamlit UI, projections, season context and validation report.
+- `fpl_engine.py` — shared heuristic point projection and expected-minutes calculation.
+- `fpl_validation.py` — MAE, bias, Spearman, top-k capture, expected-minutes metrics and captain regret where the required pre-deadline lineup data exists.
+- `fpl_background_worker.py` — scheduled snapshot/reconciliation process.
+- `historical_backtest.py` — lagged-feature replay across prior seasons.
+- `.github/workflows/fpl-auto-learning.yml` — scheduled prospective forecast log.
+- `.github/workflows/fpl-historical-backtest.yml` — manual historical backtest and report persistence.
+- `tests/test_fpl_validation.py` — basic metric, leakage and fixture-count unit tests.
+- The repository-root `forecast_log.csv` may remain as a legacy local fallback; do not overwrite the authoritative `fpl-data` branch log.
