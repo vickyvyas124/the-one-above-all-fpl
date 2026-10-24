@@ -6,6 +6,9 @@ records history coverage, and reconciles both single-GW and five-GW outcomes.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import math
 import os
 import sys
 import time
@@ -18,6 +21,7 @@ import requests
 
 import fpl_engine
 import fpl_learning
+import fpl_snapshot_store
 
 BASE = "https://fantasy.premierleague.com/api"
 MODEL_VERSION = "3.0"
@@ -46,6 +50,176 @@ def get_json(path: str, attempts: int = 3):
             if attempt + 1 < attempts:
                 time.sleep(0.8 * (2 ** attempt))
     raise RuntimeError(f"FPL request failed for {path}: {last_error}")
+
+
+def get_json_with_record(path: str, attempts: int = 3):
+    """Fetch parsed JSON and an exact-body provenance record for a snapshot."""
+    last_error = None
+    url = f"{BASE}/{path}"
+    last_body = None
+    last_status = None
+    for attempt in range(attempts):
+        try:
+            response = requests.get(url, timeout=25, headers=HEADERS)
+            last_status = response.status_code
+            last_body = bytes(response.content)
+            response.raise_for_status()
+            payload = json.loads(last_body.decode("utf-8"))
+            return payload, fpl_snapshot_store.payload_record(
+                body=last_body, url=url, status_code=last_status, fetched_at_utc=datetime.now(timezone.utc)
+            )
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(0.8 * (2 ** attempt))
+    fetched = datetime.now(timezone.utc)
+    return None, fpl_snapshot_store.payload_record(
+        body=last_body, url=url,
+        status_code=last_status or getattr(getattr(last_error, "response", None), "status_code", None),
+        fetched_at_utc=fetched, error=str(last_error),
+    )
+
+
+def fetch_history_capture(player_ids, cutoff_utc=None):
+    """Fetch exact element-summary bodies, summaries and per-player statuses."""
+    signals, failures, records = {}, {}, {}
+    unique_ids = sorted({int(pid) for pid in player_ids if pid is not None})
+
+    def fetch(player_id):
+        path = f"element-summary/{player_id}/"
+        payload, record = get_json_with_record(path, attempts=3)
+        if not isinstance(payload, dict):
+            return player_id, None, record, record["metadata"].get("error") or "invalid response"
+        try:
+            signal = fpl_engine.make_history_signal(payload, cutoff_utc=cutoff_utc)
+            return player_id, signal, record, None
+        except Exception as exc:
+            record["metadata"]["error"] = str(exc)
+            record["metadata"]["fetch_outcome"] = "error"
+            return player_id, None, record, str(exc)
+
+    if not unique_ids:
+        return signals, failures, records
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(fetch, pid) for pid in unique_ids]
+        for future in as_completed(futures):
+            pid, signal, record, error = future.result()
+            records[pid] = record
+            if signal is not None:
+                signals[pid] = signal
+            else:
+                failures[pid] = error or "unknown error"
+    return signals, failures, records
+
+
+def capture_forecast_rows(players, teams, fixtures, gameweek, horizon_len, signals):
+    """Produce the exact production-engine projections stored with a capture."""
+    rows, failures = [], []
+    for player in players:
+        try:
+            player_id = int(player["id"])
+            club = teams.get(int(player.get("team") or -1), {}).get("short_name", "?")
+            projection, _, _ = fpl_engine.estimate_points(
+                player, club, fixtures, 1, start_gw=gameweek,
+                use_history=True, history_signals=signals, calibration_offsets={},
+            )
+            projection_5gw, _, _ = fpl_engine.estimate_points(
+                player, club, fixtures, horizon_len, start_gw=gameweek,
+                use_history=True, history_signals=signals, calibration_offsets={},
+            )
+            rows.append({"player_id": player_id, "projection_model": projection,
+                         "projection_model_5gw": projection_5gw})
+        except Exception as exc:
+            failures.append({"player_id": player.get("id"), "error": str(exc)})
+    return rows, failures
+
+
+def fetch_remote_snapshot_metadata(season: str, gameweek: int):
+    """Read only the two manifests and diagnostics from the persistent snapshot branch."""
+    if os.environ.get("GITHUB_ACTIONS", "").lower() != "true":
+        return {}, [], {}
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    if not repository or "/" not in repository:
+        return {}, [], {"repository": "GITHUB_REPOSITORY is missing or invalid"}
+    api_base = f"https://api.github.com/repos/{repository}/contents"
+    raw_base_url = f"https://raw.githubusercontent.com/{repository}/fpl-snapshots"
+    headers = {**HEADERS, "Accept": "application/vnd.github.raw+json"}
+    token = os.environ.get("FPL_SNAPSHOT_GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    manifests, errors = {}, {}
+    for label in fpl_snapshot_store.WINDOWS:
+        path = f"{season}/gw{int(gameweek):02d}/{label}/manifest.json"
+        url = f"{api_base}/{path}?ref=fpl-snapshots"
+        try:
+            response = requests.get(url, timeout=15, headers=headers)
+            if response.status_code == 404:
+                continue
+            response.raise_for_status()
+            manifest = json.loads(response.content.decode("utf-8"))
+            if manifest.get("identity") != {"season": season, "gameweek": int(gameweek), "window_label": label}:
+                errors[label] = "Remote manifest identity does not match its path"
+                continue
+            manifests[label] = manifest
+        except Exception as exc:
+            errors[label] = str(exc)
+    diagnostics = []
+    local_diagnostics = Path(os.environ.get("FPL_SNAPSHOT_DIR", "fpl-snapshots")) / "diagnostics.jsonl"
+    if local_diagnostics.exists():
+        lines = local_diagnostics.read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            try:
+                diagnostics.append(json.loads(line))
+            except ValueError:
+                errors["diagnostics"] = "Local persistent diagnostics file contains invalid JSONL"
+                break
+    else:
+        diagnostics_url = f"{raw_base_url}/diagnostics.jsonl"
+        try:
+            response = requests.get(diagnostics_url, timeout=15, headers=HEADERS)
+            if response.status_code != 404:
+                response.raise_for_status()
+                for line in response.content.decode("utf-8").splitlines():
+                    try:
+                        diagnostics.append(json.loads(line))
+                    except ValueError:
+                        errors["diagnostics"] = "Remote diagnostics file contains invalid JSONL"
+                        break
+        except Exception as exc:
+            errors["diagnostics"] = str(exc)
+    return manifests, diagnostics, errors
+
+
+def restore_remote_actual_ledger(snapshot_root: str | Path, season: str, gameweek: int):
+    """Restore one score ledger only when its daily recheck is due."""
+    if os.environ.get("GITHUB_ACTIONS", "").lower() != "true":
+        return True, None
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    if not repository or "/" not in repository:
+        return False, "GITHUB_REPOSITORY is missing or invalid"
+    path = Path(snapshot_root) / "actuals" / str(season) / f"gw{int(gameweek):02d}.jsonl"
+    if path.exists():
+        return True, None
+    api_path = f"actuals/{season}/gw{int(gameweek):02d}.jsonl"
+    url = f"https://api.github.com/repos/{repository}/contents/{api_path}?ref=fpl-snapshots"
+    headers = {**HEADERS, "Accept": "application/vnd.github.raw+json"}
+    token = os.environ.get("FPL_SNAPSHOT_GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        response = requests.get(url, timeout=15, headers=headers)
+        if response.status_code == 404:
+            return True, None
+        response.raise_for_status()
+        for line in response.content.decode("utf-8").splitlines():
+            json.loads(line)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(".tmp")
+        temp.write_bytes(response.content)
+        os.replace(temp, path)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
 
 
 def season_label(now=None) -> str:
@@ -160,10 +334,11 @@ def actual_map_for_gw(gameweek: int) -> dict[int, tuple[float, float]]:
     for element in live.get("elements", []):
         stats = element.get("stats", {})
         try:
-            result[int(element["id"])] = (
-                float(stats.get("total_points") or 0),
-                float(stats.get("minutes") or 0),
-            )
+            points = float(stats.get("total_points") or 0)
+            minutes = float(stats.get("minutes") or 0)
+            if not math.isfinite(points) or not math.isfinite(minutes):
+                continue
+            result[int(element["id"])] = (points, minutes)
         except (KeyError, TypeError, ValueError):
             continue
     return result
@@ -172,6 +347,7 @@ def actual_map_for_gw(gameweek: int) -> dict[int, tuple[float, float]]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--csv-path", default="forecast_log.csv")
+    parser.add_argument("--snapshot-dir", default=os.environ.get("FPL_SNAPSHOT_DIR"))
     args = parser.parse_args()
     log_path = Path(args.csv_path)
     model_path = log_path.with_name("trained_fpl_model.json")
@@ -184,8 +360,20 @@ def main() -> int:
     changed = False
     log = read_log(log_path)
 
-    bootstrap = get_json("bootstrap-static/")
-    fixtures = get_json("fixtures/")
+    bootstrap, bootstrap_record = get_json_with_record("bootstrap-static/")
+    fixtures, fixtures_record = get_json_with_record("fixtures/")
+    if not isinstance(bootstrap, dict):
+        fpl_snapshot_store.append_diagnostic(
+            args.snapshot_dir or log_path.parent / "fpl-snapshots", season=season_label(),
+            gameweek=None, kind="source_fetch_failure",
+            message="Could not load bootstrap-static or fixtures; capture cannot be assigned to an event.",
+            at_utc=datetime.now(timezone.utc),
+        )
+        print("DIAGNOSTIC: source payload unavailable; snapshot capture skipped. Existing forecast rows will still be reconciled only if usable bootstrap data is available.")
+        return 1
+    fixtures_available = isinstance(fixtures, list)
+    if not fixtures_available:
+        fixtures = []
     players = [p for p in bootstrap.get("elements", []) if p.get("id") is not None]
     teams = {int(team["id"]): team for team in bootstrap.get("teams", []) if team.get("id") is not None}
     types = bootstrap.get("element_types", [])
@@ -195,6 +383,157 @@ def main() -> int:
     current_event = next((event for event in events if event.get("is_current")), None)
     target = next_event or (None if current_event and current_event.get("finished") else current_event)
     season = season_label()
+
+    # Capture context independently of model availability. The 24h and 6h
+    # windows are separate immutable identities; six hours is the primary
+    # decision snapshot and 24 hours is retained for comparison.
+    snapshot_root = Path(args.snapshot_dir) if args.snapshot_dir else log_path.parent / "fpl-snapshots"
+    captured_at = datetime.now(timezone.utc)
+    if target and target.get("id") is not None and target.get("deadline_time"):
+        gameweek = int(target["id"])
+        deadline = datetime.fromisoformat(str(target["deadline_time"]).replace("Z", "+00:00"))
+        window_label = fpl_snapshot_store.window_for_deadline(captured_at, deadline)
+        remote_manifests, remote_diagnostics, remote_errors = fetch_remote_snapshot_metadata(season, gameweek)
+        for source_name, error in remote_errors.items():
+            message = f"Could not verify persistent snapshot store ({source_name}): {error}"
+            if not fpl_snapshot_store.diagnostic_exists(
+                    snapshot_root, season=season, gameweek=gameweek,
+                    kind="snapshot_store_read_failure", message_prefix=f"Could not verify persistent snapshot store ({source_name}):",
+                    existing_records=remote_diagnostics):
+                fpl_snapshot_store.append_diagnostic(
+                    snapshot_root, season=season, gameweek=gameweek,
+                    kind="snapshot_store_read_failure", message=message,
+                    at_utc=datetime.now(timezone.utc),
+                )
+        if window_label:
+            snapshot_path = snapshot_root / season / f"gw{gameweek:02d}" / window_label
+            if not (snapshot_path / "manifest.json").exists() and window_label not in remote_manifests and window_label not in remote_errors:
+                cutoff = deadline - timedelta(hours=2)
+                signals, history_failures, history_records = fetch_history_capture(
+                    [p.get("id") for p in players], cutoff_utc=cutoff
+                )
+                source_records = {"bootstrap-static": bootstrap_record, "fixtures": fixtures_record}
+                team_id = int(os.environ.get("FPL_TEAM_ID", "2311669"))
+                picks_payload, picks_record = get_json_with_record(
+                    f"entry/{team_id}/event/{gameweek}/picks/", attempts=1
+                )
+                source_records["public-picks"] = picks_record
+                _, entry_record = get_json_with_record(f"entry/{team_id}/", attempts=1)
+                source_records["public-entry"] = entry_record
+                max_gw = max(event_by_id) if event_by_id else gameweek
+                horizon_len = max(1, min(gameweek + 4, max_gw) - gameweek + 1)
+                artifact_valid = fpl_learning.validate_model(fpl_engine.TRAINED_MODEL)
+                model_sha = None
+                model_bytes = None
+                if model_path.exists():
+                    try:
+                        model_bytes = model_path.read_bytes()
+                        model_sha = hashlib.sha256(model_bytes).hexdigest()
+                    except OSError:
+                        artifact_valid = False
+                model_valid = artifact_valid and fixtures_available
+                forecast_failures = []
+                forecast_rows = None
+                if model_valid:
+                    forecast_rows, forecast_failures = capture_forecast_rows(
+                        players, teams, fixtures, gameweek, horizon_len, signals
+                    )
+                    if forecast_failures:
+                        forecast_rows = None
+                if artifact_valid and not model_sha:
+                    artifact_valid = False
+                    model_valid = False
+                    forecast_rows = None
+                model_reason = None if model_valid and not forecast_failures else (
+                    f"Projection generation failed for {len(forecast_failures)} players; context captured without a forecast."
+                    if forecast_failures else
+                    "Fixture source unavailable; context captured without projections."
+                    if not fixtures_available else
+                    ("Model artifact is missing; context captured without projections."
+                     if not model_path.exists() else
+                     "Model artifact is invalid, incompatible or unreadable; context captured without projections.")
+                )
+                capture_completed_at = datetime.now(timezone.utc)
+                if capture_completed_at >= deadline:
+                    fpl_snapshot_store.append_diagnostic(
+                        snapshot_root, season=season, gameweek=gameweek,
+                        kind="deadline_passed_before_capture",
+                        message="Source collection completed at or after the deadline; no purported pre-deadline snapshot was written.",
+                        at_utc=capture_completed_at,
+                    )
+                    forecast_rows = None
+                    model_reason = "Source collection completed after deadline; snapshot rejected."
+                    print(f"DIAGNOSTIC: {model_reason}")
+                    continue_snapshot = False
+                else:
+                    continue_snapshot = True
+                if continue_snapshot:
+                    snapshot_path, created_snapshot = fpl_snapshot_store.capture_snapshot(
+                        snapshot_root, season=season, gameweek=gameweek,
+                        window_label=window_label, deadline_utc=deadline,
+                        captured_at_utc=capture_completed_at, sources=source_records,
+                        histories=history_records,
+                        model_status="valid" if artifact_valid else ("missing" if not model_path.exists() else "invalid_or_incompatible"),
+                        model_reason=model_reason, model_sha256=model_sha,
+                        model_artifact_body=model_bytes if artifact_valid else None,
+                        code_commit_sha=os.environ.get("GITHUB_SHA"),
+                        forecast_rows=forecast_rows,
+                        provenance={"deadline": "derived",
+                                    "fixture_schedule": "captured",
+                                    **({"public_picks": "captured"} if picks_payload is not None else {}),
+                                    **({"public_entry": "captured"} if entry_record.get("metadata", {}).get("fetch_outcome") == "success" else {})},
+                    )
+                    if created_snapshot:
+                        print(f"Captured immutable {window_label} context snapshot for {season} GW{gameweek}: {len(history_records) - len(history_failures)}/{len(players)} histories available; model={'valid' if model_valid else 'unavailable'}.")
+                    else:
+                        print(f"Snapshot already exists for {season} GW{gameweek} {window_label}; preserving it.")
+                failed_sources = [name for name, record in source_records.items()
+                                  if not record or record.get("metadata", {}).get("fetch_outcome") != "success"]
+                if failed_sources:
+                    fpl_snapshot_store.append_diagnostic(
+                        snapshot_root, season=season, gameweek=gameweek,
+                        kind="partial_api_fetch",
+                        message=f"Source fetch failed or was partial: {', '.join(sorted(failed_sources))}.",
+                        at_utc=capture_completed_at,
+                    )
+                if not artifact_valid:
+                    fpl_snapshot_store.append_diagnostic(
+                        snapshot_root, season=season, gameweek=gameweek,
+                        kind="model_failure", message=model_reason or "Model artifact unavailable.",
+                        at_utc=capture_completed_at,
+                    )
+                if history_failures:
+                    fpl_snapshot_store.append_diagnostic(
+                        snapshot_root, season=season, gameweek=gameweek,
+                        kind="history_gaps", message=f"{len(history_failures)} player history fetches failed.",
+                        at_utc=capture_completed_at,
+                    )
+                if forecast_failures:
+                    fpl_snapshot_store.append_diagnostic(
+                        snapshot_root, season=season, gameweek=gameweek,
+                        kind="forecast_failure",
+                        message=("Projection generation failed for player IDs: "
+                                 + ", ".join(str(item["player_id"]) for item in forecast_failures[:25]) + "."),
+                        at_utc=capture_completed_at,
+                    )
+            elif window_label in remote_manifests and not (snapshot_path / "manifest.json").exists():
+                print(f"Snapshot already exists in persistent branch for {season} GW{gameweek} {window_label}; preserving it.")
+            elif window_label in remote_errors:
+                print(f"DIAGNOSTIC: could not verify the persistent {window_label} snapshot identity; skipping capture.")
+        # Check on every workflow run, including when the current immutable
+        # window already exists or a moved deadline is outside both windows.
+        fpl_snapshot_store.record_deadline_move(
+            snapshot_root, season=season, gameweek=gameweek,
+            current_window=window_label or "outside-window", deadline_utc=deadline,
+            at_utc=datetime.now(timezone.utc), remote_manifests=remote_manifests,
+            existing_diagnostics=remote_diagnostics,
+        )
+        hours = (deadline - captured_at).total_seconds() / 3600.0
+        fpl_snapshot_store.record_missed_windows(
+            snapshot_root, season=season, gameweek=gameweek,
+            hours_to_deadline=hours, at_utc=captured_at,
+            existing_windows=set(remote_manifests), existing_diagnostics=remote_diagnostics,
+        )
 
     if target and target.get("id") is not None and target.get("deadline_time"):
         gameweek = int(target["id"])
@@ -206,7 +545,7 @@ def main() -> int:
                  & (pd.to_numeric(log["gameweek"], errors="coerce") == gameweek)
                  & (log["model_version"].astype(str) == MODEL_VERSION)).any()
         )
-        if 0 < hours_to_deadline <= 6 and not already_saved and fpl_engine.TRAINED_MODEL:
+        if 0 < hours_to_deadline <= 6 and not already_saved and fpl_learning.validate_model(fpl_engine.TRAINED_MODEL) and fixtures_available:
             # No online correction is applied during this validation release. Freeze the
             # formula while the benchmarks and rankings are accumulated.
             player_by_id = {int(player["id"]): player for player in players}
@@ -292,6 +631,8 @@ def main() -> int:
                 print(f"Saved v{MODEL_VERSION} pre-deadline forecast for {season} GW{gameweek}: {len(rows)} players; ep_next coverage={new['projection_ep_next'].notna().mean():.1%}; history coverage={new['history_enriched'].map(bool).mean():.1%}.")
         elif 0 < hours_to_deadline <= 6 and not fpl_engine.TRAINED_MODEL:
             print(f"DIAGNOSTIC: skipped new forecast for {season} GW{gameweek}; trained v3.0 artifact is unavailable or invalid. Existing rows are preserved and will still be reconciled.")
+        elif 0 < hours_to_deadline <= 6 and not fixtures_available:
+            print(f"DIAGNOSTIC: skipped new forecast for {season} GW{gameweek}; fixture source is unavailable. Existing rows are preserved.")
         elif already_saved:
             print(f"Forecast already exists for {season} GW{gameweek}; preserving the first snapshot.")
         elif hours_to_deadline > 6:
@@ -301,39 +642,77 @@ def main() -> int:
     else:
         print("No upcoming event with a published deadline; skipped new snapshot.")
 
-    finished_gws = {int(event["id"]) for event in events if event.get("finished") and event.get("id") is not None}
+    finalized_events = {
+        int(event["id"]): event for event in events
+        if event.get("id") is not None and fpl_snapshot_store.event_scores_final(event)
+    }
+    finalized_gws = set(finalized_events)
     max_gw = max(event_by_id) if event_by_id else 38
     if not log.empty:
-        # Reconcile single-GW actuals as soon as FPL says the event is finished.
+        # Final score checks use data_checked when the API exposes it. The
+        # append-only revision ledger is polled daily for late score changes.
         numeric_gws = pd.to_numeric(log["gameweek"], errors="coerce")
-        for gameweek in sorted(numeric_gws.dropna().astype(int).unique()):
-            mask = numeric_gws == gameweek
-            if gameweek not in finished_gws or not log.loc[mask, "actual_points"].isna().any():
+        current_season = log["season"].astype(str) == season
+        current_gws = sorted(numeric_gws[current_season].dropna().astype(int).unique())
+        for gameweek in current_gws:
+            mask = (numeric_gws == gameweek) & current_season
+            if gameweek not in finalized_gws:
                 continue
+            needs_revision_check = fpl_snapshot_store.actual_reconciliation_due(
+                snapshot_root, season=season, gameweek=gameweek, now=datetime.now(timezone.utc)
+            )
+            needs_forecast_log_update = log.loc[mask, "actual_points"].isna().any()
+            if not needs_revision_check and not needs_forecast_log_update:
+                continue
+            ledger_ready = True
+            if needs_revision_check:
+                ledger_ready, ledger_error = restore_remote_actual_ledger(
+                    snapshot_root, season, gameweek
+                )
+                if not ledger_ready:
+                    message = f"Could not restore finalized actual-score history: {ledger_error}"
+                    if not fpl_snapshot_store.diagnostic_exists(
+                            snapshot_root, season=season, gameweek=gameweek,
+                            kind="actual_ledger_restore_failure",
+                            message_prefix="Could not restore finalized actual-score history:"):
+                        fpl_snapshot_store.append_diagnostic(
+                            snapshot_root, season=season, gameweek=gameweek,
+                            kind="actual_ledger_restore_failure", message=message,
+                            at_utc=datetime.now(timezone.utc),
+                        )
             try:
                 actuals = actual_map_for_gw(gameweek)
-                for idx in log.index[mask]:
-                    try:
-                        player_id = int(log.at[idx, "player_id"])
-                    except (TypeError, ValueError):
-                        continue
-                    if player_id in actuals:
-                        log.at[idx, "actual_points"] = actuals[player_id][0]
-                        log.at[idx, "actual_minutes"] = actuals[player_id][1]
-                        changed = True
-                print(f"Reconciled one-GW actuals for GW{gameweek}.")
+                if needs_revision_check and ledger_ready:
+                    changed_scores = fpl_snapshot_store.append_finalized_actuals(
+                        snapshot_root, season=season, gameweek=gameweek,
+                        actuals=actuals,
+                        data_checked=bool(finalized_events[gameweek].get("data_checked", True)),
+                        reconciled_at_utc=datetime.now(timezone.utc),
+                    )
+                    print(f"Final-score reconciliation checkpoint for GW{gameweek}; changed player scores={changed_scores}.")
+                if needs_forecast_log_update:
+                    for idx in log.index[mask]:
+                        try:
+                            player_id = int(log.at[idx, "player_id"])
+                        except (TypeError, ValueError):
+                            continue
+                        if player_id in actuals:
+                            log.at[idx, "actual_points"] = actuals[player_id][0]
+                            log.at[idx, "actual_minutes"] = actuals[player_id][1]
+                            changed = True
+                    print(f"Reconciled one-GW forecast-log actuals for GW{gameweek}.")
             except Exception as exc:
                 print(f"Could not fetch actuals for GW{gameweek}: {exc}")
 
         # Reconcile the five-GW horizon only once every event in that horizon is finished.
-        all_gws = sorted(numeric_gws.dropna().astype(int).unique())
+        all_gws = current_gws
         for gameweek in all_gws:
-            mask = numeric_gws == gameweek
+            mask = (numeric_gws == gameweek) & current_season
             if not log.loc[mask, "actual_points_5gw"].isna().any():
                 continue
             horizon_end = min(int(gameweek) + 4, max_gw)
             horizon_events = set(range(int(gameweek), horizon_end + 1))
-            if not horizon_events.issubset(finished_gws):
+            if not horizon_events.issubset(finalized_gws):
                 continue
             totals: dict[int, list[float]] = {}
             all_actuals_available = True
