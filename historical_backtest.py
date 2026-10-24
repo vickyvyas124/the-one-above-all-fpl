@@ -24,7 +24,13 @@ SOURCES = {
     "2024-25": "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data/2024-25/gws/merged_gw.csv",
     "2025-26": "https://raw.githubusercontent.com/imadeddine-belkat/Premier-League-Stats/main/fpl_scraper/fpl_stats/_merged/players/2025-26_all_players_gw.csv",
 }
-HEADERS = {"User-Agent": "Mozilla/5.0 The-One-Above-All-FPL/2.9 historical-validation"}
+# The 2025-26 player archive is fixture-grain and has fixture_code rather than
+# a round/event column. Map each fixture code to its official FPL Gameweek using
+# the companion fixture table from the same data source.
+FIXTURE_SOURCES = {
+    "2025-26": "https://raw.githubusercontent.com/imadeddine-belkat/Premier-League-Stats/main/fpl_scraper/fpl_stats/fixtures/2025-26_all_fixtures.csv",
+}
+HEADERS = {"User-Agent": "Mozilla/5.0 The-One-Above-All-FPL/2.9.1 historical-validation"}
 
 
 def fetch_csv(url: str) -> pd.DataFrame:
@@ -63,10 +69,20 @@ def normalize_position(value) -> str:
     return mapping.get(text, text)
 
 
+def _fixture_key_series(values: pd.Series) -> pd.Series:
+    """Normalize numeric fixture codes and string IDs so CSV dtypes do not break joins."""
+    keys = values.astype("string").str.strip()
+    numeric = pd.to_numeric(values, errors="coerce")
+    numeric_mask = numeric.notna()
+    if numeric_mask.any():
+        keys.loc[numeric_mask] = numeric.loc[numeric_mask].astype("Int64").astype("string")
+    return keys
+
+
 def season_frame(season: str, url: str) -> pd.DataFrame:
     raw = fetch_csv(url)
     id_col = pick_column(raw, ["element", "player_id", "player_code", "element_id", "playerid", "id"])
-    gw_col = pick_column(raw, ["round", "event", "gameweek", "gw", "gameweek_id"])
+    gw_col = pick_column(raw, ["round", "event", "gameweek", "gw", "gameweek_id"], required=False)
     points_col = pick_column(raw, ["total_points", "event_points", "gw_points", "points"])
     minutes_col = pick_column(raw, ["minutes", "mins"], required=False)
     position_col = pick_column(raw, ["element_type", "position", "position_short", "position_name"], required=False)
@@ -77,9 +93,33 @@ def season_frame(season: str, url: str) -> pd.DataFrame:
     team_col = pick_column(raw, ["team_code", "team", "team_id", "team_id_x", "team_name"], required=False)
     name_col = pick_column(raw, ["web_name", "name", "second_name", "player_name"], required=False)
 
+    if gw_col:
+        gameweek_values = pd.to_numeric(raw[gw_col], errors="coerce")
+    elif fixture_col and season in FIXTURE_SOURCES:
+        fixture_data = fetch_csv(FIXTURE_SOURCES[season])
+        fixture_code_col = pick_column(fixture_data, ["code", "fixture_code", "fixture", "fixture_id", "id"])
+        fixture_gw_col = pick_column(fixture_data, ["event", "round", "gameweek", "gw"])
+        fixture_map = pd.DataFrame({
+            "_fixture_key": _fixture_key_series(fixture_data[fixture_code_col]),
+            "_gameweek": pd.to_numeric(fixture_data[fixture_gw_col], errors="coerce"),
+        }).dropna(subset=["_fixture_key", "_gameweek"]).drop_duplicates("_fixture_key", keep="last")
+        code_to_gameweek = dict(zip(fixture_map["_fixture_key"], fixture_map["_gameweek"]))
+        gameweek_values = _fixture_key_series(raw[fixture_col]).map(code_to_gameweek)
+        if gameweek_values.notna().sum() == 0:
+            raise ValueError(
+                f"No fixture_code values matched the season fixture lookup for {season}. "
+                f"Player fixture column: {fixture_col}; lookup code column: {fixture_code_col}."
+            )
+        gameweek_values = pd.to_numeric(gameweek_values, errors="coerce")
+    else:
+        raise ValueError(
+            f"Missing Gameweek column and no fixture lookup is configured for {season}. "
+            f"Available columns: {list(raw.columns)[:60]}"
+        )
+
     subset = pd.DataFrame({
         "player_id": pd.to_numeric(raw[id_col], errors="coerce"),
-        "gameweek": pd.to_numeric(raw[gw_col], errors="coerce"),
+        "gameweek": gameweek_values,
         "actual_points": pd.to_numeric(raw[points_col], errors="coerce"),
         "minutes": pd.to_numeric(raw[minutes_col], errors="coerce") if minutes_col else 0.0,
         "position": raw[position_col].map(normalize_position) if position_col else "UNK",
@@ -302,7 +342,8 @@ def main() -> int:
     (out / "historical_backtest_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(summary_df.to_string(index=False))
     if failures:
-        print("Some datasets were unavailable; see historical_backtest_metadata.json")
+        print("Some datasets were unavailable; see historical_backtest_metadata.json", file=sys.stderr)
+        return 1
     return 0
 
 
