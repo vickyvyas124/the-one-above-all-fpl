@@ -11,11 +11,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 st.set_page_config(page_title="The-One-Above-All | FPL Manager Hub", layout="wide")
-APP_VERSION = "2.9"
+APP_VERSION = "3.0"
 FORECAST_LOG_PATH = Path(__file__).resolve().parent / "forecast_log.csv"
 FORECAST_REMOTE_URL = "https://raw.githubusercontent.com/vickyvyas124/the-one-above-all-fpl/fpl-data/forecast_log.csv"
 HISTORICAL_SUMMARY_URL = "https://raw.githubusercontent.com/vickyvyas124/the-one-above-all-fpl/fpl-data/historical_backtest_summary.csv"
 HISTORICAL_GW_URL = "https://raw.githubusercontent.com/vickyvyas124/the-one-above-all-fpl/fpl-data/historical_backtest_gameweeks.csv"
+TRAINED_MODEL_URL = "https://raw.githubusercontent.com/vickyvyas124/the-one-above-all-fpl/fpl-data/trained_fpl_model.json"
 FORECAST_COLUMNS = [
     "season", "gameweek", "player_id", "player", "position", "club",
     "model_version", "forecast_created_utc", "projection_model", "projection_baseline",
@@ -76,6 +77,22 @@ def get_entry_history(team_id):
                      timeout=20, headers={"User-Agent":"Mozilla/5.0 The-One-Above-All-FPL/2.9"})
     r.raise_for_status()
     return r.json()
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_trained_model_payload():
+    """Load the versioned model fitted and published by the historical backtest workflow."""
+    try:
+        r = requests.get(TRAINED_MODEL_URL, timeout=8, headers={"User-Agent":"The-One-Above-All-FPL/3.0"})
+        r.raise_for_status()
+        payload = r.json()
+        if str(payload.get("model_version")) != "3.0" or not payload.get("coefficients"):
+            return None
+        return payload
+    except Exception:
+        return None
+
+# Dashboard and background worker consume the same model artifact.
+fpl_engine.TRAINED_MODEL = get_trained_model_payload()
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def get_player_summary(player_id):
@@ -437,6 +454,10 @@ div[data-testid="stHorizontalBlock"] .manager-panel {height:100%;}
 </div>
 """, unsafe_allow_html=True)
 st.info("Decision rule: HOLD unless a transfer clears the points-gain and reliability gates. Public FPL bank/free-transfer sync is estimated; verify it against your Transfers page before acting. This dashboard never submits transfers automatically.")
+if fpl_engine.TRAINED_MODEL:
+    st.success(f"Prediction engine v{APP_VERSION}: historical model loaded ({fpl_engine.TRAINED_MODEL.get('training_rows', 0):,} player-Gameweek training rows; seasons {', '.join(fpl_engine.TRAINED_MODEL.get('source_seasons', []))}).")
+else:
+    st.warning("Prediction engine v3.0: trained historical model not published/loaded yet; projections are using the fallback formula. Run Historical FPL Backtest successfully to train and publish trained_fpl_model.json.")
 
 with st.sidebar:
     st.header("⚙️ Optimizer settings")
@@ -516,6 +537,8 @@ with st.sidebar:
     risk = st.select_slider("Risk appetite", options=["Conservative","Moderate","Aggressive"], value="Moderate",
                              help="Conservative favors established minutes; Moderate balances projected gain and differential upside; Aggressive gives more weight to low-ownership upside.")
     if st.button("↻ Refresh rank & squad", use_container_width=True):
+        get_trained_model_payload.clear()
+        fpl_engine.TRAINED_MODEL = get_trained_model_payload()
         get_manager_profile.clear()
         get_entry_picks.clear()
         get_entry_history.clear()
@@ -1634,7 +1657,7 @@ st.markdown(
 )
 
 st.subheader("Prediction engine & model validation")
-st.caption("v2.9 is a frozen validation release: it adds FPL ep_next benchmarking, full-player history coverage tracking, one- and five-Gameweek evaluation, and ranking metrics. It does not adapt its weights while we measure performance.")
+st.caption("v3.0 is a frozen validation release: it adds FPL ep_next benchmarking, full-player history coverage tracking, one- and five-Gameweek evaluation, and ranking metrics. It does not adapt its weights while we measure performance.")
 
 # Show next-Gameweek candidates without presenting projections as certainties.
 next_week_rows = []
@@ -1662,7 +1685,7 @@ engine_c1.metric("History-enriched players", f"{len(PLAYER_HISTORY_SIGNALS)}")
 engine_c2.metric("Candidates with a GW fixture", f"{len(next_week_df)}")
 engine_c3.metric("Forecast record", "Saved" if not forecast_log.empty and ((forecast_log["season"].astype(str) == season_id) & (pd.to_numeric(forecast_log["gameweek"], errors="coerce") == int(gw))).any() else "Not saved")
 engine_c4.metric("Model version", APP_VERSION)
-st.caption("Calibration is paused while v2.9 is benchmarked, so the tested model does not change weights between Gameweeks.")
+st.caption("Calibration is paused while v3.0 is benchmarked, so the tested model does not change weights between Gameweeks.")
 if forecast_snapshot_note:
     st.caption(forecast_snapshot_note)
 if not next_week_df.empty:
@@ -1790,7 +1813,7 @@ if not forecast_log.empty:
                 )
             st.write(_agg)
             if len(_usable) < 4:
-                st.info("Early evidence only: fewer than four completed v2.9 Gameweeks have been scored. Do not change model weights yet.")
+                st.info("Early evidence only: fewer than four completed v3.0 Gameweeks have been scored. Do not change model weights yet.")
         _horizon_scored = _version_rows[pd.to_numeric(_version_rows.get("actual_points_5gw"), errors="coerce").notna()].copy()
         if not _horizon_scored.empty:
             _h_metrics = evaluate_log(_horizon_scored, actual_col="actual_points_5gw", model_col="projection_model_5gw",
@@ -1805,7 +1828,7 @@ if not forecast_log.empty:
         else:
             st.info("No complete five-Gameweek outcome is available yet. Those metrics will populate automatically when each forecast horizon finishes.")
     else:
-        st.info("No v2.9 forecast has completed results yet. The previous-version GW8 seed is kept as legacy reference and is not mixed into the v2.9 validation metrics.")
+        st.info("No v3.0 forecast has completed results yet. The previous-version GW8 seed is kept as legacy reference and is not mixed into the v3.0 validation metrics.")
 
     _historic = get_remote_historical_backtest()
     st.markdown("**Previous seasons · retrospective backtest**")
@@ -1842,7 +1865,7 @@ if not forecast_log.empty:
 else:
     st.info("No forecast log found. Once the GitHub Actions workflow is enabled, it will capture a pre-deadline snapshot and reconcile actual results automatically.")
 
-st.caption("Validation note: v2.9 weights are frozen during the test. All-player MAE, played-only MAE, expected-minutes error, EP-next benchmark error, Spearman correlation, top-10/top-20 capture, captain regret where a pre-deadline XI was logged, and five-Gameweek error are reported separately. Historical proxy results are kept separate from live pre-deadline validation.")
+st.caption("Validation note: v3.0 weights are frozen during the test. All-player MAE, played-only MAE, expected-minutes error, EP-next benchmark error, Spearman correlation, top-10/top-20 capture, captain regret where a pre-deadline XI was logged, and five-Gameweek error are reported separately. Historical proxy results are kept separate from live pre-deadline validation.")
 
 st.subheader("Automatic transfer recommendations")
 st.caption(f"Team ID: {int(team_id)} • The optimizer scans every matched squad player and searches for legal, affordable replacements. Budget source: {'public FPL sync' if auto_controls else 'manual override'}.")
@@ -2114,10 +2137,10 @@ st.markdown("""
 - Blends PPG/form with a conservative xG+xA signal, shrinks small samples toward a position baseline, estimates minutes from starts and appearances, penalizes uncertain/unavailable status, and adjusts each scheduled fixture individually. Displays cumulative xG/xA and per-90 rates.
 - Uses public player status and chance-of-playing fields where provided.
 - Does **not** access your FPL password, private `my-team` endpoint, or your personal selling prices.
-- Building on v2.8, this v2.9 validation release adds matched live benchmarks, expected-minutes diagnostics, historical replay and explicit ranking metrics alongside the existing transfer HOLD gate. The model remains heuristic until enough saved forecasts and actual scores exist; no claim of self-learning accuracy is made before backtesting shows an improvement. The transfer search still evaluates one transfer at a time and does not submit transfers to FPL.
+- Building on v2.8, this v3.0 validation release adds matched live benchmarks, expected-minutes diagnostics, historical replay and explicit ranking metrics alongside the existing transfer HOLD gate. The model remains heuristic until enough saved forecasts and actual scores exist; no claim of self-learning accuracy is made before backtesting shows an improvement. The transfer search still evaluates one transfer at a time and does not submit transfers to FPL.
 - Public FPL API is unofficial/undocumented and may change. Player/fixture data is cached for 30 minutes; manager profile/rank for 60 seconds; public picks/history for 2 minutes.
 - A sidebar **Refresh rank & squad** button clears data caches and reruns the dashboard. Finance sync is derived from public data; use Manual override if the FPL Transfers page shows a different live balance.
 - Squad sync attempts to use all 15 players from `entry/{id}/event/{gw}/picks/` for the next Gameweek. If the picks endpoint doesn't provide all 15 (especially before deadline), the app clearly falls back to the saved screenshot baseline.
 - The app does not access the authenticated `/my-team/{id}/` endpoint and does not ask for or store an FPL password/cookie. This means the latest editable pre-deadline team might not always be publicly available.
 """)
-st.caption(f"The-One-Above-All v2.9 · Last refreshed in this session: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. Use the app's refresh/reload to request fresh data.")
+st.caption(f"The-One-Above-All v3.0 · Last refreshed in this session: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. Use the app's refresh/reload to request fresh data.")
