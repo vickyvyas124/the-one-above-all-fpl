@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -64,14 +64,16 @@ def read_log(path: Path) -> pd.DataFrame:
     try:
         frame = pd.read_csv(path)
     except Exception as exc:
-        print(f"Existing forecast CSV could not be read; starting empty: {exc}")
-        frame = pd.DataFrame(columns=COLUMNS)
+        raise RuntimeError(f"Existing forecast CSV could not be read; preserving it and skipping this worker run: {exc}") from exc
+    required = {"season", "gameweek", "player_id"}
+    if not required.issubset(frame.columns):
+        raise RuntimeError("Existing forecast CSV has no recognizable forecast schema; preserving it and skipping this worker run")
     for column in COLUMNS:
         if column not in frame.columns:
             frame[column] = None
     if "model_version" in frame.columns:
         versions = frame["model_version"].astype("string").str.strip()
-        frame.loc[versions.isna() | versions.eq(""), "model_version"] = "legacy-unknown"
+        frame["model_version"] = versions.fillna("legacy-unknown").replace("", "legacy-unknown").astype(str)
     return frame[COLUMNS]
 
 
@@ -82,12 +84,12 @@ def write_log(path: Path, frame: pd.DataFrame) -> None:
     os.replace(temp, path)
 
 
-def fetch_one_history(player_id: int):
+def fetch_one_history(player_id: int, cutoff_utc=None):
     last_error = None
     for attempt in range(3):
         try:
             payload = get_json(f"element-summary/{int(player_id)}/", attempts=1)
-            return int(player_id), fpl_engine.make_history_signal(payload), None
+            return int(player_id), fpl_engine.make_history_signal(payload, cutoff_utc=cutoff_utc), None
         except Exception as exc:
             last_error = exc
             if attempt < 2:
@@ -95,7 +97,7 @@ def fetch_one_history(player_id: int):
     return int(player_id), None, str(last_error)
 
 
-def fetch_history_signals(player_ids):
+def fetch_history_signals(player_ids, cutoff_utc=None):
     signals, failures = {}, {}
     unique_ids = sorted({int(pid) for pid in player_ids if pid is not None})
     if not unique_ids:
@@ -103,7 +105,7 @@ def fetch_history_signals(player_ids):
     # All-player coverage prevents the forecast pool receiving hidden mixtures of inputs.
     # Bounded concurrency and retries reduce burst pressure on the public endpoint.
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = [pool.submit(fetch_one_history, pid) for pid in unique_ids]
+        futures = [pool.submit(fetch_one_history, pid, cutoff_utc) for pid in unique_ids]
         for future in as_completed(futures):
             try:
                 pid, signal, error = future.result()
@@ -177,7 +179,7 @@ def main() -> int:
     if fpl_engine.TRAINED_MODEL:
         print(f"Loaded trained model v3.0: {fpl_engine.TRAINED_MODEL.get('training_rows', 0)} historical player-GWs from {fpl_engine.TRAINED_MODEL.get('source_seasons', [])}.")
     else:
-        print("WARNING: no trained v3.0 model artifact found beside forecast log; using fallback formula until historical backtest publishes trained_fpl_model.json.")
+        print("DIAGNOSTIC: new v3.0 forecast snapshots are disabled because the trained model artifact is missing, invalid, or incompatible. Existing forecast rows will still be reconciled.")
     team_id = int(os.environ.get("FPL_TEAM_ID", "2311669"))
     changed = False
     log = read_log(log_path)
@@ -204,12 +206,13 @@ def main() -> int:
                  & (pd.to_numeric(log["gameweek"], errors="coerce") == gameweek)
                  & (log["model_version"].astype(str) == MODEL_VERSION)).any()
         )
-        if 0 < hours_to_deadline <= 6 and not already_saved:
+        if 0 < hours_to_deadline <= 6 and not already_saved and fpl_engine.TRAINED_MODEL:
             # No online correction is applied during this validation release. Freeze the
             # formula while the benchmarks and rankings are accumulated.
             player_by_id = {int(player["id"]): player for player in players}
             history_ids = set(player_by_id)
-            signals, history_failures = fetch_history_signals(history_ids)
+            history_cutoff = deadline - timedelta(hours=2)
+            signals, history_failures = fetch_history_signals(history_ids, cutoff_utc=history_cutoff)
             coverage = len(signals) / max(1, len(history_ids))
             print(f"History coverage for {season} GW{gameweek}: {len(signals)}/{len(history_ids)} ({coverage:.1%}); failures={len(history_failures)}")
             if history_failures:
@@ -287,6 +290,8 @@ def main() -> int:
                 log = pd.concat([log, new], ignore_index=True)
                 changed = True
                 print(f"Saved v{MODEL_VERSION} pre-deadline forecast for {season} GW{gameweek}: {len(rows)} players; ep_next coverage={new['projection_ep_next'].notna().mean():.1%}; history coverage={new['history_enriched'].map(bool).mean():.1%}.")
+        elif 0 < hours_to_deadline <= 6 and not fpl_engine.TRAINED_MODEL:
+            print(f"DIAGNOSTIC: skipped new forecast for {season} GW{gameweek}; trained v3.0 artifact is unavailable or invalid. Existing rows are preserved and will still be reconciled.")
         elif already_saved:
             print(f"Forecast already exists for {season} GW{gameweek}; preserving the first snapshot.")
         elif hours_to_deadline > 6:

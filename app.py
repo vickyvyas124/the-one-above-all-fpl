@@ -9,7 +9,7 @@ from pathlib import Path
 import fpl_engine
 import fpl_learning
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 st.set_page_config(page_title="The-One-Above-All | FPL Manager Hub", layout="wide")
 APP_VERSION = "3.0"
@@ -86,9 +86,7 @@ def get_trained_model_payload():
         r = requests.get(TRAINED_MODEL_URL, timeout=8, headers={"User-Agent":"The-One-Above-All-FPL/3.0"})
         r.raise_for_status()
         payload = r.json()
-        if (str(payload.get("model_version")) != fpl_learning.MODEL_VERSION
-                or payload.get("feature_policy") != fpl_learning.FEATURE_POLICY
-                or not payload.get("coefficients")):
+        if not fpl_learning.validate_model(payload):
             return None
         return payload
     except Exception:
@@ -113,8 +111,8 @@ def get_live_gameweek(gameweek):
     r.raise_for_status()
     return r.json()
 
-def make_history_signal(summary):
-    return fpl_engine.make_history_signal(summary)
+def make_history_signal(summary, cutoff_utc=None):
+    return fpl_engine.make_history_signal(summary, cutoff_utc=cutoff_utc)
 
 def season_label(now=None):
     now = now or datetime.now(timezone.utc)
@@ -155,20 +153,26 @@ def read_forecast_log():
     elif FORECAST_LOG_PATH.exists():
         try:
             frame = pd.read_csv(FORECAST_LOG_PATH)
-        except Exception:
+        except Exception as exc:
             frame = pd.DataFrame(columns=FORECAST_COLUMNS)
+            frame.attrs["forecast_log_read_error"] = str(exc)
     else:
         frame = pd.DataFrame(columns=FORECAST_COLUMNS)
+    if not {"season", "gameweek", "player_id"}.issubset(frame.columns):
+        frame = pd.DataFrame(columns=FORECAST_COLUMNS)
+        frame.attrs["forecast_log_read_error"] = "CSV has no recognizable forecast schema"
     for col in FORECAST_COLUMNS:
         if col not in frame.columns:
             frame[col] = None
     if "model_version" in frame.columns:
         versions = frame["model_version"].astype("string").str.strip()
-        frame.loc[versions.isna() | versions.eq(""), "model_version"] = "legacy-unknown"
+        frame["model_version"] = versions.fillna("legacy-unknown").replace("", "legacy-unknown").astype(str)
     return frame[FORECAST_COLUMNS]
 
 def write_forecast_log(frame):
     """Write a portable CSV. Streamlit-host disk can be ephemeral, so export backups are provided."""
+    if frame.attrs.get("forecast_log_read_error"):
+        return False
     try:
         FORECAST_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         temp_path = FORECAST_LOG_PATH.with_suffix(".tmp")
@@ -181,6 +185,8 @@ def write_forecast_log(frame):
 def append_first_forecast_snapshot(rows):
     """Take only the first pre-deadline snapshot for each season/Gameweek."""
     old = read_forecast_log()
+    if old.attrs.get("forecast_log_read_error"):
+        return old, False, "New forecast snapshot skipped because the existing local forecast log could not be read; its contents were preserved."
     row_version = str(rows[0].get("model_version", APP_VERSION))
     if not old.empty and ((old["season"].astype(str) == str(rows[0]["season"])) &
                           (pd.to_numeric(old["gameweek"], errors="coerce") == int(rows[0]["gameweek"])) &
@@ -191,7 +197,7 @@ def append_first_forecast_snapshot(rows):
     ok = write_forecast_log(combined)
     return combined, ok, ("Pre-deadline forecast saved." if ok else "Could not write the forecast CSV on this host; use the export/import controls for a backup workflow.")
 
-def fetch_history_signals(target_ids):
+def fetch_history_signals(target_ids, cutoff_utc=None):
     results = {}
     unique_ids = sorted({int(x) for x in target_ids if x is not None})
     if not unique_ids:
@@ -202,7 +208,7 @@ def fetch_history_signals(target_ids):
         for future in as_completed(future_to_id):
             pid = future_to_id[future]
             try:
-                results[pid] = make_history_signal(future.result())
+                results[pid] = make_history_signal(future.result(), cutoff_utc=cutoff_utc)
             except Exception:
                 continue
     return results
@@ -615,9 +621,17 @@ for _row in squad_rows:
 # Enrich the full player pool so transfer candidates, captain options and the
 # saved-vs-baseline validation do not quietly use different feature coverage.
 history_target_ids = [int(p["id"]) for p in players if p.get("id") is not None]
+_history_event = next((e for e in events if int(e.get("id") or 0) == int(gw)), {})
+try:
+    _history_deadline = datetime.fromisoformat(str(_history_event.get("deadline_time")).replace("Z", "+00:00"))
+    _history_cutoff = _history_deadline - timedelta(hours=2)
+except (TypeError, ValueError):
+    # Without a parseable deadline, use only history that was safely available
+    # at the current time; this suppresses in-progress/recently finished match data.
+    _history_cutoff = datetime.now(timezone.utc)
 try:
     with st.spinner("Updating recent player history for the prediction engine…"):
-        PLAYER_HISTORY_SIGNALS = fetch_history_signals(history_target_ids)
+        PLAYER_HISTORY_SIGNALS = fetch_history_signals(history_target_ids, cutoff_utc=_history_cutoff)
 except Exception:
     PLAYER_HISTORY_SIGNALS = {}
 
@@ -653,6 +667,8 @@ if deadline_dt and datetime.now(timezone.utc) < deadline_dt:
                      (forecast_log["model_version"].astype(str) == APP_VERSION)).any())
     if has_snapshot:
         forecast_snapshot_note = "A pre-deadline forecast already exists for this Gameweek; it is preserved."
+    elif not fpl_learning.validate_model(fpl_engine.TRAINED_MODEL):
+        forecast_snapshot_note = "New forecast snapshot skipped: the trained v3.0 model artifact is missing, invalid, or incompatible. Existing forecast records remain available for reconciliation."
     elif remote_log_active:
         forecast_snapshot_note = "Automatic logging is enabled. The scheduled GitHub workflow will record this Gameweek before its deadline; refresh after the next scheduled run."
     else:

@@ -57,12 +57,11 @@ def make_feature_row(
     """Build inference features matching historical_backtest.add_point_in_time_features."""
     hist = dict(history_signal or {})
     row = position_features(position)
+    # Training fills unavailable lagged history with zero, so new players and
+    # history-fetch failures must use the same value at inference. Bootstrap PPG,
+    # form and cumulative xGI are not interchangeable with the lagged training data.
     season_mean = hist.get("season_points_per_gw")
     recent_mean = hist.get("recent_points_per_gw")
-    if season_mean is None:
-        season_mean = fallback_season_mean
-    if recent_mean is None:
-        recent_mean = fallback_recent_mean
     # Historical archives do not record what fixture assignments were known at
     # each old deadline. Keep the public model schema stable, but make schedule
     # fields neutral in both training and inference. The engine applies the live
@@ -73,8 +72,8 @@ def make_feature_row(
         "recent_minutes_per_fixture_prev": _safe_float(hist.get("recent_minutes_per_fixture")),
         "recent_appearance_rate_prev": _safe_float(hist.get("recent_appearance_rate")),
         "recent_start_rate_prev": _safe_float(hist.get("recent_start_rate")),
-        "season_xgi_per90_prev": _safe_float(hist.get("season_xgi_per90"), fallback_xgi_per90),
-        "recent_xgi_per90_prev": _safe_float(hist.get("recent_xgi_per90"), fallback_xgi_per90),
+        "season_xgi_per90_prev": _safe_float(hist.get("season_xgi_per90")),
+        "recent_xgi_per90_prev": _safe_float(hist.get("recent_xgi_per90")),
         "fixture_count": 1.0,
         "home_share": 0.5,
     })
@@ -129,8 +128,7 @@ def fit_ridge_model(frame, *, source_seasons: list[str] | None = None, alpha: fl
 
 def predict_features(model: Mapping[str, Any] | None, row: Mapping[str, Any]) -> float | None:
     """Return non-negative expected points for one Gameweek, or None without a valid model."""
-    if (not model or str(model.get("model_version")) != MODEL_VERSION
-            or model.get("feature_policy") != FEATURE_POLICY):
+    if not validate_model(model):
         return None
     try:
         features = list(model["features"])
@@ -150,6 +148,8 @@ def predict_features(model: Mapping[str, Any] | None, row: Mapping[str, Any]) ->
 
 
 def save_model(model: Mapping[str, Any], path: str | Path) -> None:
+    if not validate_model(model):
+        raise ValueError("Refusing to save an invalid or incompatible v3.0 model artifact")
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(model, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -157,8 +157,36 @@ def save_model(model: Mapping[str, Any], path: str | Path) -> None:
 def load_model(path: str | Path) -> dict[str, Any] | None:
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        return payload if (str(payload.get("model_version")) == MODEL_VERSION
-                           and payload.get("features") == FEATURES
-                           and payload.get("feature_policy") == FEATURE_POLICY) else None
+        return payload if validate_model(payload) else None
     except (OSError, ValueError, TypeError):
         return None
+
+
+def validate_model(model: Mapping[str, Any] | None) -> bool:
+    """Validate the complete deployable artifact contract before serving it."""
+    if not isinstance(model, Mapping):
+        return False
+    if (str(model.get("model_version")) != MODEL_VERSION
+            or model.get("feature_policy") != FEATURE_POLICY
+            or model.get("model_type") != "standardized_ridge_regression"
+            or model.get("target") != "total FPL points in target Gameweek"
+            or model.get("features") != FEATURES):
+        return False
+    try:
+        for name in ("means", "scales", "coefficients"):
+            values = model[name]
+            if not isinstance(values, Mapping) or set(values) != set(FEATURES):
+                return False
+            if not all(math.isfinite(float(values[key])) for key in FEATURES):
+                return False
+        if any(float(model["scales"][key]) <= 0 for key in FEATURES):
+            return False
+        if not math.isfinite(float(model["intercept"])):
+            return False
+        if int(model.get("training_rows", 0)) < 500:
+            return False
+        if not isinstance(model.get("source_seasons"), list) or not model["source_seasons"]:
+            return False
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    return True
