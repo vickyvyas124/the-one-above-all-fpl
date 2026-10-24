@@ -10,24 +10,28 @@ permissions:
   contents: write
 
 concurrency:
-  group: fpl-auto-learning-log
+  group: fpl-data-branch-updates
   cancel-in-progress: false
 
 jobs:
   update-forecasts:
-    runs-on: ubuntu-latest
-    timeout-minutes: 12
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Check out dashboard code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
+          cache: pip
 
       - name: Install worker dependencies
         run: python -m pip install --disable-pip-version-check requests pandas
+
+      - name: Run engine validation tests
+        run: python -m unittest discover -s tests -v
 
       - name: Prepare persistent forecast branch
         env:
@@ -44,11 +48,7 @@ jobs:
             git -C "$DATA_DIR" init -b fpl-data
             git -C "$DATA_DIR" config user.name 'github-actions[bot]'
             git -C "$DATA_DIR" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            if [ -f "$GITHUB_WORKSPACE/forecast_log.csv" ]; then
-              cp "$GITHUB_WORKSPACE/forecast_log.csv" "$DATA_DIR/forecast_log.csv"
-            else
-              printf '%s\n' 'season,gameweek,player_id,player,position,club,projection_model,projection_baseline,forecast_created_utc,actual_points,actual_minutes,model_version' > "$DATA_DIR/forecast_log.csv"
-            fi
+            printf '%s\n' 'season,gameweek,player_id,player,position,club,model_version,forecast_created_utc,projection_model,projection_baseline,projection_ep_next,projection_model_5gw,projection_baseline_5gw,forecast_horizon_gws,history_enriched,history_sample_matches,projection_expected_minutes,xi_eligible,model_captain_pick,actual_points,actual_minutes,actual_points_5gw,actual_minutes_5gw' > "$DATA_DIR/forecast_log.csv"
             git -C "$DATA_DIR" add forecast_log.csv
             git -C "$DATA_DIR" commit -m 'Initialize persistent FPL forecast log'
             git -C "$DATA_DIR" remote add origin "$REMOTE_URL"
@@ -70,14 +70,10 @@ jobs:
           cd "$FPL_DATA_DIR"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          if ! git diff --quiet -- forecast_log.csv || ! git diff --cached --quiet -- forecast_log.csv; then
-            git add forecast_log.csv
+          git add forecast_log.csv
+          if ! git diff --cached --quiet; then
             git commit -m "Update FPL forecasts and actual scores [skip ci]"
             git push origin HEAD:fpl-data
-          elif ! git status --porcelain -- forecast_log.csv | grep -q .; then
-            echo 'Forecast log unchanged; nothing to commit.'
           else
-            git add forecast_log.csv
-            git commit -m "Update FPL forecasts and actual scores [skip ci]"
-            git push origin HEAD:fpl-data
+            echo 'Forecast log unchanged; nothing to commit.'
           fi
