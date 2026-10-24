@@ -3,7 +3,7 @@
 When a versioned historical model artifact is available, future Gameweek points are
 predicted by that trained model. A transparent heuristic remains as a safe fallback.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 
 import fpl_learning
@@ -11,34 +11,73 @@ import fpl_learning
 # Set by the dashboard (remote artifact) or worker (persistent fpl-data branch).
 TRAINED_MODEL = None
 
-def make_history_signal(summary):
-    """Build the same lagged signals used by the trained model and fallback scorer."""
+def make_history_signal(summary, cutoff_utc=None):
+    """Build lagged signals from completed Gameweeks, matching training aggregation.
+
+    API history can contain one record per fixture, so double Gameweeks must first
+    be summed into one observation. If a simulated deadline is supplied, only
+    events whose latest fixture is at least 72 hours old are eligible. A missing
+    kickoff timestamp makes that event unusable for this point-in-time feature set.
+    """
+    from collections import defaultdict
+
     history = summary.get("history", []) if isinstance(summary, dict) else []
-    history = sorted([r for r in history if isinstance(r, dict)], key=lambda r: int(r.get("round") or 0))
-    recent = history[-5:]
-    played = [r for r in recent if float(r.get("minutes") or 0) > 0]
-    points_played = [float(r.get("total_points") or 0) for r in played]
-    minutes_all = [float(r.get("minutes") or 0) for r in recent]
-    starts = [1 if float(r.get("starts") or 0) > 0 else 0 for r in recent]
-    all_points = [float(r.get("total_points") or 0) for r in history]
-    all_minutes = [float(r.get("minutes") or 0) for r in history]
-    all_xgi = [float(r.get("expected_goals") or 0) + float(r.get("expected_assists") or 0) for r in history]
-    recent_xgi = [float(r.get("expected_goals") or 0) + float(r.get("expected_assists") or 0) for r in recent]
-    recent_min_sum = sum(minutes_all)
-    all_min_sum = sum(all_minutes)
+    grouped = defaultdict(list)
+    cutoff = None
+    if cutoff_utc is not None:
+        cutoff = cutoff_utc if isinstance(cutoff_utc, datetime) else datetime.fromisoformat(str(cutoff_utc).replace("Z", "+00:00"))
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+        cutoff = cutoff.astimezone(timezone.utc)
+    for row in history:
+        if isinstance(row, dict) and row.get("round") is not None:
+            try:
+                grouped[int(row["round"])].append(row)
+            except (TypeError, ValueError):
+                continue
+    gameweeks = []
+    for gameweek, rows in sorted(grouped.items()):
+        if cutoff is not None:
+            try:
+                kickoffs = [datetime.fromisoformat(str(row["kickoff_time"]).replace("Z", "+00:00")) for row in rows]
+                if any(value.tzinfo is None for value in kickoffs):
+                    continue
+                available_at = max(kickoffs).astimezone(timezone.utc) + timedelta(hours=72)
+                if available_at >= cutoff:
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+        fixture_ids = {str(row.get("fixture")) for row in rows if row.get("fixture") is not None}
+        fixture_count = max(1, len(fixture_ids))
+        points = sum(float(row.get("total_points") or 0) for row in rows)
+        minutes = sum(float(row.get("minutes") or 0) for row in rows)
+        xgi = sum(float(row.get("expected_goals") or 0) + float(row.get("expected_assists") or 0) for row in rows)
+        gameweeks.append({"round": gameweek, "points": points, "minutes": minutes,
+                          "starts": max([float(row.get("starts") or 0) for row in rows] or [0]),
+                          "xgi": xgi, "fixture_count": fixture_count})
+    recent = gameweeks[-5:]
+    played = [row for row in recent if row["minutes"] > 0]
+    points_played = [row["points"] for row in played]
+    recent_min_sum = sum(row["minutes"] for row in recent)
+    all_min_sum = sum(row["minutes"] for row in gameweeks)
+    recent_fixture_count = sum(row["fixture_count"] for row in recent)
+    recent_minutes_per_gw = [row["minutes"] / row["fixture_count"] for row in recent]
+    all_points = [row["points"] for row in gameweeks]
+    all_xgi = [row["xgi"] for row in gameweeks]
+    recent_xgi = [row["xgi"] for row in recent]
     return {
-        "sample_matches": len(recent),
+        "sample_matches": recent_fixture_count,
         "played_matches": len(played),
         "recent_points_per_appearance": (sum(points_played) / len(points_played)) if points_played else None,
-        "recent_points_per_gw": (sum(float(r.get("total_points") or 0) for r in recent) / len(recent)) if recent else None,
+        "recent_points_per_gw": (sum(row["points"] for row in recent) / len(recent)) if recent else None,
         "season_points_per_gw": (sum(all_points) / len(all_points)) if all_points else None,
-        "recent_minutes_per_fixture": (sum(minutes_all) / len(minutes_all)) if minutes_all else None,
+        "recent_minutes_per_fixture": (sum(recent_minutes_per_gw) / len(recent_minutes_per_gw)) if recent_minutes_per_gw else None,
         "recent_appearance_rate": (len(played) / len(recent)) if recent else None,
-        "recent_start_rate": (sum(starts) / len(starts)) if starts else None,
+        "recent_start_rate": (sum(1 for row in recent if row["starts"] > 0) / len(recent)) if recent else None,
         "season_xgi_per90": (sum(all_xgi) / max(90.0, all_min_sum) * 90.0) if all_xgi else None,
         "recent_xgi_per90": (sum(recent_xgi) / max(90.0, recent_min_sum) * 90.0) if recent_xgi else None,
-        "last_history_gw": int(recent[-1].get("round") or 0) if recent else None,
-        "history_total_gws": len(history),
+        "last_history_gw": int(recent[-1]["round"]) if recent else None,
+        "history_total_gws": len(gameweeks),
     }
 
 
@@ -212,6 +251,35 @@ def estimate_expected_minutes(p, history_signal=None, fixture_count=1):
     return round(expected_minutes * availability_factor * fixtures_n, 1)
 
 
+def production_fallback_per_fixture(p, hist=None):
+    """Exact v3.0 heuristic projection for one neutral-difficulty fixture."""
+    def num(key):
+        try:
+            return float(p.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    hist = hist or {}
+    ppg, form = num("points_per_game"), num("form")
+    minutes, starts = num("minutes"), int(num("starts"))
+    pos = p.get("element_type")
+    baseline = {1: 3.2, 2: 3.5, 3: 3.8, 4: 4.0}.get(pos, 3.6)
+    xg90 = num("expected_goals") / max(minutes, 90) * 90
+    xa90 = num("expected_assists") / max(minutes, 90) * 90
+    attacking_signal = min(1.5, (xg90 + xa90) * 2.0)
+    raw = 0.50 * ppg + 0.25 * form + 0.25 * (baseline + attacking_signal)
+    recent_pts = hist.get("recent_points_per_appearance")
+    played_count = int(hist.get("played_matches") or 0)
+    if recent_pts is not None and played_count > 0:
+        recent_weight = min(0.30, 0.06 * played_count)
+        raw = (1.0 - recent_weight) * raw + recent_weight * float(recent_pts)
+    sample_weight = min(0.85, minutes / 900.0)
+    per_match = sample_weight * raw + (1.0 - sample_weight) * baseline
+    expected_minutes, availability_factor = _estimate_minutes_parts(p, hist)
+    minutes_factor = max(0.35, min(1.0, expected_minutes / 80.0))
+    return per_match * minutes_factor * availability_factor
+
+
 def estimate_points(p, team, fixtures, horizon=5, start_gw=None, use_history=True, history_signals=None, calibration_offsets=None):
     """Use the trained historical model when available; retain a transparent fallback."""
     hist_for_model = (history_signals or {}).get(int(p.get("id", -1)), {}) if use_history else {}
@@ -220,38 +288,9 @@ def estimate_points(p, team, fixtures, horizon=5, start_gw=None, use_history=Tru
         if trained is not None:
             return trained
 
-    def num(key):
-        try:
-            return float(p.get(key) or 0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    ppg, form = num("points_per_game"), num("form")
-    minutes, starts = num("minutes"), int(num("starts"))
-    status = str(p.get("status") or "").lower()
-    chance = p.get("chance_of_playing_next_round")
-    pos = p.get("element_type")
-    baseline = {1: 3.2, 2: 3.5, 3: 3.8, 4: 4.0}.get(pos, 3.6)
-
-    # Season xG/xA are cumulative; normalize to a conservative per-90 attacking signal.
-    xg90 = num("expected_goals") / max(minutes, 90) * 90
-    xa90 = num("expected_assists") / max(minutes, 90) * 90
-    attacking_signal = min(1.5, (xg90 + xa90) * 2.0)
-    raw = 0.50 * ppg + 0.25 * form + 0.25 * (baseline + attacking_signal)
-
     hist = hist_for_model
-    recent_pts = hist.get("recent_points_per_appearance")
-    played_count = int(hist.get("played_matches") or 0)
-    if recent_pts is not None and played_count > 0:
-        # Limit recency influence to 30% so a short hot/cold streak cannot dominate season skill.
-        recent_weight = min(0.30, 0.06 * played_count)
-        raw = (1.0 - recent_weight) * raw + recent_weight * float(recent_pts)
-
-    sample_weight = min(0.85, minutes / 900.0)
-    per_match = sample_weight * raw + (1.0 - sample_weight) * baseline
-
-    expected_minutes, availability_factor = _estimate_minutes_parts(p, hist)
-    minutes_factor = max(0.35, min(1.0, expected_minutes / 80.0))
+    pos = p.get("element_type")
+    per_match = production_fallback_per_fixture(p, hist)
 
     upcoming = _upcoming_fixtures(p, fixtures, horizon, start_gw)
     scores, diffs = [], []
@@ -260,7 +299,7 @@ def estimate_points(p, team, fixtures, horizon=5, start_gw=None, use_history=Tru
         diff = float(f.get("team_h_difficulty" if home else "team_a_difficulty") or 3)
         diffs.append(diff)
         fixture_factor = max(0.82, min(1.16, 1.0 + (3.0 - diff) * 0.06))
-        scores.append(per_match * minutes_factor * availability_factor * fixture_factor)
+        scores.append(per_match * fixture_factor)
     if not scores:
         return 0.0, 3.0, 0
     total = sum(scores)

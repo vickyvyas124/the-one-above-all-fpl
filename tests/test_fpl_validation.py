@@ -9,6 +9,7 @@ import pandas as pd
 from fpl_validation import evaluate_log, score_gameweek_group, spearman, top_k_capture
 import historical_backtest
 import fpl_engine
+import fpl_learning
 
 
 class ValidationMetricsTests(unittest.TestCase):
@@ -151,6 +152,7 @@ class HistoricalBacktestTests(unittest.TestCase):
                         "element": player_id, "round": gw,
                         "total_points": float(player_id + gw + fixture_no),
                         "minutes": 90 if (player_id + gw + fixture_no) % 3 else 0,
+                        "starts": 1 if (player_id + gw + fixture_no) % 3 else 0,
                         "element_type": position, "expected_goals": .1 * player_id,
                         "expected_assists": .05 * player_id, "was_home": fixture_no % 2 == 1,
                         "fixture": fixture_id, "team_code": team_code, "web_name": f"P{player_id}",
@@ -215,6 +217,39 @@ class HistoricalBacktestTests(unittest.TestCase):
         original_prediction = original.loc[(original["player_id"] == 1) & (original["gameweek"] == 3), "prediction_model"].iloc[0]
         altered_prediction = altered_features.loc[(altered_features["player_id"] == 1) & (altered_features["gameweek"] == 3), "prediction_model"].iloc[0]
         self.assertAlmostEqual(float(original_prediction), float(altered_prediction))
+
+    def test_proxy_report_compares_common_cohort_and_exposes_gameweek_bootstrap_intervals(self):
+        with patch.object(historical_backtest, "fetch_csv", return_value=self.synthetic_raw()):
+            grouped = historical_backtest.season_frame("2025-26", "synthetic")
+        panel = historical_backtest.add_point_in_time_features(grouped)
+        summary, gameweeks = historical_backtest._score_panel(
+            "2025-26", panel, None, "heuristic_fallback_no_prior_seasons", "synthetic"
+        )
+        row = summary.iloc[0]
+        self.assertEqual(row["evaluation_type"], historical_backtest.EVALUATION_TYPE)
+        self.assertEqual(row["player_gameweeks_evaluated"], int(gameweeks["Players"].sum()))
+        for method in ("trained_model", "season_average", "last5_gameweek_average", "production_fallback_proxy"):
+            self.assertIn(f"{method}_model_mae_mean_by_gw", row.index)
+            self.assertIn(f"{method}_model_mae_ci95_low", row.index)
+            self.assertIn(f"{method}_model_mae_ci95_high", row.index)
+        self.assertIn("production_fallback_formula", row.index)
+        self.assertTrue((gameweeks["Players"] > 0).all())
+
+    def test_training_and_live_features_match_for_same_deadline_safe_history(self):
+        raw = self.synthetic_raw()
+        with patch.object(historical_backtest, "fetch_csv", return_value=raw):
+            grouped = historical_backtest.season_frame("2025-26", "synthetic")
+        panel = historical_backtest.add_point_in_time_features(grouped)
+        target = panel[(panel["player_id"] == 1) & (panel["gameweek"] == 4)].iloc[0]
+        target_cutoff = target["_target_cutoff"]
+        historical_records = raw[(raw["element"] == 1) & (raw["round"] < 4)].to_dict("records")
+        live_signal = fpl_engine.make_history_signal({"history": historical_records}, cutoff_utc=target_cutoff)
+        position = {"GKP": 1, "DEF": 2, "MID": 3, "FWD": 4}[target["position_prev"]]
+        live_features = fpl_learning.make_feature_row(
+            position=position, history_signal=live_signal, fixture_count=1, home_share=.5
+        )
+        for feature in fpl_learning.FEATURES:
+            self.assertAlmostEqual(float(live_features[feature]), float(target[feature]), places=8, msg=feature)
 
     def test_late_prior_fixture_stats_are_excluded_until_available(self):
         raw = self.synthetic_raw()

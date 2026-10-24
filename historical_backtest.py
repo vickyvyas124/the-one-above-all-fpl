@@ -17,9 +17,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import requests
 
 import fpl_learning
+import fpl_engine
 from fpl_validation import score_gameweek_group
 
 SOURCES = {
@@ -198,6 +200,7 @@ def season_frame(season: str, url: str) -> pd.DataFrame:
         "actual_points": pd.to_numeric(raw[points_col], errors="coerce"),
         "minutes": pd.to_numeric(raw[minutes_col], errors="coerce") if minutes_col else 0.0,
         "starts": pd.to_numeric(raw[starts_col], errors="coerce") if starts_col else (pd.to_numeric(raw[minutes_col], errors="coerce") > 0).astype(float) if minutes_col else 0.0,
+        "appearances": (pd.to_numeric(raw[minutes_col], errors="coerce") > 0).astype(float) if minutes_col else 0.0,
         "position": raw[position_col].map(normalize_position) if position_col else "UNK",
         "xg": pd.to_numeric(raw[xg_col], errors="coerce") if xg_col else 0.0,
         "xa": pd.to_numeric(raw[xa_col], errors="coerce") if xa_col else 0.0,
@@ -237,7 +240,7 @@ def season_frame(season: str, url: str) -> pd.DataFrame:
     if subset.empty:
         raise ValueError(f"No usable rows found for {season}")
     agg = {
-        "actual_points": "sum", "minutes": "sum", "starts": "sum", "xg": "sum", "xa": "sum",
+        "actual_points": "sum", "minutes": "sum", "starts": "sum", "appearances": "sum", "xg": "sum", "xa": "sum",
         "position": "last", "was_home": "mean", "player": "last", "team_key": "last",
         "scheduled_fixture_count": "max", "schedule_was_home": "mean",
         "schedule_first_kickoff": "min", "schedule_last_kickoff": "max",
@@ -309,7 +312,12 @@ def add_point_in_time_features(season_data: pd.DataFrame) -> pd.DataFrame:
     features = {
         name: [] for name in ("season_mean_prev", "recent_mean_prev", "recent_minutes_per_fixture_prev",
                               "recent_appearance_rate_prev", "recent_start_rate_prev", "recent_xgi_per90_prev",
-                              "season_xgi_per90_prev", "position_prev", "pos_mean_prev")
+                              "season_xgi_per90_prev", "position_prev", "pos_mean_prev",
+                              "recent_points_per_appearance_prev", "recent_played_gws_prev",
+                              "recent_fixtures_prev",
+                              "fallback_ppg_prev", "fallback_minutes_prev", "fallback_starts_prev",
+                              "fallback_appearances_prev", "fallback_xg_prev", "fallback_xa_prev",
+                              "fallback_substitute_appearances_prev")
     }
     for _, player_rows in panel.groupby("player_id", sort=False):
         player_rows = player_rows.sort_values("gameweek")
@@ -328,6 +336,10 @@ def add_point_in_time_features(season_data: pd.DataFrame) -> pd.DataFrame:
             recent_minutes_per_fixture = (recent["minutes"] / recent_fixtures).replace([float("inf"), -float("inf")], float("nan")).dropna()
             recent_xgi = float(recent["xgi"].sum())
             season_xgi = float(prior["xgi"].sum())
+            season_played = prior[prior["minutes"] > 0]
+            recent_played = recent[recent["minutes"] > 0]
+            prior_starts = float(prior["starts"].sum())
+            prior_appearances = float(prior["appearances"].sum())
             last_position = str(prior.iloc[-1]["position"]) if not prior.empty else "UNK"
             features["season_mean_prev"].append(float(season_points.mean()) if not prior.empty else float("nan"))
             features["recent_mean_prev"].append(float(recent_points.mean()) if not recent.empty else float("nan"))
@@ -338,6 +350,16 @@ def add_point_in_time_features(season_data: pd.DataFrame) -> pd.DataFrame:
             features["season_xgi_per90_prev"].append(season_xgi / max(90.0, season_minutes) * 90.0)
             features["position_prev"].append(last_position)
             features["pos_mean_prev"].append(defaults.get(last_position, 2.8))
+            features["recent_points_per_appearance_prev"].append(float(recent_played["actual_points"].mean()) if not recent_played.empty else float("nan"))
+            features["recent_played_gws_prev"].append(int(len(recent_played)))
+            features["recent_fixtures_prev"].append(int(recent["fixture_count"].sum()))
+            features["fallback_ppg_prev"].append(float(season_played["actual_points"].sum() / len(season_played)) if not season_played.empty else float("nan"))
+            features["fallback_minutes_prev"].append(season_minutes)
+            features["fallback_starts_prev"].append(prior_starts)
+            features["fallback_appearances_prev"].append(prior_appearances)
+            features["fallback_xg_prev"].append(float(prior["xg"].sum()))
+            features["fallback_xa_prev"].append(float(prior["xa"].sum()))
+            features["fallback_substitute_appearances_prev"].append(max(0.0, prior_appearances - prior_starts))
     for name, values in features.items():
         panel[name] = values
     panel["xgi_per90_prev"] = panel["recent_xgi_per90_prev"]
@@ -411,10 +433,40 @@ def _score_panel(season: str, panel: pd.DataFrame, model: dict | None, model_typ
     data = _single_fixture_rows(panel)
     if data.empty:
         raise ValueError(f"No eligible point-in-time observations for {season}")
-    baseline = data["season_mean_prev"].fillna(data["pos_mean_prev"]).clip(lower=0)
-    fixture_count = pd.to_numeric(data["fixture_count"], errors="coerce").fillna(0).clip(0, 3)
-    home = pd.to_numeric(data["home_share"], errors="coerce").fillna(0.5).clip(0, 1)
-    data["prediction_baseline"] = baseline * fixture_count * (0.95 + 0.10 * home)
+    data["prediction_season_average"] = data["season_mean_prev"].fillna(data["pos_mean_prev"]).clip(lower=0)
+    data["prediction_last5"] = data["recent_mean_prev"].fillna(data["pos_mean_prev"]).clip(lower=0)
+    # Reconstruct only deadline-safe cumulative inputs. Injury/status information
+    # and historical deadline snapshots are absent, so those inputs use the
+    # production formula's neutral missing-status behavior and remain a proxy.
+    fallback_predictions = []
+    for _, row in data.iterrows():
+        def prior_value(key):
+            try:
+                value = float(row.get(key) or 0)
+                return value if np.isfinite(value) else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+        p = {
+            "points_per_game": prior_value("fallback_ppg_prev"),
+            "form": prior_value("recent_mean_prev"),
+            "minutes": prior_value("fallback_minutes_prev"),
+            "starts": prior_value("fallback_starts_prev"),
+            "appearances": prior_value("fallback_appearances_prev"),
+            "substitute_appearances": prior_value("fallback_substitute_appearances_prev"),
+            "expected_goals": prior_value("fallback_xg_prev"),
+            "expected_assists": prior_value("fallback_xa_prev"),
+            "element_type": {"GKP": 1, "DEF": 2, "MID": 3, "FWD": 4}.get(row.get("position_prev")),
+            "status": "a",
+        }
+        hist = {
+            "recent_points_per_appearance": prior_value("recent_points_per_appearance_prev"),
+            "played_matches": prior_value("recent_played_gws_prev"),
+            "recent_minutes_per_fixture": prior_value("recent_minutes_per_fixture_prev"),
+            "sample_matches": prior_value("recent_fixtures_prev"),
+        }
+        fallback_predictions.append(fpl_engine.production_fallback_per_fixture(p, hist))
+    data["prediction_production_fallback"] = fallback_predictions
+    data["prediction_baseline"] = data["prediction_season_average"]
     data["prediction_model"] = float("nan")
     if model:
         feature_data = data[fpl_learning.FEATURES].copy()
@@ -429,39 +481,84 @@ def _score_panel(season: str, panel: pd.DataFrame, model: dict | None, model_typ
         data["prediction_model"] = data["prediction_model_legacy"] if "prediction_model_legacy" in data else data["prediction_baseline"]
     gw_rows = []
     for gw, group in data.groupby("gameweek"):
-        renamed = group.rename(columns={
-            "prediction_model": "projection_model",
-            "prediction_baseline": "projection_baseline",
-            "prediction_expected_minutes": "projection_expected_minutes",
-            "minutes": "actual_minutes",
-        })
-        metrics = score_gameweek_group(renamed, actual_col="actual_points", model_col="projection_model",
-                                       baseline_col="projection_baseline", benchmark_col="__none__")
-        gw_rows.append({"season": season, "gameweek": int(gw), "model_type": model_type,
-                        "evaluation_type": EVALUATION_TYPE, **metrics})
+        row = {"season": season, "gameweek": int(gw), "model_type": model_type,
+               "evaluation_type": EVALUATION_TYPE, "Players": int(len(group))}
+        for method, column in (("trained_model", "prediction_model"),
+                               ("season_average", "prediction_season_average"),
+                               ("last5_gameweek_average", "prediction_last5"),
+                               ("production_fallback_proxy", "prediction_production_fallback")):
+            if method == "trained_model" and model is None:
+                for metric in ("model_mae", "model_bias", "model_spearman", "model_top10_capture", "model_top20_capture"):
+                    row[f"{method}_{metric}"] = float("nan")
+                continue
+            scored = group.rename(columns={column: "projection_model", "minutes": "actual_minutes"}).copy()
+            scored["projection_baseline"] = scored["projection_model"]
+            metrics = score_gameweek_group(scored, actual_col="actual_points", model_col="projection_model",
+                                           baseline_col="projection_baseline", benchmark_col="__none__",
+                                           include_minutes_metrics=False, include_captain_metrics=False)
+            for metric in ("Model MAE", "Model bias", "Model Spearman", "Model top-10 capture", "Model top-20 capture"):
+                row[f"{method}_{metric.lower().replace(' ', '_').replace('-', '')}"] = metrics.get(metric, float("nan"))
+        # Preserve the historical model-vs-baseline columns consumed by existing
+        # report readers. In the first season, model_type explicitly identifies
+        # that the "model" column is the prior heuristic fallback.
+        compatible = group.rename(columns={"prediction_model": "projection_model",
+                                           "prediction_baseline": "projection_baseline",
+                                           "prediction_expected_minutes": "projection_expected_minutes",
+                                           "minutes": "actual_minutes"})
+        row.update(score_gameweek_group(compatible, actual_col="actual_points",
+                                        model_col="projection_model", baseline_col="projection_baseline",
+                                        benchmark_col="__none__"))
+        gw_rows.append(row)
     gw_df = pd.DataFrame(gw_rows)
+    method_names = ("trained_model", "season_average", "last5_gameweek_average", "production_fallback_proxy")
+    metric_names = ("model_mae", "model_bias", "model_spearman", "model_top10_capture", "model_top20_capture")
+    rng = np.random.default_rng(20261024)
+    for method in method_names:
+        for metric in metric_names:
+            column = f"{method}_{metric}"
+            values = pd.to_numeric(gw_df[column], errors="coerce").dropna().to_numpy(dtype=float) if column in gw_df else np.array([])
+            if len(values):
+                draws = rng.integers(0, len(values), size=(2000, len(values)))
+                means = values[draws].mean(axis=1)
+                data_ci = (float(np.quantile(means, 0.025)), float(np.quantile(means, 0.975)))
+                gw_df.attrs.setdefault("ci", {})[column] = data_ci
     summary = {
         "season": season,
         "data_source": url,
         "model_type": model_type,
         "trained_model_used": bool(model),
         "evaluation_type": EVALUATION_TYPE,
-        "target_schedule_cohort": "single final-mapped fixture only",
+        "target_schedule_cohort": "single final-mapped fixture only; final schedule is proxy eligibility, not historical deadline knowledge",
+        "archive_player_gameweeks": int(panel["observed_row"].sum()),
+        "eligible_player_gameweeks_before_schedule_cohort": int(len(_eligible_rows(panel))),
+        "excluded_no_prior_history_rows": int(panel["observed_row"].sum() - len(_eligible_rows(panel))),
         "excluded_non_single_fixture_rows": int(len(_eligible_rows(panel)) - len(data)),
         "training_rows": int(model.get("training_rows", 0)) if model else 0,
         "gameweeks_evaluated": int(gw_df["gameweek"].nunique()) if not gw_df.empty else 0,
         "player_gameweeks_evaluated": int(len(data)),
-        "model_mae_mean_by_gw": float(gw_df["Model MAE"].mean()) if not gw_df.empty else float("nan"),
-        "baseline_mae_mean_by_gw": float(gw_df["Baseline MAE"].mean()) if not gw_df.empty else float("nan"),
-        "model_minutes_mae_mean_by_gw": float(gw_df["Expected-minutes MAE"].mean()) if not gw_df.empty and "Expected-minutes MAE" in gw_df else float("nan"),
-        "model_spearman_mean_by_gw": float(gw_df["Model Spearman"].mean()) if not gw_df.empty else float("nan"),
-        "baseline_spearman_mean_by_gw": float(gw_df["Baseline Spearman"].mean()) if not gw_df.empty else float("nan"),
-        "model_top10_capture_mean_by_gw": float(gw_df["Model top-10 capture"].mean()) if not gw_df.empty else float("nan"),
-        "baseline_top10_capture_mean_by_gw": float(gw_df["Baseline top-10 capture"].mean()) if not gw_df.empty else float("nan"),
-        "model_top20_capture_mean_by_gw": float(gw_df["Model top-20 capture"].mean()) if not gw_df.empty else float("nan"),
-        "baseline_top20_capture_mean_by_gw": float(gw_df["Baseline top-20 capture"].mean()) if not gw_df.empty else float("nan"),
-        "warning": "Historical proxy, not exact point-in-time replay: archived player/team snapshots and fixture schedules are not deadline snapshots. Target fixture count, venue and target-row position are excluded from features; only final-mapped single-fixture target rows are scored. No claim about blank/double-GW performance is made.",
+        "excluded_player_gameweeks": int(len(_eligible_rows(panel)) - len(data)),
+        "model_mae_mean_by_gw": float(gw_df["Model MAE"].mean()) if "Model MAE" in gw_df else float("nan"),
+        "baseline_mae_mean_by_gw": float(gw_df["Baseline MAE"].mean()) if "Baseline MAE" in gw_df else float("nan"),
+        "model_bias_mean_by_gw": float(gw_df["Model bias"].mean()) if "Model bias" in gw_df else float("nan"),
+        "model_spearman_mean_by_gw": float(gw_df["Model Spearman"].mean()) if "Model Spearman" in gw_df else float("nan"),
+        "baseline_spearman_mean_by_gw": float(gw_df["Baseline Spearman"].mean()) if "Baseline Spearman" in gw_df else float("nan"),
+        "model_top10_capture_mean_by_gw": float(gw_df["Model top-10 capture"].mean()) if "Model top-10 capture" in gw_df else float("nan"),
+        "baseline_top10_capture_mean_by_gw": float(gw_df["Baseline top-10 capture"].mean()) if "Baseline top-10 capture" in gw_df else float("nan"),
+        "model_top20_capture_mean_by_gw": float(gw_df["Model top-20 capture"].mean()) if "Model top-20 capture" in gw_df else float("nan"),
+        "baseline_top20_capture_mean_by_gw": float(gw_df["Baseline top-20 capture"].mean()) if "Baseline top-20 capture" in gw_df else float("nan"),
+        "model_minutes_mae_mean_by_gw": float(gw_df["Expected-minutes MAE"].mean()) if "Expected-minutes MAE" in gw_df else float("nan"),
+        "production_fallback_formula": "position_baseline={GKP:3.2,DEF:3.5,MID:3.8,FWD:4.0,unknown:3.6}; xG90=xG/max(minutes,90)*90 and xA90 likewise; attack=min(1.5,2*(xG90+xA90)); raw=.50*PPG+.25*form+.25*(baseline+attack); if played recent GWs exist, raw=(1-w)*raw+w*recent_points_per_appearance where w=min(.30,.06*played_GWs); per_match=a*raw+(1-a)*baseline where a=min(.85,minutes/900); expected minutes starts at 35 if no minutes, else for starters min(90,minutes/starts)*(.65+.35*min(1,starts/(starts+substitute_appearances))), else min(60,minutes/appearances); when sample_matches>=3, expected_minutes=.60*expected_minutes+.40*recent_minutes_per_fixture; clamp 0..90; availability=.20 for status i/s/u, .55 for d, else chance/100 clamped .20..1 when available, else .90; per_fixture=per_match*clamp(expected_minutes/80,.35,1)*availability*clamp(1+(3-difficulty)*.06,.82,1.16); total is nonnegative and rounded to 0.1. Historical proxy uses deadline-safe reconstructed prior stats, neutral status/chance and neutral fixture difficulty.",
+        "warning": "Historical proxy, not exact point-in-time replay: archive snapshots and final fixture schedules are not deadline snapshots. Scores use identical eligible player-GW rows; only final-mapped single-fixture target rows are evaluated. Production fallback uses safely reconstructed prior stats but lacks deadline status/chance data and cannot reproduce fixture difficulty, so it uses neutral availability/status and is explicitly a proxy. No claim about blank/double-GW performance is made.",
     }
+    for method in method_names:
+        summary[f"{method}_scored_player_gameweeks"] = int(gw_df["Players"].sum()) if method != "trained_model" or model else 0
+        for metric in metric_names:
+            column = f"{method}_{metric}"
+            values = pd.to_numeric(gw_df[column], errors="coerce").dropna() if column in gw_df else pd.Series(dtype=float)
+            summary[f"{column}_mean_by_gw"] = float(values.mean()) if len(values) else float("nan")
+            ci = gw_df.attrs.get("ci", {}).get(column)
+            summary[f"{column}_ci95_low"] = ci[0] if ci else float("nan")
+            summary[f"{column}_ci95_high"] = ci[1] if ci else float("nan")
     return pd.DataFrame([summary]), gw_df
 
 
