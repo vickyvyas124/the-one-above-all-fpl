@@ -31,9 +31,12 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Replay historical seasons using lagged-only features
+        id: replay-historical
+        continue-on-error: true
         run: python historical_backtest.py --out-dir "$RUNNER_TEMP/historical-output"
 
       - name: Persist historical backtest reports to fpl-data
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -59,3 +62,31 @@ jobs:
           else
             echo 'Historical reports unchanged; nothing to commit.'
           fi
+
+
+      - name: Fail if any configured historical season was skipped
+        if: always()
+        env:
+          REPORT_DIR: ${{ runner.temp }}/historical-output
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          metadata_path = Path(os.environ["REPORT_DIR"]) / "historical_backtest_metadata.json"
+          if not metadata_path.exists():
+              print(f"::error::Historical backtest metadata not found: {metadata_path}")
+              sys.exit(1)
+          metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+          failures = metadata.get("failures", [])
+          if failures:
+              for item in failures:
+                  print(f"::error title=Historical dataset failed::{item.get('season', 'unknown')}: {item.get('error', 'unknown error')}")
+              print("::error::Backtest reports were saved where possible, but the full configured season set was not evaluated.")
+              sys.exit(1)
+          print("All configured historical seasons were evaluated successfully.")
+          PY
