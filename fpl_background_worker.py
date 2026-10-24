@@ -1,4 +1,4 @@
-"""Scheduled FPL forecast snapshot and backtest updater for v2.9.
+"""Scheduled FPL forecast snapshot and backtest updater for v3.0.
 
 Snapshots the full player pool, stores a same-deadline FPL ep_next benchmark,
 records history coverage, and reconciles both single-GW and five-GW outcomes.
@@ -17,9 +17,10 @@ import pandas as pd
 import requests
 
 import fpl_engine
+import fpl_learning
 
 BASE = "https://fantasy.premierleague.com/api"
-MODEL_VERSION = "2.9"
+MODEL_VERSION = "3.0"
 COLUMNS = [
     "season", "gameweek", "player_id", "player", "position", "club",
     "model_version", "forecast_created_utc",
@@ -28,7 +29,7 @@ COLUMNS = [
     "history_enriched", "history_sample_matches", "projection_expected_minutes", "xi_eligible", "model_captain_pick",
     "actual_points", "actual_minutes", "actual_points_5gw", "actual_minutes_5gw",
 ]
-HEADERS = {"User-Agent": "Mozilla/5.0 The-One-Above-All-FPL/2.9"}
+HEADERS = {"User-Agent": "Mozilla/5.0 The-One-Above-All-FPL/3.0"}
 
 
 def get_json(path: str, attempts: int = 3):
@@ -171,6 +172,12 @@ def main() -> int:
     parser.add_argument("--csv-path", default="forecast_log.csv")
     args = parser.parse_args()
     log_path = Path(args.csv_path)
+    model_path = log_path.with_name("trained_fpl_model.json")
+    fpl_engine.TRAINED_MODEL = fpl_learning.load_model(model_path)
+    if fpl_engine.TRAINED_MODEL:
+        print(f"Loaded trained model v3.0: {fpl_engine.TRAINED_MODEL.get('training_rows', 0)} historical player-GWs from {fpl_engine.TRAINED_MODEL.get('source_seasons', [])}.")
+    else:
+        print("WARNING: no trained v3.0 model artifact found beside forecast log; using fallback formula until historical backtest publishes trained_fpl_model.json.")
     team_id = int(os.environ.get("FPL_TEAM_ID", "2311669"))
     changed = False
     log = read_log(log_path)
