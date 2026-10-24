@@ -5,14 +5,18 @@ import html
 import json
 import os
 from pathlib import Path
+import fpl_engine
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 st.set_page_config(page_title="The-One-Above-All | FPL Manager Hub", layout="wide")
-APP_VERSION = "2.7"
+APP_VERSION = "2.8"
 FORECAST_LOG_PATH = Path(__file__).resolve().parent / "forecast_log.csv"
-FORECAST_COLUMNS = ["season", "gameweek", "player_id", "player", "position", "club", "projection_model", "projection_baseline", "forecast_created_utc", "actual_points", "actual_minutes"]
+FORECAST_REMOTE_URL = "https://raw.githubusercontent.com/vickyvyas124/the-one-above-all-fpl/fpl-data/forecast_log.csv"
+FORECAST_COLUMNS = ["season", "gameweek", "player_id", "player", "position", "club", "projection_model", "projection_baseline", "forecast_created_utc", "actual_points", "actual_minutes", "model_version"]
 PLAYER_HISTORY_SIGNALS = {}
+MODEL_CALIBRATION_OFFSETS = {}
+CALIBRATION_METADATA = {"enabled": False, "completed_gws": 0, "samples_by_position": {}, "offsets": {}}
 BASE = "https://fantasy.premierleague.com/api"
 
 # Recorded squad from the user's GW8 screenshot. IDs are resolved by player name
@@ -81,39 +85,41 @@ def get_live_gameweek(gameweek):
     return r.json()
 
 def make_history_signal(summary):
-    history = summary.get("history", []) if isinstance(summary, dict) else []
-    history = sorted([r for r in history if isinstance(r, dict)], key=lambda r: int(r.get("round") or 0))
-    recent = history[-5:]
-    played = [r for r in recent if float(r.get("minutes") or 0) > 0]
-    points = [float(r.get("total_points") or 0) for r in played]
-    minutes_all = [float(r.get("minutes") or 0) for r in recent]
-    starts = [1 if float(r.get("starts") or 0) > 0 else 0 for r in recent]
-    return {
-        "sample_matches": len(recent),
-        "played_matches": len(played),
-        "recent_points_per_appearance": (sum(points) / len(points)) if points else None,
-        "recent_minutes_per_fixture": (sum(minutes_all) / len(minutes_all)) if minutes_all else None,
-        "recent_appearance_rate": (len(played) / len(recent)) if recent else None,
-        "recent_start_rate": (sum(starts) / len(starts)) if starts else None,
-        "last_history_gw": int(recent[-1].get("round") or 0) if recent else None,
-    }
+    return fpl_engine.make_history_signal(summary)
 
 def season_label(now=None):
     now = now or datetime.now(timezone.utc)
     start_year = now.year if now.month >= 7 else now.year - 1
     return f"{start_year}-{str(start_year + 1)[-2:]}"
 
-def read_forecast_log():
-    if not FORECAST_LOG_PATH.exists():
-        return pd.DataFrame(columns=FORECAST_COLUMNS)
+@st.cache_data(ttl=300, show_spinner=False)
+def get_remote_forecast_log():
+    """Load persistent forecast history from the automation data branch."""
     try:
-        frame = pd.read_csv(FORECAST_LOG_PATH)
-        for col in FORECAST_COLUMNS:
-            if col not in frame.columns:
-                frame[col] = None
-        return frame[FORECAST_COLUMNS]
+        r = requests.get(FORECAST_REMOTE_URL, timeout=5, headers={"User-Agent":"The-One-Above-All-FPL/2.8"})
+        if r.status_code != 200 or not r.text.strip():
+            return None
+        import io
+        return pd.read_csv(io.StringIO(r.text))
     except Exception:
-        return pd.DataFrame(columns=FORECAST_COLUMNS)
+        return None
+
+
+def read_forecast_log():
+    remote = get_remote_forecast_log()
+    if isinstance(remote, pd.DataFrame):
+        frame = remote.copy()
+    elif FORECAST_LOG_PATH.exists():
+        try:
+            frame = pd.read_csv(FORECAST_LOG_PATH)
+        except Exception:
+            frame = pd.DataFrame(columns=FORECAST_COLUMNS)
+    else:
+        frame = pd.DataFrame(columns=FORECAST_COLUMNS)
+    for col in FORECAST_COLUMNS:
+        if col not in frame.columns:
+            frame[col] = None
+    return frame[FORECAST_COLUMNS]
 
 def write_forecast_log(frame):
     """Write a portable CSV. Streamlit-host disk can be ephemeral, so export backups are provided."""
@@ -153,6 +159,84 @@ def fetch_history_signals(target_ids):
                 continue
     return results
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_entry_transfers(team_id):
+    """Public transfer history when the endpoint is accessible; may lag or change."""
+    try:
+        r = requests.get(f"{BASE}/entry/{int(team_id)}/transfers/", timeout=12,
+                         headers={"User-Agent":"Mozilla/5.0 The-One-Above-All-FPL/2.8"})
+        r.raise_for_status()
+        payload = r.json()
+        return payload if isinstance(payload, list) else []
+    except Exception:
+        return []
+
+
+def infer_free_transfers(history_payload, bootstrap_events, upcoming_gw, transfer_rows=None):
+    """Reconstruct available FTs from public history, transfer costs and chip history.
+
+    Returns (estimated_balance, confidence, note). Public FPL does not expose a
+    reliably documented live FT-balance field, so this remains an estimate.
+    """
+    hist = history_payload.get("current", []) if isinstance(history_payload, dict) else []
+    hist = [r for r in hist if isinstance(r, dict) and r.get("event") is not None
+            and int(r.get("event") or 0) < int(upcoming_gw)]
+    by_event = {int(r["event"]): r for r in hist}
+    chip_events = {}
+    for chip in (history_payload.get("chips", []) if isinstance(history_payload, dict) else []):
+        try:
+            ev = int(chip.get("event"))
+            name = str(chip.get("name", "")).lower().replace("_", "").replace("-", "")
+            chip_events.setdefault(ev, set()).add(name)
+        except (TypeError, ValueError):
+            continue
+    event_map = {int(e["id"]): e for e in (bootstrap_events or []) if e.get("id") is not None}
+    completed = [e for e in range(1, int(upcoming_gw))
+                 if e in by_event and bool(event_map.get(e, {}).get("finished"))]
+    if not completed:
+        return 1, False, "No completed transfer history found; defaulting to one free transfer until verified."
+    ft_balance = 1
+    confidence = True
+    # GW1/pre-season transfers don't consume the first post-GW1 free transfer.
+    last_seen = 1
+    for ev in range(2, max(completed) + 1):
+        row = by_event.get(ev)
+        if row is None:
+            confidence = False
+            # Preserve a conservative estimate when a historical row is missing.
+            ft_balance = min(5, ft_balance)
+            continue
+        chips = chip_events.get(ev, set())
+        is_wc_or_fh = any(x in {"wildcard", "freehit", "free_hit"} or "wildcard" in x or "freehit" in x for x in chips)
+        if is_wc_or_fh:
+            # Chip consumes the current week's FT while preserving banked transfers;
+            # the next week's allowance replaces the used current-week FT.
+            ft_balance = min(5, ft_balance)
+        else:
+            try:
+                transfers = max(0, int(row.get("event_transfers") or 0))
+            except (TypeError, ValueError):
+                transfers = 0; confidence = False
+            try:
+                hit_count = max(0, int(round(float(row.get("event_transfers_cost") or 0) / 4.0)))
+            except (TypeError, ValueError):
+                hit_count = 0; confidence = False
+            free_used = max(0, transfers - hit_count)
+            remaining = max(0, ft_balance - min(ft_balance, free_used))
+            ft_balance = min(5, remaining + 1)
+        last_seen = ev
+    # Account for transfers already made in the upcoming GW if the public endpoint exposes them.
+    current_transfer_rows = [r for r in (transfer_rows or []) if isinstance(r, dict) and str(r.get("event", "")) == str(upcoming_gw)]
+    current_chips = chip_events.get(int(upcoming_gw), set())
+    if current_transfer_rows and not any(x in {"wildcard", "freehit", "free_hit"} or "wildcard" in x or "freehit" in x for x in current_chips):
+        ft_balance = max(0, ft_balance - len(current_transfer_rows))
+        confidence = False  # until current chip/transfer cost fields are public this is approximate
+        note = f"Estimated from completed history and {len(current_transfer_rows)} transfer(s) detected for GW{upcoming_gw}; verify if a chip is active."
+    else:
+        note = "Reconstructed from completed transfer history, hits and chips; compare with the FPL Transfers page if you made moves this Gameweek." if confidence else "Estimated from incomplete public history; manual override is available."
+    return int(max(0, min(5, ft_balance))), confidence, note
+
+
 def norm(s):
     return "".join(ch.lower() for ch in str(s) if ch.isalnum())
 
@@ -177,88 +261,12 @@ def pos_name(p, types):
     return next((x.get("singular_name_short", "?") for x in types if x["id"] == p.get("element_type")), "?")
 
 def estimate_points(p, team, fixtures, horizon=5, start_gw=None, use_history=True):
-    """Transparent fixture-level projection; recent player match history is a capped signal."""
-    def num(key):
-        try:
-            return float(p.get(key) or 0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    ppg, form = num("points_per_game"), num("form")
-    minutes, starts = num("minutes"), int(num("starts"))
-    status = str(p.get("status") or "").lower()
-    chance = p.get("chance_of_playing_next_round")
-    pos = p.get("element_type")
-    baseline = {1: 3.2, 2: 3.5, 3: 3.8, 4: 4.0}.get(pos, 3.6)
-
-    # Season xG/xA are cumulative; normalize to a conservative per-90 attacking signal.
-    xg90 = num("expected_goals") / max(minutes, 90) * 90
-    xa90 = num("expected_assists") / max(minutes, 90) * 90
-    attacking_signal = min(1.5, (xg90 + xa90) * 2.0)
-    raw = 0.50 * ppg + 0.25 * form + 0.25 * (baseline + attacking_signal)
-
-    hist = PLAYER_HISTORY_SIGNALS.get(int(p.get("id", -1)), {}) if use_history else {}
-    recent_pts = hist.get("recent_points_per_appearance")
-    played_count = int(hist.get("played_matches") or 0)
-    if recent_pts is not None and played_count > 0:
-        # Limit recency influence to 30% so a short hot/cold streak cannot dominate season skill.
-        recent_weight = min(0.30, 0.06 * played_count)
-        raw = (1.0 - recent_weight) * raw + recent_weight * float(recent_pts)
-
-    sample_weight = min(0.85, minutes / 900.0)
-    per_match = sample_weight * raw + (1.0 - sample_weight) * baseline
-
-    if minutes <= 0:
-        expected_minutes = 35.0
-    elif starts > 0:
-        avg_start_minutes = minutes / starts
-        appearance_count = max(1.0, num("appearances"))
-        starts_subs = starts + num("substitute_appearances")
-        start_rate = min(1.0, starts / max(1.0, starts_subs))
-        expected_minutes = min(90.0, avg_start_minutes) * (0.65 + 0.35 * start_rate)
-    else:
-        expected_minutes = min(60.0, minutes / max(1.0, num("appearances")))
-
-    recent_minutes = hist.get("recent_minutes_per_fixture")
-    recent_sample = int(hist.get("sample_matches") or 0)
-    if recent_minutes is not None and recent_sample >= 3:
-        # Latest five team fixtures are a useful check on season-long minutes, including DNPs.
-        expected_minutes = 0.60 * expected_minutes + 0.40 * float(recent_minutes)
-    minutes_factor = max(0.35, min(1.0, expected_minutes / 80.0))
-
-    if status in {"i", "s", "u"}:
-        availability_factor = 0.20
-    elif status == "d":
-        availability_factor = 0.55
-    elif chance is not None:
-        try:
-            availability_factor = max(0.20, min(1.0, float(chance) / 100.0))
-        except (TypeError, ValueError):
-            availability_factor = 0.90
-    else:
-        availability_factor = 0.90
-
-    upcoming = [f for f in fixtures if not f.get("finished")
-                and f.get("event") is not None
-                and (f.get("team_h") == p.get("team") or f.get("team_a") == p.get("team"))]
-    if start_gw is not None:
-        upcoming = [f for f in upcoming
-                    if int(start_gw) <= int(f["event"]) < int(start_gw) + int(horizon)]
-    else:
-        event_ids = sorted({int(f["event"]) for f in upcoming})
-        target_ids = set(event_ids[:int(horizon)])
-        upcoming = [f for f in upcoming if int(f["event"]) in target_ids]
-    upcoming.sort(key=lambda f: (f.get("event") or 99, f.get("kickoff_time") or ""))
-    scores, diffs = [], []
-    for f in upcoming:
-        home = f.get("team_h") == p.get("team")
-        diff = float(f.get("team_h_difficulty" if home else "team_a_difficulty") or 3)
-        diffs.append(diff)
-        fixture_factor = max(0.82, min(1.16, 1.0 + (3.0 - diff) * 0.06))
-        scores.append(per_match * minutes_factor * availability_factor * fixture_factor)
-    if not scores:
-        return 0.0, 3.0, 0
-    return round(sum(scores), 1), round(sum(diffs) / len(diffs), 2), len(scores)
+    """Delegate the shared forecast formula to the same module used by automation."""
+    return fpl_engine.estimate_points(
+        p, team, fixtures, horizon=horizon, start_gw=start_gw,
+        use_history=use_history, history_signals=PLAYER_HISTORY_SIGNALS,
+        calibration_offsets=MODEL_CALIBRATION_OFFSETS,
+    )
 
 st.markdown("""
 <style>
@@ -389,7 +397,7 @@ div[data-testid="stHorizontalBlock"] .manager-panel {height:100%;}
   </div>
 </div>
 """, unsafe_allow_html=True)
-st.info("Forecasts are estimates, not official FPL projections. Confirm player availability and your personal selling prices before transferring.")
+st.info("Decision rule: HOLD unless a transfer clears the points-gain and reliability gates. Public FPL bank/free-transfer sync is estimated; verify it against your Transfers page before acting. This dashboard never submits transfers automatically.")
 
 with st.sidebar:
     st.header("⚙️ Optimizer settings")
@@ -399,10 +407,71 @@ with st.sidebar:
                          help="How many upcoming Gameweeks to include in player projections and transfer gains.")
     fixture_horizon = st.slider("Fixture calendar horizon (Gameweeks)", 5, 20, 15,
                                  help="How far ahead to display fixtures and identify officially assigned double Gameweeks. Player-point projections keep their own shorter horizon.")
-    bank_m = st.number_input("Bank (£m)", min_value=0.0, max_value=20.0, value=0.7, step=0.1,
-                             help="Added to the selling player's current public price to estimate an affordable replacement. Actual selling price may differ.")
-    free_transfers = st.selectbox("Free transfers available", [1,2,3,4,5], index=0,
-                                  help="Used in the decision guidance; the current shortlist compares one transfer at a time.")
+    # Sync the last known bank, transfer history and chip history directly from public FPL endpoints.
+    control_profile = {}
+    control_history = {}
+    control_boot = {}
+    control_transfers = []
+    try:
+        control_profile = get_manager_profile(int(team_id))
+    except Exception:
+        pass
+    try:
+        control_history = get_entry_history(int(team_id))
+    except Exception:
+        pass
+    try:
+        control_boot = get_json("bootstrap-static/")
+    except Exception:
+        pass
+    control_events = control_boot.get("events", []) if isinstance(control_boot, dict) else []
+    control_next = next((e for e in control_events if e.get("is_next")), None)
+    control_current = next((e for e in control_events if e.get("is_current")), None)
+    control_gw = int(control_next.get("id")) if control_next else int((control_current or {}).get("id", 7)) + 1
+    try:
+        control_transfers = get_entry_transfers(int(team_id))
+    except Exception:
+        control_transfers = []
+    auto_ft, auto_ft_confident, auto_ft_note = infer_free_transfers(
+        control_history, control_events, control_gw, control_transfers
+    )
+    auto_bank_raw = control_profile.get("last_deadline_bank") if isinstance(control_profile, dict) else None
+    if auto_bank_raw is None:
+        control_hist_rows = control_history.get("current", []) if isinstance(control_history, dict) else []
+        control_hist_rows = sorted([r for r in control_hist_rows if isinstance(r, dict) and r.get("event") is not None], key=lambda r: int(r.get("event", 0)))
+        auto_bank_raw = control_hist_rows[-1].get("bank") if control_hist_rows else None
+    auto_bank = float(auto_bank_raw) / 10.0 if auto_bank_raw is not None else 0.7
+    # Adjust the last-deadline bank by publicly visible transactions in the upcoming GW where prices are included.
+    latest_bank_known = auto_bank_raw is not None
+    current_transactions = [r for r in control_transfers if isinstance(r, dict) and str(r.get("event", "")) == str(control_gw)]
+    current_tx_adjustment = 0.0
+    for tx in current_transactions:
+        try:
+            out_cost = tx.get("element_out_cost")
+            in_cost = tx.get("element_in_cost")
+            if out_cost is None or in_cost is None:
+                latest_bank_known = False
+                continue
+            current_tx_adjustment += (float(out_cost) - float(in_cost)) / 10.0
+        except (TypeError, ValueError):
+            latest_bank_known = False
+    if current_transactions and latest_bank_known:
+        auto_bank = max(0.0, min(20.0, auto_bank + current_tx_adjustment))
+    sync_mode = st.selectbox("Budget & transfer source", ["Auto-sync from FPL history", "Manual override"], index=0,
+                             help="Bank comes from the latest public deadline record plus visible current-Gameweek transfers. Free transfers are reconstructed from historical transfers, hit costs and chips; override if the FPL page differs.")
+    auto_controls = sync_mode == "Auto-sync from FPL history"
+    if auto_controls:
+        st.metric("Bank available", f"£{auto_bank:.1f}m")
+        st.metric("Estimated free transfers", str(auto_ft))
+        bank_m = auto_bank
+        free_transfers = auto_ft
+        st.caption(f"Auto-sync · GW{control_gw} · Bank {'synced' if latest_bank_known else 'fallback estimate'} · Free transfers {'history-derived' if auto_ft_confident else 'estimated'}.")
+        st.caption(auto_ft_note)
+    else:
+        bank_m = st.number_input("Bank (£m)", min_value=0.0, max_value=20.0, value=round(auto_bank, 1), step=0.1, key="manual_bank_override",
+                                 help="Enter the current bank from your FPL Transfers page. This is the override for uncertain or unpublished current transfers.")
+        free_transfers = st.selectbox("Free transfers available", [0,1,2,3,4,5], index=max(0, min(5, int(auto_ft))), key="manual_ft_override",
+                                      help="Enter the exact number shown in the official FPL app.")
     transfer_hit = st.checkbox("Allow a -4 hit if model sees a gain", value=False,
                                 help="If enabled, subtracts four points from the projected gain before ranking. A hit should only be considered for a clear multi-week advantage.")
     risk = st.select_slider("Risk appetite", options=["Conservative","Moderate","Aggressive"], value="Moderate",
@@ -411,6 +480,8 @@ with st.sidebar:
         get_manager_profile.clear()
         get_entry_picks.clear()
         get_entry_history.clear()
+        get_entry_transfers.clear()
+        get_remote_forecast_log.clear()
         get_player_summary.clear()
         get_live_gameweek.clear()
         get_json.clear()
@@ -485,7 +556,10 @@ except Exception:
     PLAYER_HISTORY_SIGNALS = {}
 
 # First pre-deadline visit records one frozen prediction per player/Gameweek for honest future testing.
+remote_forecast_df = get_remote_forecast_log()
+remote_log_active = isinstance(remote_forecast_df, pd.DataFrame)
 forecast_log, forecast_snapshot_status, forecast_snapshot_note = read_forecast_log(), False, ""
+MODEL_CALIBRATION_OFFSETS, CALIBRATION_METADATA = fpl_engine.derive_calibration(forecast_log, int(gw))
 season_id = season_label()
 forecast_event = next((e for e in events if int(e.get("id") or 0) == int(gw)), {})
 deadline_text = forecast_event.get("deadline_time")
@@ -497,7 +571,11 @@ if deadline_dt and datetime.now(timezone.utc) < deadline_dt:
     has_snapshot = (not forecast_log.empty and
                     ((forecast_log["season"].astype(str) == season_id) &
                      (pd.to_numeric(forecast_log["gameweek"], errors="coerce") == int(gw))).any())
-    if not has_snapshot:
+    if has_snapshot:
+        forecast_snapshot_note = "A pre-deadline forecast already exists for this Gameweek; it is preserved."
+    elif remote_log_active:
+        forecast_snapshot_note = "Automatic logging is enabled. The scheduled GitHub workflow will record this Gameweek before its deadline; refresh after the next scheduled run."
+    else:
         created_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
         forecast_rows = []
         for _p in players:
@@ -509,10 +587,9 @@ if deadline_dt and datetime.now(timezone.utc) < deadline_dt:
                 "club": teams.get(_p.get("team"), {}).get("short_name", "?"),
                 "projection_model": _model, "projection_baseline": _base,
                 "forecast_created_utc": created_utc, "actual_points": None, "actual_minutes": None,
+                "model_version": APP_VERSION,
             })
         forecast_log, forecast_snapshot_status, forecast_snapshot_note = append_first_forecast_snapshot(forecast_rows)
-    else:
-        forecast_snapshot_note = "A pre-deadline forecast already exists for this Gameweek; it is preserved."
 else:
     forecast_snapshot_note = "No new forecast snapshot was written because this is not currently before the selected Gameweek deadline."
 
@@ -530,32 +607,59 @@ except Exception:
     latest_history = {}
     previous_history = {}
 
-# Chip status is not reliably exposed by the public manager profile, so keep it editable.
+# Use public chip history when it is available, while keeping a manual status fallback.
 chip_period_key = "first_half" if int(gw) < 20 else "second_half"
 chip_period_label = "First-half chips (before GW19 deadline)" if int(gw) < 20 else "Second-half chips (GW20 onwards)"
+_chip_history = history_payload.get("chips", []) if isinstance(history_payload, dict) else []
+_chip_used_events = {"wildcard": [], "bench_boost": [], "free_hit": [], "triple_captain": []}
+_chip_aliases = {
+    "wildcard": "wildcard", "wc": "wildcard",
+    "bboost": "bench_boost", "benchboost": "bench_boost", "bench_boost": "bench_boost",
+    "freehit": "free_hit", "free_hit": "free_hit",
+    "3xc": "triple_captain", "triplecaptain": "triple_captain", "triple_captain": "triple_captain",
+}
+for _chip in _chip_history if isinstance(_chip_history, list) else []:
+    try:
+        _chip_name = "".join(ch for ch in str(_chip.get("name", "")).lower() if ch.isalnum() or ch == "_")
+        _chip_type = _chip_aliases.get(_chip_name)
+        _chip_event = int(_chip.get("event"))
+        in_period = (_chip_event < 20) if int(gw) < 20 else (_chip_event >= 20)
+        if _chip_type and in_period:
+            _chip_used_events[_chip_type].append(_chip_event)
+    except (TypeError, ValueError, AttributeError):
+        continue
+wildcard_used_event = max(_chip_used_events["wildcard"], default=None)
+bench_boost_used_event = max(_chip_used_events["bench_boost"], default=None)
+free_hit_used_event = max(_chip_used_events["free_hit"], default=None)
+triple_captain_used_event = max(_chip_used_events["triple_captain"], default=None)
 with st.sidebar:
     st.divider()
     with st.expander(f"🎟️ Chip status · {chip_period_label}", expanded=False):
-        st.caption("Seeded from your last screenshot for the first half: Wildcard used in GW6; Bench Boost, Free Hit and Triple Captain available. Please update these manually after playing a chip.")
+        st.caption("Chip status is prefilled from public manager history where available. Verify it in the FPL app if a chip is pending or history has not updated; manual editing remains available.")
         wildcard_options = ["Available", "Played in GW6", "Played in another Gameweek", "Unknown / verify"]
-        wildcard_default = 1 if int(gw) < 20 else 0
+        if wildcard_used_event is not None:
+            wildcard_default = 1 if wildcard_used_event == 6 else 2
+        else:
+            wildcard_default = 1 if int(gw) < 20 else 0
         wildcard_status = st.selectbox(
             "Wildcard", wildcard_options, index=wildcard_default,
-            key=f"chip_wildcard_{chip_period_key}"
+            key=f"chip_wildcard_{chip_period_key}_{wildcard_used_event or 'none'}"
         )
         chip_options = ["Available", "Played in a previous Gameweek", "Unknown / verify"]
-        chip_default = 0
+        bench_default = 1 if bench_boost_used_event is not None else 0
+        freehit_default = 1 if free_hit_used_event is not None else 0
+        triple_default = 1 if triple_captain_used_event is not None else 0
         bench_boost_status = st.selectbox(
-            "Bench Boost", chip_options, index=chip_default,
-            key=f"chip_bb_{chip_period_key}"
+            "Bench Boost", chip_options, index=bench_default,
+            key=f"chip_bb_{chip_period_key}_{bench_boost_used_event or 'none'}"
         )
         free_hit_status = st.selectbox(
-            "Free Hit", chip_options, index=chip_default,
-            key=f"chip_fh_{chip_period_key}"
+            "Free Hit", chip_options, index=freehit_default,
+            key=f"chip_fh_{chip_period_key}_{free_hit_used_event or 'none'}"
         )
         triple_captain_status = st.selectbox(
-            "Triple Captain", chip_options, index=chip_default,
-            key=f"chip_tc_{chip_period_key}"
+            "Triple Captain", chip_options, index=triple_default,
+            key=f"chip_tc_{chip_period_key}_{triple_captain_used_event or 'none'}"
         )
 
 rank_change_places = None
@@ -589,6 +693,28 @@ if len(rank_history_rows) >= 2:
 else:
     rank_history_rows = rank_history_rows[-2:]
 
+# Public pick history includes purchase prices on many FPL responses. Use them to estimate
+# the manager-specific selling price rather than assuming every asset sells at today's market price.
+purchase_price_by_id = {}
+for _pick in public_picks_for_display:
+    try:
+        if _pick.get("purchase_price") is not None:
+            purchase_price_by_id[int(_pick.get("element"))] = int(_pick.get("purchase_price"))
+    except (TypeError, ValueError):
+        continue
+if not purchase_price_by_id:
+    try:
+        _finished_event_ids = [int(e["id"]) for e in events if e.get("finished") and e.get("id") is not None]
+        _last_finished_event = max(_finished_event_ids) if _finished_event_ids else None
+        if _last_finished_event:
+            _last_picks_payload = get_entry_picks(int(team_id), int(_last_finished_event))
+            _last_picks = _last_picks_payload.get("picks", []) if isinstance(_last_picks_payload, dict) else []
+            for _pick in _last_picks:
+                if _pick.get("purchase_price") is not None and _pick.get("element") is not None:
+                    purchase_price_by_id[int(_pick["element"])] = int(_pick["purchase_price"])
+    except Exception:
+        pass
+
 # Profile, history and public squad sync loaded above; visual overview is rendered after squad matching.\n\n# Build squad from public picks when available, otherwise saved screenshot baseline
 resolved=[]
 unmatched=[]
@@ -601,6 +727,7 @@ for row in squad_rows:
             "Player": p.get("web_name"), "Position": pos_name(p,types), "Club": teamname,
             "Team ID": int(p.get("team")) if p.get("team") is not None else None,
             "Price (£m)": round((p.get("now_cost") or 0)/10,1),
+            "Sell price (£m)": round((purchase_price_by_id.get(int(p["id"]), int(p.get("now_cost") or 0)) + max(0, (int(p.get("now_cost") or 0) - purchase_price_by_id.get(int(p["id"]), int(p.get("now_cost") or 0))) // 2) if int(p.get("now_cost") or 0) > purchase_price_by_id.get(int(p["id"]), int(p.get("now_cost") or 0)) else int(p.get("now_cost") or 0)) / 10, 1),
             "Form": float(p.get("form") or 0), "PPG": float(p.get("points_per_game") or 0),
             "Minutes": int(p.get("minutes") or 0), "Status": p.get("status","?"),
             "Chance (%)": p.get("chance_of_playing_next_round"),
@@ -617,6 +744,39 @@ for row in squad_rows:
         })
     else:
         unmatched.append(row[2])
+
+# Compute a shared preview of the highest-projection legal XI. The captain shortlist
+# and later XI display both use this same formation logic and point model.
+model_xi_start_ids = set()
+model_xi_preview = []
+if len(resolved) == 15:
+    from itertools import combinations as _decision_combinations
+    _decision_player_by_id = {int(player["id"]): player for player in players if player.get("id") is not None}
+    for _resolved in resolved:
+        _player = _decision_player_by_id.get(int(_resolved["id"]))
+        if not _player:
+            continue
+        _proj, _, _ = estimate_points(_player, str(_resolved["Club"]), fixtures, horizon=1, start_gw=gw)
+        model_xi_preview.append({
+            "Player": str(_resolved["Player"]), "Position": str(_resolved["Position"]),
+            "Club": str(_resolved["Club"]), "GW projected pts": float(_proj), "id": int(_resolved["id"]),
+        })
+    _best_preview = None
+    _best_preview_score = -1e9
+    if len(model_xi_preview) == 15:
+        for _combo in _decision_combinations(model_xi_preview, 11):
+            _gk = sum(1 for _x in _combo if _x["Position"] in {"GKP", "GK"})
+            _def = sum(1 for _x in _combo if _x["Position"] == "DEF")
+            _mid = sum(1 for _x in _combo if _x["Position"] == "MID")
+            _fwd = sum(1 for _x in _combo if _x["Position"] == "FWD")
+            if _gk != 1 or not (3 <= _def <= 5) or not (2 <= _mid <= 5) or not (1 <= _fwd <= 3):
+                continue
+            _top_pts = max(float(_x["GW projected pts"]) for _x in _combo)
+            _score = sum(float(_x["GW projected pts"]) for _x in _combo) + _top_pts
+            if _score > _best_preview_score:
+                _best_preview_score, _best_preview = _score, list(_combo)
+    if _best_preview:
+        model_xi_start_ids = {int(_x["id"]) for _x in _best_preview}
 
 # FPL-inspired manager profile on the left and Gameweek pitch on the right.
 profile_col, pitch_col = st.columns([0.72, 1.85], gap="large")
@@ -649,8 +809,8 @@ with profile_col:
     )
     st.markdown(
         "<div class='manager-panel'><div class='panel-heading'>Squad controls</div>"
-        f"<div class='rank-row'><span>Bank entered</span><strong>£{bank_m:.1f}m</strong></div>"
-        f"<div class='rank-row'><span>Free transfers entered</span><strong>{free_transfers}</strong></div>"
+        f"<div class='rank-row'><span>Bank ({'auto' if auto_controls else 'manual'})</span><strong>£{bank_m:.1f}m</strong></div>"
+        f"<div class='rank-row'><span>Free transfers ({'estimated' if auto_controls else 'manual'})</span><strong>{free_transfers}</strong></div>"
         f"<div class='rank-row'><span>Points horizon</span><strong>{horizon} GWs</strong></div>"
         f"<div class='rank-row'><span>Fixture calendar</span><strong>{fixture_horizon} GWs</strong></div>"
         f"<div class='rank-row'><span>Risk mode</span><strong>{html.escape(risk)}</strong></div>"
@@ -851,6 +1011,10 @@ if resolved:
             elif norm(row.get("Player", "")) == "palmer":
                 current_vice_id = int(row["id"])
 
+    if model_xi_start_ids:
+        captain_pool_ids = set(model_xi_start_ids)
+        captain_source = "Model-optimized legal XI (shared with starting-XI optimizer)"
+
     captain_rows = []
     for element_id in captain_pool_ids:
         player = player_by_id.get(int(element_id))
@@ -930,7 +1094,7 @@ if resolved:
         else:
             st.caption(f"Candidate source: {captain_source}.")
         if not picks_sync_ok:
-            st.warning("Captaincy shortlist uses your last saved lineup screenshot because current public picks were unavailable. Confirm your actual starting XI before the deadline.")
+            st.warning("Current public picks were unavailable. The recommendation uses the model-optimized legal XI based on your matched 15-player squad; verify your actual team before the deadline.")
         if not any(int(row.get("Fixtures this GW", 0)) > 0 for row in captain_rows):
             st.info("Fixture assignments for the next Gameweek may not be complete yet. Captain recommendations are provisional.")
 
@@ -1195,6 +1359,34 @@ league_dgw_gws_chip = sorted({
     )
 })
 
+# Compare this Gameweek with the best currently known later opportunity for chips.
+# These are fixture/projection comparisons, not guaranteed points or perfect future forecasts.
+future_chip_options = []
+all_chip_ids = sorted(set(chip_starter_ids + chip_bench_ids))
+for future_gw in sorted({int(x) for x in target_gws if int(x) > int(gw)}):
+    future_points_by_id = {}
+    future_fixture_counts = {}
+    for player_id in all_chip_ids:
+        player = elements_by_id_chip.get(int(player_id))
+        if not player:
+            continue
+        club_code = teams.get(player.get("team"), {}).get("short_name", "?")
+        future_pts, _, future_fx_count = estimate_points(player, club_code, fixtures, horizon=1, start_gw=future_gw)
+        future_points_by_id[int(player_id)] = float(future_pts)
+        future_fixture_counts[int(player_id)] = int(future_fx_count)
+    future_bench_total = sum(future_points_by_id.get(pid, 0.0) for pid in chip_bench_ids)
+    future_best_captain = max(future_points_by_id.values(), default=0.0)
+    future_blanks = sum(1 for pid in chip_starter_ids if future_fixture_counts.get(pid, 0) == 0)
+    future_chip_options.append({
+        "gameweek": future_gw,
+        "bench_points": future_bench_total,
+        "captain_points": future_best_captain,
+        "blank_starters": future_blanks,
+    })
+best_future_bench = max(future_chip_options, key=lambda row: row["bench_points"], default=None)
+best_future_tc = max(future_chip_options, key=lambda row: row["captain_points"], default=None)
+best_future_fh = max(future_chip_options, key=lambda row: row["blank_starters"], default=None)
+
 # Readiness scores are intentionally transparent rule-based indexes.
 # They express how favourable a chip looks for THIS Gameweek, not probability of success.
 bench_score = round(30 * min(bench_points_chip / 18.0, 1.0)
@@ -1251,6 +1443,18 @@ if chip_state_is_available(bench_boost_status):
     else:
         bb_action = "Save for a stronger bench/DGW"
         bb_detail = f"Projected bench total is {bench_points_chip:.1f} points across {len(bench_chip_rows)} matched bench players. No bench Double Gameweek is currently assigned."
+    if best_future_bench and best_future_bench["bench_points"] >= bench_points_chip + 2.0:
+        bb_action = f"Save for GW{best_future_bench['gameweek']}"
+        bb_detail = (f"Current bench estimate: {bench_points_chip:.1f} points; the best later scheduled Gameweek in the planning window is "
+                    f"GW{best_future_bench['gameweek']} at {best_future_bench['bench_points']:.1f}. Recheck the squad closer to that deadline.")
+    elif bench_points_chip >= 12 and bench_reliability_chip >= 0.70:
+        bb_action = "Potential use this GW"
+        bb_detail = (f"Current bench estimate is {bench_points_chip:.1f} with reliability {bench_reliability_chip:.0%}. "
+                    + (f"Best later known bench estimate: {best_future_bench['bench_points']:.1f} in GW{best_future_bench['gameweek']}." if best_future_bench else "No later bench opportunity is currently comparable in the visible fixture window."))
+    else:
+        bb_action = "Hold — bench not strong enough yet"
+        bb_detail = (f"Current bench estimate is {bench_points_chip:.1f}. Use only when the bench has a materially stronger projected total; "
+                    + (f"the best later known estimate is {best_future_bench['bench_points']:.1f} in GW{best_future_bench['gameweek']}." if best_future_bench else "no later fully scheduled opportunity is currently available."))
     bb_score_text = f"{bench_score}% use-now suitability"
 else:
     bb_action = "Already used / verify status"
@@ -1267,6 +1471,18 @@ if chip_state_is_available(triple_captain_status):
     else:
         tc_action = "Usually save for a premium DGW"
         tc_detail = f"Best current captain projection is {captain_pts_chip:.1f} points; no Double Gameweek is assigned to that captain's club this GW."
+    if best_future_tc and best_future_tc["captain_points"] >= captain_pts_chip + 1.5:
+        tc_action = f"Save for GW{best_future_tc['gameweek']}"
+        tc_detail = (f"Current best captain estimate: {captain_pts_chip:.1f}; best later projected squad player is "
+                    f"{best_future_tc['captain_points']:.1f} in GW{best_future_tc['gameweek']}. This comparison is based on currently published fixtures and current player inputs.")
+    elif captain_dgw_chip and captain_pts_chip >= 8.0 and captain_reliability_chip >= 0.70:
+        tc_action = "Potential use this GW"
+        tc_detail = (f"Current captain candidate projects {captain_pts_chip:.1f} across this Gameweek's assigned fixtures with reliability {captain_reliability_chip:.0%}. "
+                    + (f"Best later projected captain: {best_future_tc['captain_points']:.1f} in GW{best_future_tc['gameweek']}." if best_future_tc else "No later stronger captain projection is visible."))
+    else:
+        tc_action = "Hold — wait for a stronger captain spot"
+        tc_detail = (f"Current captain candidate projects {captain_pts_chip:.1f}. "
+                    + (f"Best later candidate currently projects {best_future_tc['captain_points']:.1f} in GW{best_future_tc['gameweek']}." if best_future_tc else "No later candidate can be compared yet."))
     tc_score_text = f"{tc_score}% use-now suitability"
 else:
     tc_action = "Already used / verify status"
@@ -1283,6 +1499,18 @@ if chip_state_is_available(free_hit_status):
     else:
         fh_action = "Save for a major Blank GW"
         fh_detail = f"{blank_starters_chip} starting players currently have no fixture. A Free Hit is usually more valuable when several starters blank."
+    if best_future_fh and best_future_fh["blank_starters"] >= blank_starters_chip + 1 and best_future_fh["blank_starters"] >= 3:
+        fh_action = f"Save for GW{best_future_fh['gameweek']}"
+        fh_detail = (f"Current XI has {blank_starters_chip} blanks; the largest later blank signal in the visible schedule is "
+                    f"{best_future_fh['blank_starters']} in GW{best_future_fh['gameweek']}. This is only based on announced fixtures.")
+    elif blank_starters_chip >= 4:
+        fh_action = "Potential use this GW"
+        fh_detail = (f"{blank_starters_chip} current starters have no fixture. Compare the projected Free Hit XI with the normal team before confirming. "
+                    + (f"Best later known blank count: {best_future_fh['blank_starters']} in GW{best_future_fh['gameweek']}." if best_future_fh else "No later blank opportunity is currently assigned."))
+    else:
+        fh_action = "Hold for a major Blank GW"
+        fh_detail = (f"Current XI has {blank_starters_chip} blanks. Usually wait until several starters lack a fixture. "
+                    + (f"Largest later known blank count is {best_future_fh['blank_starters']} in GW{best_future_fh['gameweek']}." if best_future_fh else "No major later blank is visible yet."))
     fh_score_text = f"{freehit_score}% use-now suitability"
 else:
     fh_action = "Already used / verify status"
@@ -1312,7 +1540,7 @@ st.markdown(
 )
 
 st.subheader("Prediction engine & model validation")
-st.caption("The model now blends season form with recent match-by-match history for the squad and a bounded transfer-target pool. The baseline is retained so future results can show whether the history signal actually helps.")
+st.caption("The model blends season form with recent match-by-match history, then uses backtests to learn only a small, capped positional bias correction after enough completed v2.8 Gameweeks. It remains a heuristic, not a trained machine-learning system.")
 
 # Show next-Gameweek candidates without presenting projections as certainties.
 next_week_rows = []
@@ -1338,6 +1566,8 @@ engine_c1.metric("History-enriched players", f"{len(PLAYER_HISTORY_SIGNALS)}")
 engine_c2.metric("Candidates with a GW fixture", f"{len(next_week_df)}")
 engine_c3.metric("Forecast record", "Saved" if not forecast_log.empty and ((forecast_log["season"].astype(str) == season_id) & (pd.to_numeric(forecast_log["gameweek"], errors="coerce") == int(gw))).any() else "Not saved")
 engine_c4.metric("Model version", APP_VERSION)
+calibration_label = (f"Active · {CALIBRATION_METADATA.get('completed_gws', 0)} GWs" if CALIBRATION_METADATA.get("enabled") else f"Learning · {CALIBRATION_METADATA.get('completed_gws', 0)}/4 GWs")
+st.caption(f"Automatic calibration: {calibration_label}. The model only applies a small, capped position-level bias correction after at least four earlier v2.8 Gameweeks have scored actual results; until then it keeps the original weights.")
 if forecast_snapshot_note:
     st.caption(forecast_snapshot_note)
 if not next_week_df.empty:
@@ -1409,10 +1639,10 @@ if len(resolved) == 15:
 else:
     st.info(f"Best-XI optimizer needs all 15 squad members matched; currently matched: {len(resolved)}.")
 
-# Update actual scores only once FPL marks the forecasted Gameweek as finished.
+# Update actual scores only in local fallback mode; the scheduled worker owns the persistent branch.
 forecast_log = read_forecast_log()
 finished_gws = {int(e["id"]) for e in events if e.get("finished") and e.get("id") is not None}
-if not forecast_log.empty:
+if not remote_log_active and not forecast_log.empty:
     changed_actuals = False
     for _saved_gw in sorted(pd.to_numeric(forecast_log["gameweek"], errors="coerce").dropna().astype(int).unique()):
         _mask = (pd.to_numeric(forecast_log["gameweek"], errors="coerce") == int(_saved_gw))
@@ -1440,63 +1670,73 @@ forecast_log = read_forecast_log()
 if not forecast_log.empty:
     scored = forecast_log[pd.to_numeric(forecast_log["actual_points"], errors="coerce").notna()].copy()
     if not scored.empty:
-        scored["actual_points"] = pd.to_numeric(scored["actual_points"], errors="coerce")
-        scored["actual_minutes"] = pd.to_numeric(scored["actual_minutes"], errors="coerce").fillna(0)
-        scored["projection_model"] = pd.to_numeric(scored["projection_model"], errors="coerce")
-        scored["projection_baseline"] = pd.to_numeric(scored["projection_baseline"], errors="coerce")
-        # Compare both forecasts on the identical set of players who actually featured.
-        played = scored[scored["actual_minutes"] > 0].copy()
+        for col in ["actual_points", "actual_minutes", "projection_model", "projection_baseline"]:
+            scored[col] = pd.to_numeric(scored[col], errors="coerce")
+        # Expected-points forecasts are evaluated against all players, including DNPs;
+        # this matches the unconditional prediction the decision engine actually uses.
+        scored["model_abs_error"] = (scored["projection_model"] - scored["actual_points"]).abs()
+        scored["baseline_abs_error"] = (scored["projection_baseline"] - scored["actual_points"]).abs()
+        scored["model_error"] = scored["projection_model"] - scored["actual_points"]
+        gw_metrics = scored.groupby(["season", "gameweek"], as_index=False).agg(
+            Players=("player_id", "count"),
+            **{"Model MAE · all players": ("model_abs_error", "mean"),
+               "Baseline MAE · all players": ("baseline_abs_error", "mean"),
+               "Model bias": ("model_error", "mean")}
+        )
+        played = scored[scored["actual_minutes"].fillna(0) > 0].copy()
         if not played.empty:
-            played["model_abs_error"] = (played["projection_model"] - played["actual_points"]).abs()
-            played["baseline_abs_error"] = (played["projection_baseline"] - played["actual_points"]).abs()
-            played["model_error"] = played["projection_model"] - played["actual_points"]
-            gw_metrics = played.groupby(["season", "gameweek"], as_index=False).agg(
-                Players=("player_id", "count"),
-                **{"History model MAE": ("model_abs_error", "mean"), "Baseline MAE": ("baseline_abs_error", "mean"), "Model bias": ("model_error", "mean")}
+            played["model_abs_error_played"] = (played["projection_model"] - played["actual_points"]).abs()
+            played["baseline_abs_error_played"] = (played["projection_baseline"] - played["actual_points"]).abs()
+            played_metrics = played.groupby(["season", "gameweek"], as_index=False).agg(
+                **{"Model MAE · played": ("model_abs_error_played", "mean"),
+                   "Baseline MAE · played": ("baseline_abs_error_played", "mean")}
             )
-            for col in ["History model MAE", "Baseline MAE", "Model bias"]:
-                gw_metrics[col] = gw_metrics[col].round(2)
-            st.markdown("**Backtest: forecasts vs completed Gameweeks**")
-            st.dataframe(gw_metrics.sort_values(["season", "gameweek"], ascending=[False, False]), use_container_width=True, hide_index=True)
-            latest_metric = gw_metrics.sort_values(["season", "gameweek"], ascending=[False, False]).iloc[0]
-            if latest_metric["History model MAE"] < latest_metric["Baseline MAE"]:
-                st.success(f"In the latest scored Gameweek, the history-enriched model had lower MAE ({latest_metric['History model MAE']:.2f}) than the baseline ({latest_metric['Baseline MAE']:.2f}). This is an early sample, not proof of long-term superiority.")
-            elif latest_metric["History model MAE"] > latest_metric["Baseline MAE"]:
-                st.warning(f"In the latest scored Gameweek, the history-enriched model had higher MAE ({latest_metric['History model MAE']:.2f}) than the baseline ({latest_metric['Baseline MAE']:.2f}). We should not assume the extra history signal helps until more Gameweeks are tested.")
-            else:
-                st.info("The history-enriched model and baseline had equal MAE in the latest scored Gameweek.")
+            gw_metrics = gw_metrics.merge(played_metrics, on=["season", "gameweek"], how="left")
+        for col in gw_metrics.columns:
+            if "MAE" in col or col == "Model bias":
+                gw_metrics[col] = pd.to_numeric(gw_metrics[col], errors="coerce").round(2)
+        st.markdown("**Backtest: forecasts vs completed Gameweeks**")
+        st.dataframe(gw_metrics.sort_values(["season", "gameweek"], ascending=[False, False]), use_container_width=True, hide_index=True)
+        latest_metric = gw_metrics.sort_values(["season", "gameweek"], ascending=[False, False]).iloc[0]
+        model_mae = float(latest_metric["Model MAE · all players"])
+        base_mae = float(latest_metric["Baseline MAE · all players"])
+        if model_mae < base_mae:
+            st.success(f"In the latest scored Gameweek, the history model had lower all-player MAE ({model_mae:.2f}) than the baseline ({base_mae:.2f}). One Gameweek is not proof of long-term superiority.")
+        elif model_mae > base_mae:
+            st.warning(f"In the latest scored Gameweek, the history model had higher all-player MAE ({model_mae:.2f}) than the baseline ({base_mae:.2f}). We should not assume the history signal helps until more Gameweeks are tested.")
         else:
-            st.info("Forecasts exist, but no players with actual minutes are available for a meaningful completed-Gameweek comparison yet.")
+            st.info("The history model and baseline had equal all-player MAE in the latest scored Gameweek.")
     else:
-        st.info("No saved forecast has completed results yet. Once a recorded Gameweek finishes, the dashboard will fetch actual points and calculate model-versus-baseline error.")
-    with st.expander("Forecast history: backup, restore and audit", expanded=False):
-        st.caption("Forecast snapshots are saved once per Gameweek before its deadline. Streamlit-host storage may reset after a redeploy/restart, so download this CSV periodically and restore it below if needed.")
+        st.info("No saved forecast has completed results yet. The scheduled worker will fetch actual scores after FPL marks a Gameweek finished.")
+    with st.expander("Forecast history: backup and audit", expanded=False):
+        st.caption("Forecasts and actuals are normally persisted automatically by the GitHub Actions workflow on the fpl-data branch. Download the CSV only as an optional offline backup.")
         st.download_button("Download forecast/backtest CSV", data=forecast_log.to_csv(index=False).encode("utf-8"), file_name="the_one_above_all_forecast_log.csv", mime="text/csv")
-        upload = st.file_uploader("Restore or merge a previously downloaded forecast CSV", type=["csv"], key="forecast_restore_upload")
-        if upload is not None and st.button("Merge forecast backup", key="merge_forecast_backup"):
-            try:
-                restored = pd.read_csv(upload)
-                for col in FORECAST_COLUMNS:
-                    if col not in restored.columns:
-                        restored[col] = None
-                restored = restored[FORECAST_COLUMNS]
-                combined = pd.concat([forecast_log, restored], ignore_index=True)
-                combined = combined.drop_duplicates(subset=["season", "gameweek", "player_id"], keep="last")
-                if write_forecast_log(combined):
-                    st.success("Forecast backup merged. Reload the dashboard to update the backtest table.")
-                    st.rerun()
-                else:
-                    st.error("The hosting filesystem did not allow the CSV to be saved.")
-            except Exception as exc:
-                st.error(f"Could not restore that CSV: {exc}")
+        if not remote_log_active:
+            upload = st.file_uploader("Restore or merge a previously downloaded forecast CSV (local fallback only)", type=["csv"], key="forecast_restore_upload")
+            if upload is not None and st.button("Merge forecast backup", key="merge_forecast_backup"):
+                try:
+                    restored = pd.read_csv(upload)
+                    for col in FORECAST_COLUMNS:
+                        if col not in restored.columns:
+                            restored[col] = None
+                    restored = restored[FORECAST_COLUMNS]
+                    combined = pd.concat([forecast_log, restored], ignore_index=True)
+                    combined = combined.drop_duplicates(subset=["season", "gameweek", "player_id"], keep="last")
+                    if write_forecast_log(combined):
+                        st.success("Local forecast backup merged. The scheduled worker's persistent branch remains authoritative once it is active.")
+                        st.rerun()
+                    else:
+                        st.error("The hosting filesystem did not allow the CSV to be saved.")
+                except Exception as exc:
+                    st.error(f"Could not restore that CSV: {exc}")
 else:
-    st.info("No forecast CSV is available yet. Keep the dashboard open before a future Gameweek deadline so it can freeze the first pre-deadline forecast.")
+    st.info("No forecast log found. Once the GitHub Actions workflow is enabled, it will capture a pre-deadline snapshot and reconcile actual results automatically.")
 
 st.caption("Validation note: projections are heuristic and are not yet a trained/validated ML model. MAE is calculated only among players who actually played, for the same set under both models. More completed Gameweeks are required before changing weights confidently.")
 
 st.subheader("Automatic transfer recommendations")
-st.caption("Team ID: 2311669 • The optimizer scans every matched squad player and searches for legal, affordable replacements.")
-st.write("Recommendations are generated automatically from projected points, risk settings, estimated budget and the three-per-club rule. They are decision support, not automatic transfers.")
+st.caption(f"Team ID: {int(team_id)} • The optimizer scans every matched squad player and searches for legal, affordable replacements. Budget source: {'public FPL sync' if auto_controls else 'manual override'}.")
+st.write("This engine is allowed to recommend HOLD. It only labels a transfer actionable when the estimated multi-Gameweek points edge clears a conservative threshold, incoming minutes/availability are reliable, the squad is fully matched, and a points hit is justified. It never submits transfers automatically.")
 if resolved:
     df = pd.DataFrame(resolved)
     candidates = pd.DataFrame([{
@@ -1520,7 +1760,7 @@ if resolved:
     # AUTOMATIC TRANSFER SCAN: evaluate every possible player-out / player-in pair.
     squad_names = sorted(df["Player"].dropna().unique().tolist())
     club_counts_auto = df["Club"].value_counts().to_dict()
-    hit_cost_auto = 4 if (transfer_hit and free_transfers == 0) else 0
+    hit_cost_auto = 4 if free_transfers == 0 else 0
     auto_rows = []
 
     def reliability_for_candidate(cand):
@@ -1539,8 +1779,8 @@ if resolved:
         return mins_rel, avail_rel
 
     for _, outgoing in df.iterrows():
-        outgoing_price = float(outgoing["Price (£m)"])
-        budget_ceiling = outgoing_price + float(bank_m)  # approximate; personal sell price may differ
+        outgoing_price = float(outgoing.get("Sell price (£m)", outgoing["Price (£m)"]))
+        budget_ceiling = outgoing_price + float(bank_m)
         same_position = candidates[candidates["Position"] == outgoing["Position"]]
         possible_buys = same_position[
             (~same_position["Player"].isin(squad_names)) &
@@ -1582,6 +1822,34 @@ if resolved:
             else:
                 verdict = "Marginal upgrade"
 
+            outgoing_status = str(outgoing.get("Status", "")).lower()
+            outgoing_chance = outgoing.get("Chance (%)")
+            outgoing_unavailable = outgoing_status in {"i", "s", "u"} or (pd.notna(outgoing_chance) and float(outgoing_chance) <= 25)
+            outgoing_minutes_rel, outgoing_avail_rel = reliability_for_candidate(outgoing)
+            outgoing_projection = float(outgoing_proj)
+            captaincy_exposure = False
+            try:
+                captaincy_exposure = str(outgoing.get("Player", "")) in {str(captain_pick.get("Player", "")), str(vice_pick.get("Player", ""))}
+            except Exception:
+                captaincy_exposure = False
+            # Action recommendations require a robust net points edge; differential ownership only ranks candidates.
+            min_gain_threshold = 5.0
+            if outgoing_unavailable:
+                min_gain_threshold = 2.5
+            if int(free_transfers) >= 4:
+                min_gain_threshold = max(3.5, min_gain_threshold - 1.5)
+            if captaincy_exposure:
+                min_gain_threshold += 2.5
+            if free_transfers == 0:
+                min_gain_threshold = max(8.0, min_gain_threshold + 3.0)
+            if free_transfers == 0 and not transfer_hit:
+                verdict = "HOLD — hit disabled"
+            elif net_gain < min_gain_threshold:
+                verdict = "HOLD — gain below threshold"
+            elif mins_rel < 0.70 or avail_rel < 0.80:
+                verdict = "HOLD — reliability too low"
+            else:
+                verdict = "Actionable candidate — recheck before deadline"
             auto_rows.append({
                 "Sell": outgoing["Player"], "Sell club": outgoing["Club"],
                 "Buy": incoming["Player"], "Buy club": incoming["Club"],
@@ -1594,44 +1862,56 @@ if resolved:
                 "Minutes reliability (%)": round(mins_rel * 100),
                 "Availability reliability (%)": round(avail_rel * 100),
                 "Ownership (%)": ownership_pct, "Decision score": round(float(score), 3),
+                "Minimum gain to act": round(float(min_gain_threshold), 1),
+                "Outgoing unavailable": bool(outgoing_unavailable),
+                "Captaincy exposure": bool(captaincy_exposure),
+                "Actionable": bool(net_gain >= min_gain_threshold and mins_rel >= 0.70 and avail_rel >= 0.80
+                                   and (free_transfers > 0 or transfer_hit) and not unmatched),
                 "Verdict": verdict,
             })
 
     if unmatched:
         st.warning("Automatic recommendations are provisional because some seeded squad names did not match public FPL records: " + ", ".join(unmatched) + ". Club limits and squad context may be incomplete until every player is matched.")
 
+    hours_to_deadline_now = None
+    try:
+        if deadline_dt is not None:
+            hours_to_deadline_now = (deadline_dt - datetime.now(timezone.utc)).total_seconds() / 3600.0
+    except Exception:
+        hours_to_deadline_now = None
+
     if auto_rows:
         auto_df = pd.DataFrame(auto_rows)
         # Show the highest-scoring legal swap for each player we could sell.
-        best_each = (auto_df.sort_values(["Decision score", "Projected gain"], ascending=False)
+        best_each = (auto_df.sort_values(["Actionable", "Decision score", "Projected gain"], ascending=False)
                      .drop_duplicates(subset=["Sell"], keep="first")
-                     .sort_values(["Decision score", "Projected gain"], ascending=False)
+                     .sort_values(["Actionable", "Decision score", "Projected gain"], ascending=False)
                      .head(10))
-        st.caption(f"Risk mode: {risk} • Horizon: {horizon} GWs • Transfer hit applied: {hit_cost_auto} points. Prices use public prices plus bank as an approximation.")
-        st.dataframe(best_each[["Sell","Sell club","Buy","Buy club","Position","Buy price (£m)","Budget ceiling (£m)","Club count after transfer","Outgoing projected pts","Incoming projected pts","Projected gain","Minutes reliability (%)","Availability reliability (%)","Ownership (%)","Decision score","Verdict"]], use_container_width=True, hide_index=True)
+        st.caption(f"Risk mode: {risk} • Horizon: {horizon} GWs • Transfer hit applied: {hit_cost_auto} points. Budget uses the synced bank and estimated personal sell price; verify exact FPL values before acting.")
+        st.dataframe(best_each[["Sell","Sell club","Buy","Buy club","Position","Buy price (£m)","Budget ceiling (£m)","Club count after transfer","Outgoing projected pts","Incoming projected pts","Projected gain","Minimum gain to act","Minutes reliability (%)","Availability reliability (%)","Captaincy exposure","Actionable","Ownership (%)","Decision score","Verdict"]], use_container_width=True, hide_index=True)
         top = best_each.iloc[0]
+        gain = float(top["Projected gain"])
+        threshold = float(top["Minimum gain to act"])
+        reliable = float(top["Minutes reliability (%)"]) >= 70 and float(top["Availability reliability (%)"]) >= 80
+        candidate_is_robust = bool(top.get("Actionable", False)) and gain >= threshold and reliable and not unmatched
         if unmatched:
-            st.warning("Automatic recommendations are provisional because one or more squad players are not matched to public FPL data. Verify the full squad and club counts before acting.")
-            st.markdown(f"**Quick summary:** Top model-ranked move is **{top['Sell']} → {top['Buy']}** at an estimated **{top['Projected gain']:+.1f} points** over {horizon} Gameweeks, but this is not actionable until squad matching is complete.")
-        elif str(top["Sell"]).lower() == "haaland":
-            st.warning("Captaincy check required: Haaland was captain in your last recorded lineup. This model does not fully price the opportunity cost of replacing your captain.")
-            st.markdown(f"**Quick summary:** The model ranks **Haaland → {top['Buy']}** at **{top['Projected gain']:+.1f} points** over {horizon} Gameweeks, but do not act before comparing captaincy options and verifying actual selling price and team news.")
-        elif float(top["Projected gain"]) > 0:
-            st.success(f"Top automatic move under {risk.lower()} settings: {top['Sell']} → {top['Buy']} ({top['Buy club']}), projected {top['Projected gain']:+.1f} points over {horizon} GWs. Verdict: {top['Verdict']}. Check team news and actual selling price before acting.")
-            if float(top["Projected gain"]) >= 5 and float(top["Minutes reliability (%)"]) >= 70 and float(top["Availability reliability (%)"]) >= 80:
-                summary_action = "This is worth investigating as a potential transfer."
-            else:
-                summary_action = "This is only a candidate; uncertainty makes it unsuitable as an automatic transfer instruction."
-            st.markdown(
-                f"**Quick summary:** Best model-ranked move: **{top['Sell']} → {top['Buy']}** for an estimated **{top['Projected gain']:+.1f} points** over {horizon} Gameweeks. "
-                f"{summary_action} You have **{free_transfers} free transfer(s)** recorded; verify the player's role, availability and your personal selling price before deciding."
-            )
+            st.warning("Decision: HOLD / verify squad. At least one squad member is unmatched, so the optimizer cannot safely assess the legal squad or club limit.")
+            st.markdown(f"**Best candidate for review:** {top['Sell']} → {top['Buy']} · estimated {gain:+.1f} points over {horizon} Gameweeks. This is not an action recommendation until all 15 players match.")
+        elif free_transfers == 0 and not transfer_hit:
+            st.info(f"**Decision: HOLD — no transfer justified without a points hit.** Best candidate is {top['Sell']} → {top['Buy']} at {gain:+.1f} projected points after accounting for the -4 hit. Taking that hit is disabled, so the model will not recommend taking one.")
+        elif candidate_is_robust and (free_transfers > 0 or (transfer_hit and gain >= threshold)) and hours_to_deadline_now is not None and hours_to_deadline_now > 24 and not bool(top.get("Outgoing unavailable", False)):
+            st.info(f"**Decision: HOLD FOR NOW — candidate to monitor:** {top['Sell']} → {top['Buy']} ({top['Buy club']}) · estimated net gain {gain:+.1f} over {horizon} Gameweeks. It clears the points/reliability gate, but the deadline is still more than 24 hours away.")
+            st.markdown("**Suggested timing:** Re-check within 24 hours of the deadline, then again after the latest team news. Only act if the move still clears the threshold and the official FPL selling price/bank confirm it is affordable. A projection is not a guarantee.")
+        elif candidate_is_robust and (free_transfers > 0 or (transfer_hit and gain >= threshold)) and hours_to_deadline_now is not None and hours_to_deadline_now > 0:
+            st.success(f"**Decision: TRANSFER CANDIDATE — final review window** · {top['Sell']} → {top['Buy']} ({top['Buy club']}) · estimated net gain {gain:+.1f} points over {horizon} Gameweeks. It clears the {threshold:.1f}-point action threshold and the candidate's reliability checks.")
+            st.markdown("**Before acting:** Check press-conference/injury news and verify the real selling price/bank in FPL. If new information drops the gain below the threshold or minutes/availability confidence, switch back to HOLD.")
         else:
-            st.info("No legal transfer has a positive projected gain under the current settings. Rolling the transfer may be better.")
-            st.markdown(
-                f"**Quick summary:** The current model finds no legal, affordable move with positive projected gain over {horizon} Gameweeks under {risk.lower()} settings. "
-                f"With **{free_transfers} free transfer(s)** available, preserving flexibility looks preferable until team news or projections improve."
-            )
+            reason = []
+            if gain < threshold: reason.append(f"projected edge {gain:+.1f} is below the {threshold:.1f}-point action threshold")
+            if not reliable: reason.append("incoming minutes/availability are not reliable enough")
+            if free_transfers == 0 and transfer_hit and gain < threshold: reason.append("the gain does not repay the hit with enough margin")
+            st.info("**Decision: HOLD — no transfer clears the decision gate.** " + ("; ".join(reason) if reason else "The model cannot establish a sufficiently robust advantage."))
+            st.markdown(f"Best candidate to monitor: **{top['Sell']} → {top['Buy']}**, estimated {gain:+.1f} points over {horizon} Gameweeks. Reassess after team news or if the player’s status changes; an unused free transfer can roll over up to the rules limit.")
     else:
         st.info("No legal, affordable one-for-one transfers were found. Check the matched squad, budget and club-count warnings.")
         st.markdown("**Quick summary:** No transfer recommendation can be made until the squad and affordability data are resolved.")
@@ -1644,7 +1924,7 @@ if resolved:
     squad_names = sorted(df["Player"].unique().tolist())
     sell_name = st.selectbox("Sell player", squad_names, index=(squad_names.index("Schade") if "Schade" in squad_names else 0))
     sell = df[df["Player"]==sell_name].iloc[0]
-    max_price = float(sell["Price (£m)"]) + bank_m
+    max_price = float(sell.get("Sell price (£m)", sell["Price (£m)"])) + bank_m
     options = candidates[(candidates["Position"]==sell["Position"]) &
                          (~candidates["Player"].isin(squad_names)) &
                          (candidates["Price (£m)"] <= max_price)].copy()
@@ -1665,7 +1945,7 @@ if resolved:
         st.warning("Some recorded squad names did not match public data; club counts may be incomplete until those aliases are corrected.")
 
     options["Raw gain"] = options[f"Projected {horizon}GW pts"] - float(sell[f"Proj GW{gw}–GW{gw+horizon-1}"])
-    options["Hit cost"] = 4 if (transfer_hit and free_transfers == 0) else 0
+    options["Hit cost"] = 4 if free_transfers == 0 else 0
     options["Projected gain"] = options["Raw gain"] - options["Hit cost"]
     # Risk setting affects the ranking, not the raw point projection.
     ownership = options["Selected (%)"].fillna(0).astype(float).clip(0, 100)
@@ -1710,7 +1990,7 @@ if resolved:
     if options.empty:
         st.info("No affordable out-of-squad player candidates matched this position under the rough budget estimate.")
     else:
-        st.caption(f"Approximate replacement ceiling: £{max_price:.1f}m, using current price + bank. Enter actual selling value separately in your final decision.")
+        st.caption(f"Replacement ceiling: approximately £{max_price:.1f}m, using the manager-specific sale estimate + synced bank. Confirm the current official FPL selling price before confirming a transfer.")
         st.caption(f"Ranking mode: {risk}. Horizon: {horizon} GWs. Hit penalty: {4 if (transfer_hit and free_transfers == 0) else 0} points. Decision score now explicitly weights minutes reliability, availability, differential ownership and xG+xA/90.")
         options["Minutes reliability (%)"] = (minutes_reliability * 100).round(0).astype(int)
         options["Availability reliability (%)"] = (availability_reliability * 100).round(0).astype(int)
@@ -1724,10 +2004,10 @@ st.markdown("""
 - Blends PPG/form with a conservative xG+xA signal, shrinks small samples toward a position baseline, estimates minutes from starts and appearances, penalizes uncertain/unavailable status, and adjusts each scheduled fixture individually. Displays cumulative xG/xA and per-90 rates.
 - Uses public player status and chance-of-playing fields where provided.
 - Does **not** access your FPL password, private `my-team` endpoint, or your personal selling prices.
-- This v2.7 adds recent player match history, legal XI/captain/bench optimization from the current 15 players, and a forecast-vs-baseline audit trail. The model remains heuristic, not a trained machine-learning model; the transfer search still tests one transfer at a time and does not yet solve for a replacement 15-player squad globally, model price changes, or estimate rank probabilities.
+- This v2.8 adds shared forecast logic for dashboard and scheduled jobs, automatic bank/free-transfer history synchronization, and a conservative transfer HOLD gate. The model remains heuristic until enough saved forecasts and actual scores exist; no claim of self-learning accuracy is made before backtesting shows an improvement. The transfer search still evaluates one transfer at a time and does not submit transfers to FPL.
 - Public FPL API is unofficial/undocumented and may change. Player/fixture data is cached for 30 minutes; manager profile/rank for 60 seconds; public picks/history for 2 minutes.
-- A sidebar **Refresh rank & squad** button clears data caches and reruns the dashboard.
+- A sidebar **Refresh rank & squad** button clears data caches and reruns the dashboard. Finance sync is derived from public data; use Manual override if the FPL Transfers page shows a different live balance.
 - Squad sync attempts to use all 15 players from `entry/{id}/event/{gw}/picks/` for the next Gameweek. If the picks endpoint doesn't provide all 15 (especially before deadline), the app clearly falls back to the saved screenshot baseline.
 - The app does not access the authenticated `/my-team/{id}/` endpoint and does not ask for or store an FPL password/cookie. This means the latest editable pre-deadline team might not always be publicly available.
 """)
-st.caption(f"The-One-Above-All v2.7 · Last refreshed in this session: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. Use the app's refresh/reload to request fresh data.")
+st.caption(f"The-One-Above-All v2.8 · Last refreshed in this session: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. Use the app's refresh/reload to request fresh data.")
