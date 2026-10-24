@@ -18,7 +18,13 @@ def spearman(actual: Iterable, predicted: Iterable) -> float:
     pair = pd.DataFrame({"actual": list(actual), "predicted": list(predicted)}).dropna()
     if len(pair) < 3 or pair["actual"].nunique() < 2 or pair["predicted"].nunique() < 2:
         return float("nan")
-    value = pair["actual"].corr(pair["predicted"], method="spearman")
+    # Compute Spearman as Pearson correlation of average ranks. Calling
+    # Series.corr(method="spearman") delegates to scipy.stats in pandas, but
+    # SciPy is intentionally not a runtime dependency of this lightweight app
+    # and GitHub Actions worker. Ranking first gives the same tie-aware metric.
+    actual_rank = pair["actual"].rank(method="average")
+    predicted_rank = pair["predicted"].rank(method="average")
+    value = actual_rank.corr(predicted_rank)  # default Pearson correlation; no SciPy required
     return float(value) if pd.notna(value) else float("nan")
 
 
