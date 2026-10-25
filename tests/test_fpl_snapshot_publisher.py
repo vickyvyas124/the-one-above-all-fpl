@@ -1,4 +1,6 @@
 import gzip
+import hashlib
+import json
 import os
 import subprocess
 import tempfile
@@ -7,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import fpl_snapshot_publisher as publisher
+import fpl_snapshot_store
 
 
 class SnapshotPublisherIntegrationTests(unittest.TestCase):
@@ -29,8 +32,7 @@ class SnapshotPublisherIntegrationTests(unittest.TestCase):
         self.old_actual = "actuals/2026-27/gw04.jsonl"
         self.old_index = "reconciliation-index.json"
         initial = {
-            self.old_manifest: b'{"identity":{"gameweek":5,"window_label":"24h"}}\n',
-            self.old_payload: gzip.compress(b'{"elements":[]}', mtime=0),
+            **self._bundle_files("2026-27", 5, "24h"),
             self.old_diag: (
                 b'{"kind":"previous-diagnostic-1"}\n'
                 b'{"kind":"previous-diagnostic-2"}\n'
@@ -90,11 +92,34 @@ class SnapshotPublisherIntegrationTests(unittest.TestCase):
         target.write_bytes(content)
 
     def _source_with_new_6h_snapshot(self):
+        files = self._bundle_files("2026-27", 5, "6h", source_name="fixtures", source_body=b"[]")
+        for relative, body in files.items():
+            self._write_source_file(relative, body)
         manifest = "2026-27/gw05/6h/manifest.json"
         payload = "2026-27/gw05/6h/payloads/fixtures.json.gz"
-        self._write_source_file(manifest, b'{"identity":{"gameweek":5,"window_label":"6h"}}\n')
-        self._write_source_file(payload, gzip.compress(b"[]", mtime=0))
         return manifest, payload
+
+    @staticmethod
+    def _bundle_files(season, gameweek, window, *, source_name="bootstrap-static", source_body=b'{"elements":[]}'):
+        bundle = f"{season}/gw{gameweek:02d}/{window}"
+        manifest = {
+            "identity": {"season": season, "gameweek": gameweek, "window_label": window},
+            "sources": {
+                source_name: {
+                    "fetch_outcome": "success",
+                    "sha256": hashlib.sha256(source_body).hexdigest(),
+                },
+            },
+            "player_history": {"players": {}},
+            "model": {"artifact_captured": False},
+            "forecast": {"included": False},
+        }
+        return {
+            f"{bundle}/manifest.json": json.dumps(
+                manifest, sort_keys=True, separators=(",", ":")
+            ).encode() + b"\n",
+            f"{bundle}/payloads/{source_name}.json.gz": gzip.compress(source_body, mtime=0),
+        }
 
     def _remote_blob(self, relative):
         result = subprocess.run(
@@ -145,14 +170,16 @@ class SnapshotPublisherIntegrationTests(unittest.TestCase):
         self._git(self, "init", "--bare", "--initial-branch=fpl-snapshots", str(empty_bare))
         self._git(self, "init", "-b", "fpl-snapshots", str(empty_repo))
         self._git(empty_repo, "remote", "add", "origin", str(empty_bare))
-        relative = "2026-27/gw01/24h/manifest.json"
-        target = empty_source / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(b'{"identity":{"gameweek":1,"window_label":"24h"}}\n')
+        files = self._bundle_files("2026-27", 1, "24h")
+        for relative, body in files.items():
+            target = empty_source / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
 
         commit = publisher.publish(empty_source, empty_repo, push=True)
 
-        self.assertEqual(self._remote_blob_from(empty_bare, relative), target.read_bytes())
+        manifest_relative = "2026-27/gw01/24h/manifest.json"
+        self.assertEqual(self._remote_blob_from(empty_bare, manifest_relative), (empty_source / manifest_relative).read_bytes())
         self.assertEqual(
             self._git(self, "--git-dir", str(empty_bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip(),
             commit,
@@ -173,6 +200,87 @@ class SnapshotPublisherIntegrationTests(unittest.TestCase):
         after = self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip()
         self.assertEqual(after, before)
         self.assertEqual(self._git(self.repo, "rev-parse", "HEAD").stdout.strip(), self.initial_head)
+
+    def test_adding_file_to_existing_snapshot_bundle_is_rejected(self):
+        relative = "2026-27/gw05/24h/payloads/late-file.json.gz"
+        self._write_source_file(relative, gzip.compress(b"late data", mtime=0))
+
+        with self.assertRaisesRegex(publisher.PublishSafetyError, "existing immutable snapshot bundle"):
+            publisher.publish(self.source, self.repo, push=True)
+
+        self.assertEqual(
+            self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip(),
+            self.initial_head,
+        )
+        with self.assertRaises(subprocess.CalledProcessError):
+            self._remote_blob(relative)
+
+    def test_incomplete_new_snapshot_bundle_is_rejected(self):
+        manifest = self._bundle_files("2026-27", 6, "24h")["2026-27/gw06/24h/manifest.json"]
+        self._write_source_file("2026-27/gw06/24h/manifest.json", manifest)
+
+        with self.assertRaisesRegex(publisher.PublishSafetyError, "source payload is missing or mismatched"):
+            publisher.publish(self.source, self.repo, push=True)
+
+        self.assertEqual(
+            self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip(),
+            self.initial_head,
+        )
+
+    def test_new_capture_window_is_added_without_changing_existing_bundle(self):
+        manifest, payload = self._source_with_new_6h_snapshot()
+        commit = publisher.publish(self.source, self.repo, push=True)
+
+        self.assertIsNotNone(commit)
+        self.assertEqual(self._remote_blob(self.old_manifest), self.initial_bytes[self.old_manifest])
+        self.assertEqual(self._remote_blob(self.old_payload), self.initial_bytes[self.old_payload])
+        self.assertEqual(self._remote_blob(manifest), (self.source / manifest).read_bytes())
+        self.assertEqual(self._remote_blob(payload), (self.source / payload).read_bytes())
+
+    def test_bundle_completeness_accepts_snapshot_store_output(self):
+        captured = "2026-10-01T12:00:00+00:00"
+        source_body = b'{"elements":[]}'
+        history_body = b'{"history":[]}'
+        sources = {"bootstrap-static": fpl_snapshot_store.payload_record(
+            body=source_body, url="https://example.test/bootstrap-static/", status_code=200,
+            fetched_at_utc=captured,
+        ), "fixtures": fpl_snapshot_store.payload_record(
+            body=b'{"error":"temporary upstream response"}',
+            url="https://example.test/fixtures/", status_code=503,
+            fetched_at_utc=captured, error="upstream unavailable",
+        )}
+        histories = {7: fpl_snapshot_store.payload_record(
+            body=history_body, url="https://example.test/element-summary/7/", status_code=200,
+            fetched_at_utc=captured,
+        )}
+        bundle, created = fpl_snapshot_store.capture_snapshot(
+            self.source, season="2026-27", gameweek=6, window_label="24h",
+            deadline_utc="2026-10-02T12:00:00+00:00", captured_at_utc=captured,
+            sources=sources, histories=histories, model_status="missing",
+            model_reason="test capture without model",
+        )
+        self.assertTrue(created)
+        self.assertEqual(fpl_snapshot_store.verify_snapshot(bundle), [])
+
+        commit = publisher.publish(self.source, self.repo, push=True)
+
+        self.assertIsNotNone(commit)
+        self.assertEqual(
+            self._remote_blob("2026-27/gw06/24h/manifest.json"),
+            (bundle / "manifest.json").read_bytes(),
+        )
+
+    def test_unreferenced_file_in_new_snapshot_bundle_is_rejected(self):
+        self._source_with_new_6h_snapshot()
+        self._write_source_file("2026-27/gw05/6h/payloads/unreferenced.json.gz", gzip.compress(b"extra", mtime=0))
+
+        with self.assertRaisesRegex(publisher.PublishSafetyError, "unexpected"):
+            publisher.publish(self.source, self.repo, push=True)
+
+        self.assertEqual(
+            self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip(),
+            self.initial_head,
+        )
 
     def test_modifying_existing_source_payload_is_rejected_without_push(self):
         self._write_source_file(self.old_payload, b"rewritten-source-payload")
@@ -259,6 +367,30 @@ class SnapshotPublisherIntegrationTests(unittest.TestCase):
             self.initial_head,
         )
         self.assertEqual(self._remote_blob(self.old_manifest), self.initial_bytes[self.old_manifest])
+
+    def test_stale_publisher_rejects_moving_remote_without_overwriting_competing_commit(self):
+        competitor = self._clone_partial("competing-publisher")
+        competitor_source = self.root / "competing-source"
+        competitor_source.mkdir()
+        competing_diagnostic = self.initial_bytes[self.old_diag] + b'{"kind":"independent-update"}\n'
+        target = competitor_source / self.old_diag
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(competing_diagnostic)
+        competing_commit = publisher.publish(competitor_source, competitor, push=True)
+        self.assertIsNotNone(competing_commit)
+
+        self._source_with_new_6h_snapshot()
+        with self.assertRaisesRegex(publisher.PublishSafetyError, "git push"):
+            publisher.publish(self.source, self.repo, push=True)
+
+        remote_head = self._git(
+            self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots"
+        ).stdout.strip()
+        self.assertEqual(remote_head, competing_commit)
+        self.assertEqual(self._remote_blob(self.old_diag), competing_diagnostic)
+        self.assertEqual(self._remote_blob(self.old_manifest), self.initial_bytes[self.old_manifest])
+        with self.assertRaises(subprocess.CalledProcessError):
+            self._remote_blob("2026-27/gw05/6h/manifest.json")
 
     def test_invalid_new_actual_ledger_is_rejected(self):
         relative = "actuals/2026-27/gw06.jsonl"
