@@ -1,6 +1,20 @@
 {
-  "created_at_utc": "2026-10-24T15:51:12+00:00",
-  "source_note": "Historical data is used to train a ridge-regression model on lagged player form/minutes/xGI and target Gameweek schedule. Out-of-season metrics use only preceding seasons. Archived data is not an exact replay of historical live API snapshots.",
+  "status": "complete",
+  "evaluation_type": "historical_proxy_single_fixture_no_point_in_time_snapshots",
+  "created_at_utc": "2026-10-25T06:52:39+00:00",
+  "source_note": "Historical proxy, not exact point-in-time replay. Archived player/team snapshots and final fixture schedules are not deadline snapshots. Target fixture count, venue and target-row position are excluded from features. Training and historical scores use only rows mapped to exactly one final-schedule fixture; blank/double Gameweeks are excluded. Out-of-season metrics use only preceding seasons.",
+  "requested_seasons": [
+    "2023-24",
+    "2024-25",
+    "2025-26"
+  ],
+  "evaluated_seasons": [
+    "2023-24",
+    "2024-25",
+    "2025-26"
+  ],
+  "skipped_seasons": [],
+  "failed_seasons": [],
   "success_seasons": [
     "2023-24",
     "2024-25",
@@ -10,7 +24,7 @@
   "deployed_model": {
     "model_version": "3.0",
     "model_type": "standardized_ridge_regression",
-    "training_rows": 82801,
+    "training_rows": 72908,
     "source_seasons": [
       "2023-24",
       "2024-25",
