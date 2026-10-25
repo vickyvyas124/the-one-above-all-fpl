@@ -1,0 +1,421 @@
+import gzip
+import hashlib
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import fpl_snapshot_publisher as publisher
+import fpl_snapshot_store
+
+
+class SnapshotPublisherIntegrationTests(unittest.TestCase):
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.bare = self.root / "remote.git"
+        self.seed = self.root / "seed"
+        self.seed.mkdir()
+        self._git(self.seed, "init", "-b", "fpl-snapshots")
+        self._git(self.seed, "config", "user.name", "Snapshot Test")
+        self._git(self.seed, "config", "user.email", "snapshot@example.test")
+        self._git(self, "init", "--bare", "--initial-branch=fpl-snapshots", str(self.bare))
+        self._git(self, "--git-dir", str(self.bare), "config", "uploadpack.allowFilter", "true")
+
+        self.old_manifest = "2026-27/gw05/24h/manifest.json"
+        self.old_payload = "2026-27/gw05/24h/payloads/bootstrap-static.json.gz"
+        self.old_diag = "diagnostics.jsonl"
+        self.old_actual = "actuals/2026-27/gw04.jsonl"
+        self.old_index = "reconciliation-index.json"
+        initial = {
+            **self._bundle_files("2026-27", 5, "24h"),
+            self.old_diag: (
+                b'{"kind":"previous-diagnostic-1"}\n'
+                b'{"kind":"previous-diagnostic-2"}\n'
+            ),
+            self.old_actual: b'{"record_type":"actual_score","player_id":1,"revision":1}\n',
+            self.old_index: b'{"2026-27:GW04":"2026-10-01T12:00:00+00:00"}\n',
+        }
+        self.initial_bytes = initial
+        for relative, body in initial.items():
+            target = self.seed / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
+        self._git(self.seed, "add", ".")
+        self._git(self.seed, "commit", "-m", "Seed existing 24h snapshot and mutable history")
+        self._git(self.seed, "remote", "add", "origin", str(self.bare))
+        self._git(self.seed, "push", "-u", "origin", "fpl-snapshots")
+        self.initial_head = self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip()
+        self.repo = self._clone_partial("publisher")
+        self.source = self.root / "partial-source"
+        self.source.mkdir()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _git(self, cwd, *args, check=True):
+        directory = cwd if isinstance(cwd, Path) else self.root
+        command = (
+            ["git", *args]
+            if len(args) >= 1 and args[0] == "--git-dir"
+            else ["git", "-C", str(directory), *args]
+        )
+        result = subprocess.run(
+            command, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if result.returncode and check:
+            self.fail(f"git {args!r} failed: {result.stderr}")
+        return result
+
+    def _clone_partial(self, name, *, shallow=False):
+        destination = self.root / name
+        clone_args = ["git", "clone"]
+        if shallow:
+            clone_args.extend(["--depth", "1", "--filter=blob:none"])
+        clone_args.extend(["--no-checkout", "--branch", "fpl-snapshots", f"file://{self.bare}", str(destination)])
+        result = subprocess.run(
+            clone_args,
+            check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if result.returncode:
+            self.fail(f"git clone failed: {result.stderr}")
+        self._git(destination, "read-tree", "HEAD")
+        return destination
+
+    def _write_source_file(self, relative, content):
+        target = self.source / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+    def _source_with_new_6h_snapshot(self):
+        files = self._bundle_files("2026-27", 5, "6h", source_name="fixtures", source_body=b"[]")
+        for relative, body in files.items():
+            self._write_source_file(relative, body)
+        manifest = "2026-27/gw05/6h/manifest.json"
+        payload = "2026-27/gw05/6h/payloads/fixtures.json.gz"
+        return manifest, payload
+
+    @staticmethod
+    def _bundle_files(season, gameweek, window, *, source_name="bootstrap-static", source_body=b'{"elements":[]}'):
+        bundle = f"{season}/gw{gameweek:02d}/{window}"
+        manifest = {
+            "identity": {"season": season, "gameweek": gameweek, "window_label": window},
+            "sources": {
+                source_name: {
+                    "fetch_outcome": "success",
+                    "sha256": hashlib.sha256(source_body).hexdigest(),
+                },
+            },
+            "player_history": {"players": {}},
+            "model": {"artifact_captured": False},
+            "forecast": {"included": False},
+        }
+        return {
+            f"{bundle}/manifest.json": json.dumps(
+                manifest, sort_keys=True, separators=(",", ":")
+            ).encode() + b"\n",
+            f"{bundle}/payloads/{source_name}.json.gz": gzip.compress(source_body, mtime=0),
+        }
+
+    def _remote_blob(self, relative):
+        result = subprocess.run(
+            ["git", "--git-dir", str(self.bare), "show", f"refs/heads/fpl-snapshots:{relative}"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return result.stdout
+
+    def test_partial_6h_publish_preserves_existing_24h_and_appends_mutable_records(self):
+        manifest, payload = self._source_with_new_6h_snapshot()
+        self._write_source_file(self.old_diag, self.initial_bytes[self.old_diag] + b'{"kind":"new-diagnostic"}\n')
+        self._write_source_file(self.old_actual, self.initial_bytes[self.old_actual] + b'{"record_type":"actual_score","player_id":2,"revision":1}\n')
+        self._write_source_file(self.old_index, b'{"2026-27:GW04":"updated","2026-27:GW05":"now"}\n')
+
+        commit = publisher.publish(self.source, self.repo, push=True)
+        self.assertIsNotNone(commit)
+        self.assertEqual(self._remote_blob(manifest), (self.source / manifest).read_bytes())
+        self.assertEqual(self._remote_blob(payload), (self.source / payload).read_bytes())
+        self.assertEqual(self._remote_blob(self.old_manifest), self.initial_bytes[self.old_manifest])
+        self.assertEqual(self._remote_blob(self.old_payload), self.initial_bytes[self.old_payload])
+        self.assertEqual(
+            self._remote_blob(self.old_diag),
+            self.initial_bytes[self.old_diag] + b'{"kind":"new-diagnostic"}\n',
+        )
+        self.assertEqual(
+            self._remote_blob(self.old_actual),
+            self.initial_bytes[self.old_actual]
+            + b'{"record_type":"actual_score","player_id":2,"revision":1}\n',
+        )
+        self.assertEqual(self._remote_blob(self.old_index), b'{"2026-27:GW04":"updated","2026-27:GW05":"now"}\n')
+        changed = self._git(
+            self.repo, "diff-tree", "--no-commit-id", "--name-status", "-r",
+            "--no-renames", "HEAD^", "HEAD",
+        ).stdout.splitlines()
+        self.assertTrue(changed)
+        self.assertFalse(any(row.startswith("D\t") for row in changed))
+        self.assertEqual(self._git(self.repo, "diff", "--cached", "--quiet", "HEAD", check=False).returncode, 0)
+        self.assertEqual(
+            self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip(),
+            commit,
+        )
+
+    def test_first_publish_to_empty_local_bare_remote_succeeds(self):
+        empty_bare = self.root / "empty.git"
+        empty_repo = self.root / "empty-publisher"
+        empty_source = self.root / "first-capture"
+        empty_source.mkdir()
+        self._git(self, "init", "--bare", "--initial-branch=fpl-snapshots", str(empty_bare))
+        self._git(self, "init", "-b", "fpl-snapshots", str(empty_repo))
+        self._git(empty_repo, "remote", "add", "origin", str(empty_bare))
+        files = self._bundle_files("2026-27", 1, "24h")
+        for relative, body in files.items():
+            target = empty_source / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
+
+        commit = publisher.publish(empty_source, empty_repo, push=True)
+
+        manifest_relative = "2026-27/gw01/24h/manifest.json"
+        self.assertEqual(self._remote_blob_from(empty_bare, manifest_relative), (empty_source / manifest_relative).read_bytes())
+        self.assertEqual(
+            self._git(self, "--git-dir", str(empty_bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip(),
+            commit,
+        )
+
+    def _remote_blob_from(self, remote, relative):
+        result = subprocess.run(
+            ["git", "--git-dir", str(remote), "show", f"refs/heads/fpl-snapshots:{relative}"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return result.stdout
+
+    def test_modifying_existing_immutable_snapshot_is_rejected_without_push(self):
+        self._write_source_file(self.old_manifest, b'{"rewritten":true}\n')
+        before = self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip()
+        with self.assertRaisesRegex(publisher.PublishSafetyError, "immutable"):
+            publisher.publish(self.source, self.repo, push=True)
+        after = self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip()
+        self.assertEqual(after, before)
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD").stdout.strip(), self.initial_head)
+
+    def test_adding_file_to_existing_snapshot_bundle_is_rejected(self):
+        relative = "2026-27/gw05/24h/payloads/late-file.json.gz"
+        self._write_source_file(relative, gzip.compress(b"late data", mtime=0))
+
+        with self.assertRaisesRegex(publisher.PublishSafetyError, "existing immutable snapshot bundle"):
+            publisher.publish(self.source, self.repo, push=True)
+
+        self.assertEqual(
+            self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip(),
+            self.initial_head,
+        )
+        with self.assertRaises(subprocess.CalledProcessError):
+            self._remote_blob(relative)
+
+    def test_incomplete_new_snapshot_bundle_is_rejected(self):
+        manifest = self._bundle_files("2026-27", 6, "24h")["2026-27/gw06/24h/manifest.json"]
+        self._write_source_file("2026-27/gw06/24h/manifest.json", manifest)
+
+        with self.assertRaisesRegex(publisher.PublishSafetyError, "source payload is missing or mismatched"):
+            publisher.publish(self.source, self.repo, push=True)
+
+        self.assertEqual(
+            self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip(),
+            self.initial_head,
+        )
+
+    def test_new_capture_window_is_added_without_changing_existing_bundle(self):
+        manifest, payload = self._source_with_new_6h_snapshot()
+        commit = publisher.publish(self.source, self.repo, push=True)
+
+        self.assertIsNotNone(commit)
+        self.assertEqual(self._remote_blob(self.old_manifest), self.initial_bytes[self.old_manifest])
+        self.assertEqual(self._remote_blob(self.old_payload), self.initial_bytes[self.old_payload])
+        self.assertEqual(self._remote_blob(manifest), (self.source / manifest).read_bytes())
+        self.assertEqual(self._remote_blob(payload), (self.source / payload).read_bytes())
+
+    def test_bundle_completeness_accepts_snapshot_store_output(self):
+        captured = "2026-10-01T12:00:00+00:00"
+        source_body = b'{"elements":[]}'
+        history_body = b'{"history":[]}'
+        sources = {"bootstrap-static": fpl_snapshot_store.payload_record(
+            body=source_body, url="https://example.test/bootstrap-static/", status_code=200,
+            fetched_at_utc=captured,
+        ), "fixtures": fpl_snapshot_store.payload_record(
+            body=b'{"error":"temporary upstream response"}',
+            url="https://example.test/fixtures/", status_code=503,
+            fetched_at_utc=captured, error="upstream unavailable",
+        )}
+        histories = {7: fpl_snapshot_store.payload_record(
+            body=history_body, url="https://example.test/element-summary/7/", status_code=200,
+            fetched_at_utc=captured,
+        )}
+        bundle, created = fpl_snapshot_store.capture_snapshot(
+            self.source, season="2026-27", gameweek=6, window_label="24h",
+            deadline_utc="2026-10-02T12:00:00+00:00", captured_at_utc=captured,
+            sources=sources, histories=histories, model_status="missing",
+            model_reason="test capture without model",
+        )
+        self.assertTrue(created)
+        self.assertEqual(fpl_snapshot_store.verify_snapshot(bundle), [])
+
+        commit = publisher.publish(self.source, self.repo, push=True)
+
+        self.assertIsNotNone(commit)
+        self.assertEqual(
+            self._remote_blob("2026-27/gw06/24h/manifest.json"),
+            (bundle / "manifest.json").read_bytes(),
+        )
+
+    def test_unreferenced_file_in_new_snapshot_bundle_is_rejected(self):
+        self._source_with_new_6h_snapshot()
+        self._write_source_file("2026-27/gw05/6h/payloads/unreferenced.json.gz", gzip.compress(b"extra", mtime=0))
+
+        with self.assertRaisesRegex(publisher.PublishSafetyError, "unexpected"):
+            publisher.publish(self.source, self.repo, push=True)
+
+        self.assertEqual(
+            self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip(),
+            self.initial_head,
+        )
+
+    def test_modifying_existing_source_payload_is_rejected_without_push(self):
+        self._write_source_file(self.old_payload, b"rewritten-source-payload")
+        with self.assertRaisesRegex(publisher.PublishSafetyError, "immutable"):
+            publisher.publish(self.source, self.repo, push=True)
+        after = self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip()
+        self.assertEqual(after, self.initial_head)
+
+    def test_staged_immutable_deletion_is_rejected_without_push(self):
+        self._git(self.repo, "rm", "--cached", "--", self.old_manifest)
+        self._source_with_new_6h_snapshot()
+        with self.assertRaisesRegex(publisher.PublishSafetyError, "deletion"):
+            publisher.publish(self.source, self.repo, push=True)
+        after = self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip()
+        self.assertEqual(after, self.initial_head)
+
+    def test_mutable_jsonl_rewrite_or_truncation_is_rejected(self):
+        self._write_source_file(self.old_diag, b'{"kind":"replacement"}\n')
+        with self.assertRaisesRegex(publisher.PublishSafetyError, "rewritten or truncated"):
+            publisher.publish(self.source, self.repo, push=True)
+        after = self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip()
+        self.assertEqual(after, self.initial_head)
+
+    def test_mutable_jsonl_truncation_preserves_remote_history_and_head(self):
+        # This is a true truncation: the source retains only the first of two
+        # existing records, rather than replacing the file with another value.
+        original = self.initial_bytes[self.old_diag]
+        self.assertEqual(len(original.splitlines()), 2)
+        self._write_source_file(self.old_diag, original.splitlines(keepends=True)[0])
+
+        with self.assertRaisesRegex(publisher.PublishSafetyError, "rewritten or truncated"):
+            publisher.publish(self.source, self.repo, push=True)
+
+        self.assertEqual(
+            self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip(),
+            self.initial_head,
+        )
+        self.assertEqual(self._remote_blob(self.old_diag), original)
+
+    def test_shallow_blob_filtered_clone_can_publish_without_parent_fallback(self):
+        repo = self._clone_partial("shallow-publisher", shallow=True)
+        self.assertEqual(self._git(repo, "rev-parse", "--is-shallow-repository").stdout.strip(), "true")
+        manifest, payload = self._source_with_new_6h_snapshot()
+
+        commit = publisher.publish(self.source, repo, push=True)
+
+        self.assertIsNotNone(commit)
+        self.assertEqual(self._remote_blob(manifest), (self.source / manifest).read_bytes())
+        self.assertEqual(self._remote_blob(payload), (self.source / payload).read_bytes())
+        self.assertEqual(self._remote_blob(self.old_manifest), self.initial_bytes[self.old_manifest])
+        self.assertEqual(self._remote_blob(self.old_payload), self.initial_bytes[self.old_payload])
+        changes = self._git(
+            repo, "diff-tree", "--no-commit-id", "--name-status", "-r", "--no-renames",
+            self.initial_head, "HEAD",
+        ).stdout.splitlines()
+        self.assertFalse(any(row.startswith("D\t") for row in changes))
+
+    def test_unavailable_prior_blob_in_shallow_clone_rejects_without_remote_change(self):
+        repo = self._clone_partial("missing-blob-publisher", shallow=True)
+        tree_entry = self._git(repo, "ls-tree", "HEAD", "--", self.old_manifest).stdout.split()
+        prior_blob = tree_entry[2].decode() if isinstance(tree_entry[2], bytes) else tree_entry[2]
+        self.assertNotEqual(
+            subprocess.run(
+                ["git", "-C", str(repo), "cat-file", "-e", prior_blob],
+                env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).returncode,
+            0,
+            "blob-filtered clone unexpectedly contains the immutable manifest blob",
+        )
+        # Prevent Git's promisor remote from fetching the omitted object. The
+        # publisher must reject uncertainty instead of treating it as absence.
+        self._git(repo, "remote", "set-url", "origin", str(self.root / "unavailable-remote.git"))
+        self._write_source_file(self.old_manifest, b'{"identity":{"rewritten":true}}\n')
+
+        with patch.dict(os.environ, {"GIT_NO_LAZY_FETCH": "1"}):
+            with self.assertRaises(publisher.PublishSafetyError):
+                publisher.publish(self.source, repo, push=True)
+
+        self.assertEqual(
+            self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip(),
+            self.initial_head,
+        )
+        self.assertEqual(self._remote_blob(self.old_manifest), self.initial_bytes[self.old_manifest])
+
+    def test_stale_publisher_rejects_moving_remote_without_overwriting_competing_commit(self):
+        competitor = self._clone_partial("competing-publisher")
+        competitor_source = self.root / "competing-source"
+        competitor_source.mkdir()
+        competing_diagnostic = self.initial_bytes[self.old_diag] + b'{"kind":"independent-update"}\n'
+        target = competitor_source / self.old_diag
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(competing_diagnostic)
+        competing_commit = publisher.publish(competitor_source, competitor, push=True)
+        self.assertIsNotNone(competing_commit)
+
+        self._source_with_new_6h_snapshot()
+        with self.assertRaisesRegex(publisher.PublishSafetyError, "git push"):
+            publisher.publish(self.source, self.repo, push=True)
+
+        remote_head = self._git(
+            self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots"
+        ).stdout.strip()
+        self.assertEqual(remote_head, competing_commit)
+        self.assertEqual(self._remote_blob(self.old_diag), competing_diagnostic)
+        self.assertEqual(self._remote_blob(self.old_manifest), self.initial_bytes[self.old_manifest])
+        with self.assertRaises(subprocess.CalledProcessError):
+            self._remote_blob("2026-27/gw05/6h/manifest.json")
+
+    def test_invalid_new_actual_ledger_is_rejected(self):
+        relative = "actuals/2026-27/gw06.jsonl"
+        self._write_source_file(relative, b"not-json\n")
+        with self.assertRaisesRegex(publisher.PublishSafetyError, "Invalid JSONL record"):
+            publisher.publish(self.source, self.repo, push=True)
+        after = self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip()
+        self.assertEqual(after, self.initial_head)
+
+    def test_workflow_publisher_fails_closed_off_main(self):
+        self._source_with_new_6h_snapshot()
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_REF": "refs/heads/feature/test"}):
+            with self.assertRaisesRegex(publisher.PublishSafetyError, "only on main"):
+                publisher.publish(self.source, self.repo, push=True)
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD").stdout.strip(), self.initial_head)
+
+    def test_workflow_calls_shared_main_only_publisher_with_push_branch(self):
+        root = Path(__file__).parents[1]
+        workflow = (root / ".github/workflows/fpl-auto-learning.yml").read_text(encoding="utf-8-sig")
+        self.assertIn("if: github.ref == 'refs/heads/main'", workflow)
+        self.assertIn("python fpl_snapshot_publisher.py", workflow)
+        self.assertIn("--branch fpl-snapshots", workflow)
+        self.assertIn("--push", workflow)
+        self.assertNotIn('git add -- "', workflow)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

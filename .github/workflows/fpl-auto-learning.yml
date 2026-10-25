@@ -117,6 +117,7 @@ jobs:
           fi
 
       - name: Persist new snapshots to dedicated branch
+        id: snapshot-publish
         if: steps.snapshot-run.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -127,27 +128,50 @@ jobs:
           SOURCE="$RUNNER_TEMP/fpl-snapshots"
           DATA_DIR="$RUNNER_TEMP/fpl-snapshot-branch"
           if git ls-remote --exit-code --heads "$REMOTE_URL" fpl-snapshots >/dev/null 2>&1; then
-            git clone --depth 1 --filter=blob:none --no-checkout --single-branch \
-              --branch fpl-snapshots "$REMOTE_URL" "$DATA_DIR"
+            git clone --depth 1 --filter=blob:none --no-checkout --single-branch --branch fpl-snapshots "$REMOTE_URL" "$DATA_DIR"
             git -C "$DATA_DIR" read-tree HEAD
           else
             mkdir -p "$DATA_DIR"
             git -C "$DATA_DIR" init -b fpl-snapshots
             git -C "$DATA_DIR" remote add origin "$REMOTE_URL"
           fi
-          cp -a "$SOURCE/." "$DATA_DIR/"
-          git -C "$DATA_DIR" config user.name 'github-actions[bot]'
-          git -C "$DATA_DIR" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          for item in "$SOURCE"/*; do
-            [[ -e "$item" ]] || continue
-            git -C "$DATA_DIR" add -- "${item#"$SOURCE"/}"
-          done
-          if ! git -C "$DATA_DIR" diff --cached --quiet; then
-            git -C "$DATA_DIR" commit -m 'Capture immutable FPL deadline snapshot'
-            git -C "$DATA_DIR" push origin HEAD:fpl-snapshots
-          else
-            echo 'Snapshot branch already contains all captured data.'
-          fi
+          python fpl_snapshot_publisher.py \
+            --source "$SOURCE" \
+            --repository "$DATA_DIR" \
+            --remote origin \
+            --branch fpl-snapshots \
+            --push
+
+      - name: Prepare sanitized snapshot failure diagnostic
+        id: snapshot-failure-diagnostic
+        if: always() && (steps.snapshot-run.outcome == 'failure' || steps.snapshot-publish.outcome == 'failure')
+        env:
+          CAPTURE_OUTCOME: ${{ steps.snapshot-run.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.snapshot-publish.outcome }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RECOVERY_DIR="$RUNNER_TEMP/fpl-safe-recovery"
+          mkdir -p "$RECOVERY_DIR"
+          {
+            printf 'diagnostic_type=snapshot_failure\n'
+            printf 'run_id=%s\n' "$RUN_ID"
+            printf 'run_attempt=%s\n' "$RUN_ATTEMPT"
+            printf 'capture_outcome=%s\n' "$CAPTURE_OUTCOME"
+            printf 'publish_outcome=%s\n' "$PUBLISH_OUTCOME"
+          } > "$RECOVERY_DIR/diagnostic.txt"
+
+      - name: Upload sanitized snapshot failure diagnostic
+        if: always() && (steps.snapshot-run.outcome == 'failure' || steps.snapshot-publish.outcome == 'failure')
+        uses: actions/upload-artifact@v4
+        with:
+          name: fpl-snapshot-failure-diagnostic
+          path: ${{ runner.temp }}/fpl-safe-recovery/diagnostic.txt
+          if-no-files-found: error
+          retention-days: 3
+        continue-on-error: true
 
       - name: Persist log updates
         env:

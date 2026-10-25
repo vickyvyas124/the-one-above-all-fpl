@@ -80,6 +80,59 @@ def get_json_with_record(path: str, attempts: int = 3):
     )
 
 
+PUBLIC_PICK_FIELDS = ("element", "position", "multiplier", "is_captain", "is_vice_captain")
+
+
+def sanitized_public_picks_record(payload, record, *, gameweek: int):
+    """Build a persistence record from only decision-replay fields.
+
+    The entry identifier is deliberately redacted from the stored provenance URL,
+    and fetch errors are replaced with a fixed message so request exceptions or
+    response bodies cannot leak personal data into a manifest.
+    """
+    metadata = (record or {}).get("metadata") or {}
+    safe_url = f"{BASE}/entry/[redacted]/event/{int(gameweek)}/picks/"
+    fetched_at = metadata.get("fetched_at_utc") or datetime.now(timezone.utc)
+    status_code = metadata.get("http_status")
+
+    sanitized = None
+    error = "Public picks response unavailable or did not match the expected schema."
+    if isinstance(payload, dict) and isinstance(payload.get("picks"), list):
+        rows = []
+        try:
+            for pick in payload["picks"]:
+                if not isinstance(pick, dict):
+                    raise ValueError("pick must be an object")
+                row = {}
+                for field in PUBLIC_PICK_FIELDS:
+                    value = pick.get(field)
+                    if field in {"is_captain", "is_vice_captain"}:
+                        if type(value) is not bool:
+                            raise ValueError("captain flags must be booleans")
+                    elif type(value) is not int:
+                        raise ValueError("pick identifiers and multipliers must be integers")
+                    row[field] = value
+                if row["element"] < 1 or not 1 <= row["position"] <= 15 or not 0 <= row["multiplier"] <= 3:
+                    raise ValueError("pick field is outside its allowed range")
+                rows.append(row)
+            sanitized = {"event": int(gameweek), "picks": rows}
+        except (TypeError, ValueError):
+            sanitized = None
+
+    if sanitized is None:
+        return fpl_snapshot_store.payload_record(
+            body=None, url=safe_url, status_code=status_code,
+            fetched_at_utc=fetched_at, error=error,
+        )
+
+    body = json.dumps(
+        sanitized, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return fpl_snapshot_store.payload_record(
+        body=body, url=safe_url, status_code=status_code, fetched_at_utc=fetched_at,
+    )
+
+
 def fetch_history_capture(player_ids, cutoff_utc=None):
     """Fetch exact element-summary bodies, summaries and per-player statuses."""
     signals, failures, records = {}, {}, {}
@@ -417,9 +470,9 @@ def main() -> int:
                 picks_payload, picks_record = get_json_with_record(
                     f"entry/{team_id}/event/{gameweek}/picks/", attempts=1
                 )
-                source_records["public-picks"] = picks_record
-                _, entry_record = get_json_with_record(f"entry/{team_id}/", attempts=1)
-                source_records["public-entry"] = entry_record
+                source_records["public-picks"] = sanitized_public_picks_record(
+                    picks_payload, picks_record, gameweek=gameweek
+                )
                 max_gw = max(event_by_id) if event_by_id else gameweek
                 horizon_len = max(1, min(gameweek + 4, max_gw) - gameweek + 1)
                 artifact_valid = fpl_learning.validate_model(fpl_engine.TRAINED_MODEL)
@@ -480,8 +533,9 @@ def main() -> int:
                         forecast_rows=forecast_rows,
                         provenance={"deadline": "derived",
                                     "fixture_schedule": "captured",
-                                    **({"public_picks": "captured"} if picks_payload is not None else {}),
-                                    **({"public_entry": "captured"} if entry_record.get("metadata", {}).get("fetch_outcome") == "success" else {})},
+                                    **({"public_picks": "captured"}
+                                       if source_records["public-picks"]["metadata"].get("fetch_outcome") == "success"
+                                       else {})},
                     )
                     if created_snapshot:
                         print(f"Captured immutable {window_label} context snapshot for {season} GW{gameweek}: {len(history_records) - len(history_failures)}/{len(players)} histories available; model={'valid' if model_valid else 'unavailable'}.")

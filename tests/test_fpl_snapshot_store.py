@@ -210,7 +210,8 @@ class SnapshotStoreTests(unittest.TestCase):
         backtest_workflow = (root / ".github/workflows/fpl-historical-backtest.yml").read_text()
         self.assertIn("if: github.ref == 'refs/heads/main'", worker_workflow)
         self.assertIn("Persist new snapshots to dedicated branch", worker_workflow)
-        self.assertIn("HEAD:fpl-snapshots", worker_workflow)
+        self.assertIn("--branch fpl-snapshots", worker_workflow)
+        self.assertIn("--push", worker_workflow)
         self.assertIn("steps.snapshot-run.outputs.changed == 'true'", worker_workflow)
         self.assertIn("if: github.ref == 'refs/heads/main'", backtest_workflow)
 
