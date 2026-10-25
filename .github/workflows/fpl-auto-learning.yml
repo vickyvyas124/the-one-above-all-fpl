@@ -127,28 +127,19 @@ jobs:
           SOURCE="$RUNNER_TEMP/fpl-snapshots"
           DATA_DIR="$RUNNER_TEMP/fpl-snapshot-branch"
           if git ls-remote --exit-code --heads "$REMOTE_URL" fpl-snapshots >/dev/null 2>&1; then
-            git clone --depth 1 --filter=blob:none --no-checkout --single-branch \
-              --branch fpl-snapshots "$REMOTE_URL" "$DATA_DIR"
+            git clone --depth 1 --filter=blob:none --no-checkout --single-branch --branch fpl-snapshots "$REMOTE_URL" "$DATA_DIR"
             git -C "$DATA_DIR" read-tree HEAD
           else
             mkdir -p "$DATA_DIR"
             git -C "$DATA_DIR" init -b fpl-snapshots
             git -C "$DATA_DIR" remote add origin "$REMOTE_URL"
           fi
-          cp -a "$SOURCE/." "$DATA_DIR/"
-          git -C "$DATA_DIR" config user.name 'github-actions[bot]'
-          git -C "$DATA_DIR" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          for item in "$SOURCE"/*; do
-            [[ -e "$item" ]] || continue
-            git -C "$DATA_DIR" add -- "${item#"$SOURCE"/}"
-          done
-          if ! git -C "$DATA_DIR" diff --cached --quiet; then
-            git -C "$DATA_DIR" commit -m 'Capture immutable FPL deadline snapshot'
-            git -C "$DATA_DIR" push origin HEAD:fpl-snapshots
-          else
-            echo 'Snapshot branch already contains all captured data.'
-          fi
-
+          python fpl_snapshot_publisher.py \
+            --source "$SOURCE" \
+            --repository "$DATA_DIR" \
+            --remote origin \
+            --branch fpl-snapshots \
+            --push
       - name: Persist log updates
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
