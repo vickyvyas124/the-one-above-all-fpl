@@ -180,6 +180,12 @@ class DashboardNavigationAppTests(unittest.TestCase):
                 [tab.label for tab in app.tabs],
                 ["Decide", "Squad", "Fixtures", "Model"],
             )
+            status_strip = next(
+                element.value
+                for element in app.markdown
+                if "class='status-strip'" in str(element.value)
+            )
+            self.assertIn("<strong>Free transfers</strong> 1 · history-derived", status_strip)
 
             decide_tab = app.tabs[0]
             verdict_markdown = next(

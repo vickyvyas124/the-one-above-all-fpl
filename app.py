@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import fpl_engine
 import fpl_learning
+from fpl_ui_labels import status_chip_labels
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -544,12 +545,15 @@ with st.sidebar:
     sync_mode = st.selectbox("Budget & transfer source", ["Auto-sync from FPL history", "Manual override"], index=0,
                              help="Bank comes from the latest public deadline record plus visible current-Gameweek transfers. Free transfers are reconstructed from historical transfers, hit costs and chips; override if the FPL page differs.")
     auto_controls = sync_mode == "Auto-sync from FPL history"
+    _bank_state, _ft_state = status_chip_labels(
+        auto_controls, latest_bank_known, auto_ft_confident
+    )
     if auto_controls:
         st.metric("Bank available", f"£{auto_bank:.1f}m")
         st.metric("Estimated free transfers", str(auto_ft))
         bank_m = auto_bank
         free_transfers = auto_ft
-        st.caption(f"Auto-sync · GW{control_gw} · Bank {'synced' if latest_bank_known else 'fallback estimate'} · Free transfers {'history-derived' if auto_ft_confident else 'estimated'}.")
+        st.caption(f"Auto-sync · GW{control_gw} · Bank {_bank_state} · Free transfers {_ft_state}.")
         st.caption(auto_ft_note)
     else:
         bank_m = st.number_input("Bank (£m)", min_value=0.0, max_value=20.0, value=round(auto_bank, 1), step=0.1, key="manual_bank_override",
@@ -929,8 +933,6 @@ else:
 
 _model_status = "Trained" if fpl_learning.validate_model(fpl_engine.TRAINED_MODEL) else "Fallback"
 _squad_source_status = f"Public picks · GW{gw}" if picks_sync_ok else "Saved baseline"
-_bank_state = "manual" if not auto_controls else ("synced" if latest_bank_known else "estimated")
-_ft_state = "manual" if not auto_controls else "estimated"
 st.markdown(
     "<div class='decision-header'>"
     f"<div class='decision-brand'>⚽ The-One-Above-All · GW{int(gw)}</div>"
