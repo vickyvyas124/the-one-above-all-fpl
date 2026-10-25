@@ -16,6 +16,14 @@ import fpl_snapshot_store
 
 
 class BackgroundWorkerArtifactTests(unittest.TestCase):
+    def setUp(self):
+        # Worker tests use mocked API payloads and temporary snapshot stores.
+        # Do not let GitHub runner environment variables enable remote reads
+        # or persistent-workflow behavior during this isolated unit suite.
+        self._github_actions = patch.dict(os.environ, {"GITHUB_ACTIONS": "false"})
+        self._github_actions.start()
+        self.addCleanup(self._github_actions.stop)
+
     def test_invalid_picks_failure_metadata_discards_raw_response_and_entry_id(self):
         raw_secret = b'{"manager":"PRIVATE_MANAGER_NAME"}'
         raw_record = fpl_snapshot_store.payload_record(

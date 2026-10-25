@@ -15,6 +15,14 @@ import fpl_snapshot_store
 class SnapshotPublisherIntegrationTests(unittest.TestCase):
 
     def setUp(self):
+        # GitHub pull-request runners set GITHUB_ACTIONS=true and use a
+        # refs/pull/.../merge ref. These tests publish only to temporary local
+        # bare repositories, so model the production main ref by default.
+        # The dedicated off-main guard test below overrides this explicitly.
+        self._github_ref = patch.dict(os.environ, {"GITHUB_REF": "refs/heads/main"})
+        self._github_ref.start()
+        self.addCleanup(self._github_ref.stop)
+
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.bare = self.root / "remote.git"
