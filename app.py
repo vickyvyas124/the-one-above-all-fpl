@@ -8,8 +8,10 @@ import os
 from pathlib import Path
 import fpl_engine
 import fpl_learning
+from fpl_ui_labels import status_chip_labels
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="The-One-Above-All | FPL Manager Hub", layout="wide")
 APP_VERSION = "3.0"
@@ -352,13 +354,33 @@ st.markdown("""
 [data-testid="stSidebar"] [data-testid="stSlider"] [data-testid="stMarkdownContainer"] p {color:#f6f3fa !important;}
 [data-testid="stSidebar"] [data-testid="stCheckbox"] label,
 [data-testid="stSidebar"] [data-testid="stCheckbox"] p {color:#f6f3fa !important;}
-.hero {padding:1.4rem 1.6rem;border-radius:20px;background:linear-gradient(115deg,#210026 0%,#37003c 48%,#563b83 100%);color:#fff;margin-bottom:1.1rem;box-shadow:0 12px 32px rgba(55,0,60,.16);position:relative;overflow:hidden;}
-.hero:after {content:"";position:absolute;width:260px;height:260px;border-radius:50%;right:-65px;top:-130px;background:rgba(0,255,135,.12);}
-.hero-top {display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;}
-.hero h1 {color:#fff;margin:0;font-size:clamp(1.55rem,3vw,2.3rem);font-weight:850;letter-spacing:-.04em;}
-.hero p {color:#e8dced;margin:.4rem 0 0 0;font-size:.95rem;}
-.gw-chip {display:inline-block;background:#00ff87;color:#210026;padding:.42rem .8rem;border-radius:999px;font-weight:800;font-size:.86rem;}
-.kicker {font-size:.75rem;text-transform:uppercase;letter-spacing:.11em;color:#d7c9df;font-weight:700;margin-bottom:.2rem;}
+.decision-header {display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;background:linear-gradient(110deg,#210026 0%,#37003c 58%,#563b83 100%);color:#fff;padding:.78rem 1rem;border-radius:14px;margin:1.8rem 0 .55rem;box-shadow:0 4px 16px rgba(55,0,60,.12);}
+.decision-brand {font-weight:850;font-size:1.08rem;letter-spacing:-.025em;white-space:nowrap;}
+.decision-deadlines {display:flex;align-items:center;justify-content:flex-end;gap:.45rem;flex-wrap:wrap;}
+.deadline-chip {background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.18);border-radius:9px;padding:.35rem .55rem;line-height:1.2;}
+.deadline-chip span {display:block;color:#e8dced;font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;}
+.deadline-chip strong {display:block;color:#fff;font-size:.82rem;font-variant-numeric:tabular-nums;}
+.deadline-chip.countdown {background:#00ff87;border-color:#00ff87;}
+.deadline-chip.countdown span,.deadline-chip.countdown strong {color:#210026;}
+.status-strip {display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;margin:0 0 .25rem;}
+.status-chip {display:inline-flex;align-items:center;gap:.28rem;border:1px solid #e6deeb;background:#faf7fb;color:#4b4050;padding:.3rem .55rem;border-radius:999px;font-size:.75rem;line-height:1.2;}
+.status-chip strong {color:#37003c;font-weight:800;}
+.verdict-card {border:1px solid #e4dce9;border-left:5px solid #00b86b;background:linear-gradient(110deg,#fff 0%,#faf7fb 100%);border-radius:15px;padding:1rem 1.1rem;margin:.2rem 0 .8rem;box-shadow:0 5px 18px rgba(55,0,60,.06);}
+.verdict-topline {display:flex;align-items:center;gap:.55rem;flex-wrap:wrap;margin-bottom:.35rem;}
+.verdict-label {font-size:.7rem;color:#706179;text-transform:uppercase;letter-spacing:.09em;font-weight:800;}
+.verdict-value {font-size:1.42rem;line-height:1.15;color:#37003c;font-weight:900;letter-spacing:-.035em;}
+.provisional-badge {display:inline-block;background:#fff1d6;color:#704400;border:1px solid #ebcb8d;padding:.2rem .5rem;border-radius:999px;font-size:.67rem;font-weight:850;text-transform:uppercase;letter-spacing:.04em;}
+.decision-card-grid {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.65rem;margin:.2rem 0 .8rem;}
+.decision-summary-card {background:#fff;border:1px solid #ebe5ef;border-radius:13px;padding:.75rem .82rem;min-width:0;box-shadow:0 3px 12px rgba(55,0,60,.035);}
+.decision-summary-card .card-label {color:#706179;text-transform:uppercase;letter-spacing:.07em;font-size:.65rem;font-weight:850;margin-bottom:.25rem;}
+.decision-summary-card .card-value {color:#37003c;font-size:.98rem;line-height:1.25;font-weight:850;overflow-wrap:anywhere;}
+.decision-summary-card .card-detail {color:#6b6473;font-size:.74rem;line-height:1.35;margin-top:.25rem;}
+.checklist-grid {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.1rem .8rem;margin:-.1rem 0 .5rem;}
+[data-testid="stSidebar"] [data-testid="stMetric"] {background:#fff;border:1px solid #e8dfee;border-radius:12px;}
+[data-testid="stSidebar"] [data-testid="stMetricLabel"] {color:#51475a !important;}
+[data-testid="stSidebar"] [data-testid="stMetricValue"] {color:#37003c !important;}
+[data-testid="stSidebar"] [data-testid="stMetricLabel"] [data-testid="stMarkdownContainer"] p {color:#51475a !important;}
+[data-testid="stSidebar"] [data-testid="stMetricValue"] [data-testid="stMarkdownContainer"] p {color:#37003c !important;}
 div[data-testid="stMetric"] {padding:.85rem 1rem;border:1px solid #ebe7ef;border-radius:15px;background:linear-gradient(180deg,#fff,#fbf9fc);box-shadow:0 4px 14px rgba(33,0,38,.05);}
 div[data-testid="stMetricLabel"] {color:#686173;font-weight:650;}
 div[data-testid="stMetricValue"] {color:#37003c;font-weight:850;}
@@ -384,7 +406,16 @@ h2,h3 {letter-spacing:-.025em;}
 .section-intro {color:#777083;font-size:.92rem;margin-top:-.4rem;margin-bottom:.7rem;}
 @media (max-width:650px) {
  .block-container {padding-left:.65rem;padding-right:.65rem;}
- .hero {padding:1.05rem;border-radius:15px;}
+ .decision-header {align-items:flex-start;padding:.7rem .75rem;}
+ .decision-brand {font-size:.98rem;}
+ .decision-deadlines {justify-content:flex-start;width:100%;}
+ .deadline-chip {padding:.3rem .42rem;}
+ .deadline-chip strong {font-size:.72rem;}
+ .status-chip {font-size:.68rem;padding:.28rem .45rem;}
+ .verdict-card {padding:.82rem .88rem;}
+ .verdict-value {font-size:1.22rem;}
+ .decision-card-grid {grid-template-columns:1fr;gap:.45rem;}
+ .decision-summary-card {padding:.62rem .7rem;}
  .pitch-wrap {padding:10px 5px;}
  .pitch-row {gap:4px;margin:10px auto;}
  .player-tile {width:22%;border-radius:8px;}
@@ -451,22 +482,7 @@ h2,h3 {letter-spacing:-.025em;}
 .chip-score {font-size:1.25rem;font-weight:900;color:#37003c;}
 div[data-testid="stHorizontalBlock"] .manager-panel {height:100%;}
 </style>
-<div class="hero">
-  <div class="hero-top">
-    <div>
-      <div class="kicker">Fantasy Premier League · Manager dashboard</div>
-      <h1>⚽ The-One-Above-All</h1>
-      <p>Squad hub · Transfer intelligence · Five-Gameweek planning</p>
-    </div>
-    <div class="gw-chip">NEXT GAMEWEEK · AUTO DATA</div>
-  </div>
-</div>
 """, unsafe_allow_html=True)
-st.info("Decision rule: HOLD unless a transfer clears the points-gain and reliability gates. Public FPL bank/free-transfer sync is estimated; verify it against your Transfers page before acting. This dashboard never submits transfers automatically.")
-if fpl_engine.TRAINED_MODEL:
-    st.success(f"Prediction engine v{APP_VERSION}: historical model loaded ({fpl_engine.TRAINED_MODEL.get('training_rows', 0):,} player-Gameweek training rows; seasons {', '.join(fpl_engine.TRAINED_MODEL.get('source_seasons', []))}).")
-else:
-    st.warning("Prediction engine v3.0: trained historical model not published/loaded yet; projections are using the fallback formula. Run Historical FPL Backtest successfully to train and publish trained_fpl_model.json.")
 
 with st.sidebar:
     st.header("⚙️ Optimizer settings")
@@ -529,12 +545,15 @@ with st.sidebar:
     sync_mode = st.selectbox("Budget & transfer source", ["Auto-sync from FPL history", "Manual override"], index=0,
                              help="Bank comes from the latest public deadline record plus visible current-Gameweek transfers. Free transfers are reconstructed from historical transfers, hit costs and chips; override if the FPL page differs.")
     auto_controls = sync_mode == "Auto-sync from FPL history"
+    _bank_state, _ft_state = status_chip_labels(
+        auto_controls, latest_bank_known, auto_ft_confident
+    )
     if auto_controls:
         st.metric("Bank available", f"£{auto_bank:.1f}m")
         st.metric("Estimated free transfers", str(auto_ft))
         bank_m = auto_bank
         free_transfers = auto_ft
-        st.caption(f"Auto-sync · GW{control_gw} · Bank {'synced' if latest_bank_known else 'fallback estimate'} · Free transfers {'history-derived' if auto_ft_confident else 'estimated'}.")
+        st.caption(f"Auto-sync · GW{control_gw} · Bank {_bank_state} · Free transfers {_ft_state}.")
         st.caption(auto_ft_note)
     else:
         bank_m = st.number_input("Bank (£m)", min_value=0.0, max_value=20.0, value=round(auto_bank, 1), step=0.1, key="manual_bank_override",
@@ -891,6 +910,58 @@ if len(resolved) == 15:
     if _best_preview:
         model_xi_start_ids = {int(_x["id"]) for _x in _best_preview}
 
+def _deadline_text(deadline, zone_name, zone_label):
+    if deadline is None:
+        return "Not announced"
+    try:
+        localized = deadline.astimezone(ZoneInfo(zone_name))
+        return f"{localized:%a %d %b · %H:%M} {zone_label}"
+    except (OverflowError, ValueError):
+        return "Unavailable"
+
+
+if deadline_dt is None:
+    deadline_countdown = "Not announced"
+else:
+    _countdown_delta = deadline_dt - datetime.now(timezone.utc)
+    if _countdown_delta.total_seconds() <= 0:
+        deadline_countdown = "Deadline passed"
+    else:
+        _countdown_days, _countdown_remainder = divmod(int(_countdown_delta.total_seconds()), 86400)
+        _countdown_hours, _countdown_remainder = divmod(_countdown_remainder, 3600)
+        deadline_countdown = f"{_countdown_days}d {_countdown_hours}h {_countdown_remainder // 60}m"
+
+_model_status = "Trained" if fpl_learning.validate_model(fpl_engine.TRAINED_MODEL) else "Fallback"
+_squad_source_status = f"Public picks · GW{gw}" if picks_sync_ok else "Saved baseline"
+st.markdown(
+    "<div class='decision-header'>"
+    f"<div class='decision-brand'>⚽ The-One-Above-All · GW{int(gw)}</div>"
+    "<div class='decision-deadlines'>"
+    f"<div class='deadline-chip'><span>Deadline · UK</span><strong>{html.escape(_deadline_text(deadline_dt, 'Europe/London', 'UK'))}</strong></div>"
+    f"<div class='deadline-chip'><span>Deadline · IST</span><strong>{html.escape(_deadline_text(deadline_dt, 'Asia/Kolkata', 'IST'))}</strong></div>"
+    f"<div class='deadline-chip countdown'><span>Time remaining</span><strong>{html.escape(deadline_countdown)}</strong></div>"
+    "</div></div>"
+    "<div class='status-strip'>"
+    f"<span class='status-chip'><strong>Model</strong> {html.escape(_model_status)}</span>"
+    f"<span class='status-chip'><strong>Squad</strong> {html.escape(_squad_source_status)}</span>"
+    f"<span class='status-chip'><strong>Bank</strong> £{bank_m:.1f}m · {html.escape(_bank_state)}</span>"
+    f"<span class='status-chip'><strong>Free transfers</strong> {int(free_transfers)} · {html.escape(_ft_state)}</span>"
+    "</div>",
+    unsafe_allow_html=True,
+)
+
+with st.expander("How decisions are made", expanded=False):
+    st.markdown("**Decision rule:** HOLD unless a transfer clears the existing points-gain and reliability gates. Check the official FPL bank and selling price before acting. This dashboard never submits transfers automatically.")
+    st.write("The engine can recommend HOLD. A transfer candidate must clear the existing estimated multi-Gameweek points edge, incoming minutes and availability checks, squad matching, and any points-hit justification.")
+    st.markdown("""
+    - Blends PPG/form with xG+xA, shrinks small samples toward a position baseline, estimates minutes from starts and appearances, and adjusts scheduled fixtures individually.
+    - Uses public player status and chance-of-playing fields where available.
+    - Does not access your FPL password, private `my-team` endpoint, or personal selling prices.
+    - Model weights remain heuristic and are evaluated against historical and live validation metrics.
+    - Public FPL data is unofficial and may change. Refresh requests use the existing cache and refresh controls.
+    - Public squad picks may not expose the latest editable team before the deadline; the saved baseline is shown when picks are unavailable.
+    """)
+
 decide_tab, squad_tab, fixtures_tab, model_tab = st.tabs(["Decide", "Squad", "Fixtures", "Model"])
 
 with squad_tab:
@@ -966,7 +1037,12 @@ with squad_tab:
         )
 
     with pitch_col:
-        st.markdown("<div class='gw-heading'><div><div class='gw-title'>Gameweek "+str(latest_history.get("event", gw))+"</div><div class='gw-sub'>Latest recorded Gameweek · starting XI and substitutes</div></div><span class='gw-chip'>NEXT · GW"+str(gw)+"</span></div>", unsafe_allow_html=True)
+        _latest_gw_label = latest_history.get("event", "—") if latest_history else "—"
+        _lineup_source_label = "public picks" if picks_sync_ok and public_picks_for_display else "saved baseline"
+        st.markdown(f"**Latest GW result · GW{_latest_gw_label}**")
+        st.caption("Latest recorded points and rank from the public manager history.")
+        st.markdown(f"**Next GW · GW{int(gw)}**")
+        st.caption(f"Lineup source: {_lineup_source_label}. Pitch numbers are projections for the selected horizon.")
         if unmatched:
             st.warning("Names not uniquely matched to public data (review manually): " + ", ".join(unmatched))
         if resolved:
@@ -1010,7 +1086,7 @@ with squad_tab:
                          f"<text x='32' y='39' text-anchor='middle' font-size='12' font-weight='900' fill='#ffffff'> {esc(club[:3])} </text></svg>")
                 return (f"<div class='player-tile'><div class='tile-top'>{esc(short)}</div>"
                         f"<div class='tile-avatar'>{shirt}</div><div class='tile-meta'>{esc(club)} · £{float(r['Price (£m)']):.1f}m<br>"
-                        f"<span class='tile-pts'>{float(pts):.1f} pts</span></div></div>")
+                         f"<span class='tile-pts'>{float(pts):.1f} proj.</span></div></div>")
             if picks_sync_ok and public_picks_for_display:
                 # Use actual public pick positions and player roles to render the current squad.
                 picks_by_id = {int(p.get("id")): p for p in players}
@@ -1063,7 +1139,7 @@ with squad_tab:
                 pitch_html += f"<div class='pitch-title'>{label}</div><div class='pitch-row'>"
                 pitch_html += "".join(tile(name) for name in names)
                 pitch_html += "</div>"
-            pitch_html += "<div class='pitch-caption'>Projected points are model estimates over your selected horizon — not Gameweek scores.</div></div>"
+            pitch_html += "<div class='pitch-caption'>Projected points over your selected horizon — not Gameweek scores.</div></div>"
             st.markdown(pitch_html, unsafe_allow_html=True)
             st.markdown("#### Bench")
             bench_parts=[]
@@ -1892,9 +1968,6 @@ with model_tab:
     st.caption("Validation note: v3.0 weights are frozen during the test. All-player MAE, played-only MAE, expected-minutes error, EP-next benchmark error, Spearman correlation, top-10/top-20 capture, captain regret where a pre-deadline XI was logged, and five-Gameweek error are reported separately. Historical proxy results are kept separate from live pre-deadline validation.")
 
 with decide_tab:
-    st.subheader("Automatic transfer recommendations")
-    st.caption(f"Team ID: {int(team_id)} • The optimizer scans every matched squad player and searches for legal, affordable replacements. Budget source: {'public FPL sync' if auto_controls else 'manual override'}.")
-    st.write("This engine is allowed to recommend HOLD. It only labels a transfer actionable when the estimated multi-Gameweek points edge clears a conservative threshold, incoming minutes/availability are reliable, the squad is fully matched, and a points hit is justified. It never submits transfers automatically.")
     if resolved:
         df = pd.DataFrame(resolved)
         candidates = pd.DataFrame([{
@@ -2028,9 +2101,6 @@ with decide_tab:
                     "Verdict": verdict,
                 })
 
-        if unmatched:
-            st.warning("Automatic recommendations are provisional because some seeded squad names did not match public FPL records: " + ", ".join(unmatched) + ". Club limits and squad context may be incomplete until every player is matched.")
-
         hours_to_deadline_now = None
         try:
             if deadline_dt is not None:
@@ -2038,6 +2108,12 @@ with decide_tab:
         except Exception:
             hours_to_deadline_now = None
 
+        decision_label = "VERIFY DATA"
+        reason_line = "No recommendation is available until a legal, affordable candidate can be assessed."
+        candidate_summary = "Not available"
+        gain = None
+        threshold = None
+        best_each = pd.DataFrame()
         if auto_rows:
             auto_df = pd.DataFrame(auto_rows)
             # Show the highest-scoring legal swap for each player we could sell.
@@ -2045,128 +2121,162 @@ with decide_tab:
                          .drop_duplicates(subset=["Sell"], keep="first")
                          .sort_values(["Actionable", "Decision score", "Projected gain"], ascending=False)
                          .head(10))
-            st.caption(f"Risk mode: {risk} • Horizon: {horizon} GWs • Transfer hit applied: {hit_cost_auto} points. Budget uses the synced bank and estimated personal sell price; verify exact FPL values before acting.")
-            st.dataframe(best_each[["Sell","Sell club","Buy","Buy club","Position","Buy price (£m)","Budget ceiling (£m)","Club count after transfer","Outgoing projected pts","Incoming projected pts","Projected gain","Minimum gain to act","Minutes reliability (%)","Availability reliability (%)","Captaincy exposure","Actionable","Ownership (%)","Decision score","Verdict"]], use_container_width=True, hide_index=True)
             top = best_each.iloc[0]
             gain = float(top["Projected gain"])
             threshold = float(top["Minimum gain to act"])
             reliable = float(top["Minutes reliability (%)"]) >= 70 and float(top["Availability reliability (%)"]) >= 80
             candidate_is_robust = bool(top.get("Actionable", False)) and gain >= threshold and reliable and not unmatched
+            candidate_summary = f"{top['Sell']} → {top['Buy']} · {top['Buy club']}"
             if unmatched:
-                st.warning("Decision: HOLD / verify squad. At least one squad member is unmatched, so the optimizer cannot safely assess the legal squad or club limit.")
-                st.markdown(f"**Best candidate for review:** {top['Sell']} → {top['Buy']} · estimated {gain:+.1f} points over {horizon} Gameweeks. This is not an action recommendation until all 15 players match.")
+                decision_label = "VERIFY DATA"
+                reason_line = "At least one squad member is unmatched, so the legal squad and club limits cannot be safely assessed."
             elif free_transfers == 0 and not transfer_hit:
-                st.info(f"**Decision: HOLD — no transfer justified without a points hit.** Best candidate is {top['Sell']} → {top['Buy']} at {gain:+.1f} projected points after accounting for the -4 hit. Taking that hit is disabled, so the model will not recommend taking one.")
+                decision_label = "HOLD"
+                reason_line = f"No transfer is justified without a points hit. The -4 hit is disabled; best candidate: {candidate_summary}."
             elif candidate_is_robust and (free_transfers > 0 or (transfer_hit and gain >= threshold)) and hours_to_deadline_now is not None and hours_to_deadline_now > 24 and not bool(top.get("Outgoing unavailable", False)):
-                st.info(f"**Decision: HOLD FOR NOW — candidate to monitor:** {top['Sell']} → {top['Buy']} ({top['Buy club']}) · estimated net gain {gain:+.1f} over {horizon} Gameweeks. It clears the points/reliability gate, but the deadline is still more than 24 hours away.")
-                st.markdown("**Suggested timing:** Re-check within 24 hours of the deadline, then again after the latest team news. Only act if the move still clears the threshold and the official FPL selling price/bank confirm it is affordable. A projection is not a guarantee.")
+                decision_label = "HOLD FOR NOW"
+                reason_line = "It clears the points/reliability gate, but the deadline is still more than 24 hours away. Recheck inside 24 hours and after team news."
             elif candidate_is_robust and (free_transfers > 0 or (transfer_hit and gain >= threshold)) and hours_to_deadline_now is not None and hours_to_deadline_now > 0:
-                st.success(f"**Decision: TRANSFER CANDIDATE — final review window** · {top['Sell']} → {top['Buy']} ({top['Buy club']}) · estimated net gain {gain:+.1f} points over {horizon} Gameweeks. It clears the {threshold:.1f}-point action threshold and the candidate's reliability checks.")
-                st.markdown("**Before acting:** Check press-conference/injury news and verify the real selling price/bank in FPL. If new information drops the gain below the threshold or minutes/availability confidence, switch back to HOLD.")
+                decision_label = "TRANSFER"
+                reason_line = f"Clears the {threshold:.1f}-point action threshold and candidate reliability checks. Verify team news and official selling price/bank."
             else:
                 reason = []
                 if gain < threshold: reason.append(f"projected edge {gain:+.1f} is below the {threshold:.1f}-point action threshold")
                 if not reliable: reason.append("incoming minutes/availability are not reliable enough")
                 if free_transfers == 0 and transfer_hit and gain < threshold: reason.append("the gain does not repay the hit with enough margin")
-                st.info("**Decision: HOLD — no transfer clears the decision gate.** " + ("; ".join(reason) if reason else "The model cannot establish a sufficiently robust advantage."))
-                st.markdown(f"Best candidate to monitor: **{top['Sell']} → {top['Buy']}**, estimated {gain:+.1f} points over {horizon} Gameweeks. Reassess after team news or if the player’s status changes; an unused free transfer can roll over up to the rules limit.")
+                decision_label = "HOLD"
+                reason_line = "; ".join(reason) if reason else "The model cannot establish a sufficiently robust advantage."
         else:
-            st.info("No legal, affordable one-for-one transfers were found. Check the matched squad, budget and club-count warnings.")
-            st.markdown("**Quick summary:** No transfer recommendation can be made until the squad and affordability data are resolved.")
+            reason_line = "No legal, affordable one-for-one transfers were found. Check squad matching, budget, and club-count warnings."
 
-        st.divider()
-        st.subheader("Manual transfer comparison (optional)")
-        st.write("Use this section only to investigate a specific player-out choice; the optimizer above scans your squad automatically.")
-
-        # Current squad selector
-        squad_names = sorted(df["Player"].unique().tolist())
-        sell_name = st.selectbox("Sell player", squad_names, index=(squad_names.index("Schade") if "Schade" in squad_names else 0))
-        sell = df[df["Player"]==sell_name].iloc[0]
-        max_price = float(sell.get("Sell price (£m)", sell["Price (£m)"])) + bank_m
-        options = candidates[(candidates["Position"]==sell["Position"]) &
-                             (~candidates["Player"].isin(squad_names)) &
-                             (candidates["Price (£m)"] <= max_price)].copy()
-
-        # Enforce the official maximum of three players from any one club.
-        # If selling from the candidate's club, the outgoing player frees a slot there.
-        club_counts = df["Club"].value_counts().to_dict()
-        options["Current club count"] = options["Club"].map(club_counts).fillna(0).astype(int)
-        same_club_as_sold = options["Club"].eq(sell["Club"])
-        options["Club count after transfer"] = (
-            options["Current club count"] + 1 - same_club_as_sold.astype(int)
+        _provisional = _model_status == "Fallback" or bool(unmatched) or (auto_controls and not latest_bank_known)
+        _provisional_badge = '<span class="provisional-badge">Provisional</span>' if _provisional else ""
+        _candidate_safe = html.escape(candidate_summary)
+        _gain_detail = f"Projected gain {gain:+.1f} points · needed {threshold:.1f}" if gain is not None else "Projected gain · not available"
+        st.markdown(
+            "<div class='verdict-card'><div class='verdict-topline'>"
+            f"<span class='verdict-label'>Recommended action</span><span class='verdict-value'>{html.escape(decision_label)}</span>"
+            f"{_provisional_badge}</div>"
+            f"<div class='verdict-candidate'>{_candidate_safe}</div>"
+            f"<div class='verdict-gain'>{html.escape(_gain_detail)}</div>"
+            f"<div class='verdict-reason'>{html.escape(reason_line)}</div></div>", unsafe_allow_html=True,
         )
-        options = options[options["Club count after transfer"] <= 3].copy()
 
-        st.caption("Three-per-club rule is enforced in the shortlist. Current matched squad counts: " +
-                   ", ".join(f"{club}: {count}" for club, count in sorted(club_counts.items())))
-        if unmatched:
-            st.warning("Some recorded squad names did not match public data; club counts may be incomplete until those aliases are corrected.")
+        _captain_name = str(captain_pick.get("Player", "Not available")) if captain_pick is not None else "Not available"
+        _vice_name = str(vice_pick.get("Player", "Not available")) if vice_pick is not None else "Not available"
+        _captain_pts = captain_pick.get("GW projected pts") if captain_pick is not None else None
+        _vice_pts = vice_pick.get("GW projected pts") if vice_pick is not None else None
+        _captain_detail = f"{float(_captain_pts):.1f} projected points" if _captain_pts is not None else "Not available"
+        _vice_detail = f"{float(_vice_pts):.1f} projected points" if _vice_pts is not None else "Not available"
+        _chip_choices = [card for card in chip_cards if card[1] == "Available"]
+        _chip_choice = next((card for card in _chip_choices if card[3] in {"Consider this GW", "Potential use this GW"}), _chip_choices[0] if _chip_choices else None)
+        _chip_name, _chip_action, _chip_detail = ("Not available", "Not available", "No chip recommendation is available.") if _chip_choice is None else (_chip_choice[0], _chip_choice[3], _chip_choice[4])
+        st.markdown(
+            "<div class='decision-card-grid'>"
+            f"<div class='decision-summary-card'><div class='card-label'>Transfer</div><div class='card-value'>{_candidate_safe}</div><div class='card-detail'>{html.escape(_gain_detail)}</div></div>"
+            f"<div class='decision-summary-card'><div class='card-label'>Captain and vice-captain</div><div class='card-value'>C: {html.escape(_captain_name)} · VC: {html.escape(_vice_name)}</div><div class='card-detail'>{_captain_detail} · {_vice_detail}</div></div>"
+            f"<div class='decision-summary-card'><div class='card-label'>Chip · {html.escape(_chip_name)}</div><div class='card-value'>{html.escape(_chip_action)}</div><div class='card-detail'>{html.escape(str(_chip_detail))}</div></div>"
+            "</div>", unsafe_allow_html=True,
+        )
+        st.markdown("**Before transferring**")
+        _check_left, _check_right = st.columns(2, gap="small")
+        with _check_left:
+            st.checkbox("Squad is correct", key="transfer_check_squad")
+            st.checkbox("Official selling price checked", key="transfer_check_price")
+        with _check_right:
+            st.checkbox("Player availability checked", key="transfer_check_availability")
+            st.checkbox("Team news checked", key="transfer_check_team_news")
 
-        options["Raw gain"] = options[f"Projected {horizon}GW pts"] - float(sell[f"Proj GW{gw}–GW{gw+horizon-1}"])
-        options["Hit cost"] = 4 if free_transfers == 0 else 0
-        options["Projected gain"] = options["Raw gain"] - options["Hit cost"]
-        # Risk setting affects the ranking, not the raw point projection.
-        ownership = options["Selected (%)"].fillna(0).astype(float).clip(0, 100)
-        # Reliability is deliberately stronger than in v1.3: fewer than 300 minutes
-        # should materially reduce confidence in a transfer recommendation.
-        minutes_reliability = (options["Minutes"].astype(float) / 600.0).clip(0.15, 1.0)
-        unknown_status = options["Chance (%)"].isna()
-        doubtful = options["Status"].astype(str).str.lower().eq("d")
-        availability_reliability = pd.Series(1.0, index=options.index)
-        availability_reliability.loc[unknown_status] = 0.88
-        availability_reliability.loc[doubtful] = 0.60
-        unavailable = options["Status"].astype(str).str.lower().isin(["i", "s", "u"])
-        availability_reliability.loc[unavailable] = 0.20
+        if not best_each.empty:
+            st.markdown("#### Suggested transfers")
+            st.caption(f"Sorted by existing {risk.lower()} decision score · verify official selling price and bank before acting.")
+            _default_transfer_table = pd.DataFrame({
+                "Sell": best_each["Sell"], "Buy": best_each["Buy"],
+                "Gain": best_each["Projected gain"].map(lambda value: f"{float(value):+.1f}"),
+                "Needed": best_each["Minimum gain to act"].map(lambda value: f"{float(value):.1f}"),
+                "Reliability": best_each.apply(lambda row: f"{int(row['Minutes reliability (%)'])}% min · {int(row['Availability reliability (%)'])}% avail", axis=1),
+            })
+            st.dataframe(_default_transfer_table, use_container_width=True, hide_index=True)
+            with st.expander("More columns", expanded=False):
+                st.caption(f"Risk mode: {risk} · Horizon: {horizon} GWs · Transfer hit applied: {hit_cost_auto} points.")
+                st.dataframe(best_each[["Sell","Sell club","Buy","Buy club","Position","Buy price (£m)","Budget ceiling (£m)","Club count after transfer","Outgoing projected pts","Incoming projected pts","Projected gain","Minimum gain to act","Minutes reliability (%)","Availability reliability (%)","Captaincy exposure","Actionable","Ownership (%)","Decision score","Verdict"]], use_container_width=True, hide_index=True)
 
-        # Differential upside is capped: low ownership alone must never dominate the model.
-        differential_bonus = (1.0 - ownership.clip(0, 10) / 10.0).clip(0, 1)
-        xgi90 = (options["xG/90"].fillna(0).astype(float) +
-                 options["xA/90"].fillna(0).astype(float)).clip(0, 0.8)
-        attacking_bonus = xgi90 / 0.8  # 0..1, based on current public xG/xA fields
+        with st.expander("Manual transfer comparison (optional)", expanded=False):
 
-        if risk == "Conservative":
-            # Strongly discounts low-minute/uncertain players; likely to prefer established minutes.
-            options["Decision score"] = options["Projected gain"] * minutes_reliability * availability_reliability
-        elif risk == "Aggressive":
-            # Mostly preserves upside while giving an explicit bonus to low-owned, attacking differentials.
-            options["Decision score"] = (
-                options["Projected gain"]
-                - 0.15 * (1.0 - minutes_reliability) * options["Projected gain"].clip(lower=0)
-                - 0.25 * (1.0 - availability_reliability) * options["Projected gain"].clip(lower=0)
-                + 1.25 * differential_bonus
-                + 0.75 * attacking_bonus
+            # Current squad selector
+            squad_names = sorted(df["Player"].unique().tolist())
+            sell_name = st.selectbox("Sell player", squad_names, index=(squad_names.index("Schade") if "Schade" in squad_names else 0))
+            sell = df[df["Player"]==sell_name].iloc[0]
+            max_price = float(sell.get("Sell price (£m)", sell["Price (£m)"])) + bank_m
+            options = candidates[(candidates["Position"]==sell["Position"]) &
+                                 (~candidates["Player"].isin(squad_names)) &
+                                 (candidates["Price (£m)"] <= max_price)].copy()
+
+            # Enforce the official maximum of three players from any one club.
+            # If selling from the candidate's club, the outgoing player frees a slot there.
+            club_counts = df["Club"].value_counts().to_dict()
+            options["Current club count"] = options["Club"].map(club_counts).fillna(0).astype(int)
+            same_club_as_sold = options["Club"].eq(sell["Club"])
+            options["Club count after transfer"] = (
+                options["Current club count"] + 1 - same_club_as_sold.astype(int)
             )
-        else:
-            # Moderately discounts uncertainty without discarding projected points.
-            options["Decision score"] = (
-                options["Projected gain"] * (0.45 + 0.55 * minutes_reliability)
-                * availability_reliability
-                + 0.45 * differential_bonus
-                + 0.25 * attacking_bonus
-            )
-        options = options.sort_values(["Decision score","Projected gain","Minutes"], ascending=False).head(15)
-        if options.empty:
-            st.info("No affordable out-of-squad player candidates matched this position under the rough budget estimate.")
-        else:
-            st.caption(f"Replacement ceiling: approximately £{max_price:.1f}m, using the manager-specific sale estimate + synced bank. Confirm the current official FPL selling price before confirming a transfer.")
-            st.caption(f"Ranking mode: {risk}. Horizon: {horizon} GWs. Hit penalty: {4 if (transfer_hit and free_transfers == 0) else 0} points. Decision score now explicitly weights minutes reliability, availability, differential ownership and xG+xA/90.")
-            options["Minutes reliability (%)"] = (minutes_reliability * 100).round(0).astype(int)
-            options["Availability reliability (%)"] = (availability_reliability * 100).round(0).astype(int)
-            st.dataframe(options[["Player","Club","Price (£m)","Current club count","Club count after transfer","Form","PPG","Minutes","Minutes reliability (%)","Status","Chance (%)","Availability reliability (%)","xG","xA","xG/90","xA/90",f"Projected {horizon}GW pts","Selected (%)","Projected gain","Decision score"]], use_container_width=True, hide_index=True)
-            best=options.iloc[0]
-            st.success(f"Top candidate under {risk.lower()} settings: {best['Player']} ({best['Club']}) — projected gain {best['Projected gain']:+.1f} points over {horizon} GWs. Decision score includes your risk preference, minutes and availability reliability, ownership and xG/xA signals; it is not a guaranteed return.")
-            st.write("Decision rule: only transfer if the gain remains worthwhile after checking availability, actual selling price, expected minutes and the other 14 squad slots. A high projection alone is not a command to transfer.")
+            options = options[options["Club count after transfer"] <= 3].copy()
 
-with model_tab:
-    st.subheader("What the model does — and does not do")
-    st.markdown("""
-    - Blends PPG/form with a conservative xG+xA signal, shrinks small samples toward a position baseline, estimates minutes from starts and appearances, penalizes uncertain/unavailable status, and adjusts each scheduled fixture individually. Displays cumulative xG/xA and per-90 rates.
-    - Uses public player status and chance-of-playing fields where provided.
-    - Does **not** access your FPL password, private `my-team` endpoint, or your personal selling prices.
-    - Building on v2.8, this v3.0 validation release adds matched live benchmarks, expected-minutes diagnostics, historical replay and explicit ranking metrics alongside the existing transfer HOLD gate. The model remains heuristic until enough saved forecasts and actual scores exist; no claim of self-learning accuracy is made before backtesting shows an improvement. The transfer search still evaluates one transfer at a time and does not submit transfers to FPL.
-    - Public FPL API is unofficial/undocumented and may change. Player/fixture data is cached for 30 minutes; manager profile/rank for 60 seconds; public picks/history for 2 minutes.
-    - A sidebar **Refresh rank & squad** button clears data caches and reruns the dashboard. Finance sync is derived from public data; use Manual override if the FPL Transfers page shows a different live balance.
-    - Squad sync attempts to use all 15 players from `entry/{id}/event/{gw}/picks/` for the next Gameweek. If the picks endpoint doesn't provide all 15 (especially before deadline), the app clearly falls back to the saved screenshot baseline.
-    - The app does not access the authenticated `/my-team/{id}/` endpoint and does not ask for or store an FPL password/cookie. This means the latest editable pre-deadline team might not always be publicly available.
-    """)
-    st.caption(f"The-One-Above-All v3.0 · Last refreshed in this session: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. Use the app's refresh/reload to request fresh data.")
+            st.caption("Three-per-club rule is enforced in the shortlist. Current matched squad counts: " +
+                       ", ".join(f"{club}: {count}" for club, count in sorted(club_counts.items())))
+            if unmatched:
+                st.warning("Some recorded squad names did not match public data; club counts may be incomplete until those aliases are corrected.")
+
+            options["Raw gain"] = options[f"Projected {horizon}GW pts"] - float(sell[f"Proj GW{gw}–GW{gw+horizon-1}"])
+            options["Hit cost"] = 4 if free_transfers == 0 else 0
+            options["Projected gain"] = options["Raw gain"] - options["Hit cost"]
+            # Risk setting affects the ranking, not the raw point projection.
+            ownership = options["Selected (%)"].fillna(0).astype(float).clip(0, 100)
+            # Reliability is deliberately stronger than in v1.3: fewer than 300 minutes
+            # should materially reduce confidence in a transfer recommendation.
+            minutes_reliability = (options["Minutes"].astype(float) / 600.0).clip(0.15, 1.0)
+            unknown_status = options["Chance (%)"].isna()
+            doubtful = options["Status"].astype(str).str.lower().eq("d")
+            availability_reliability = pd.Series(1.0, index=options.index)
+            availability_reliability.loc[unknown_status] = 0.88
+            availability_reliability.loc[doubtful] = 0.60
+            unavailable = options["Status"].astype(str).str.lower().isin(["i", "s", "u"])
+            availability_reliability.loc[unavailable] = 0.20
+
+            # Differential upside is capped: low ownership alone must never dominate the model.
+            differential_bonus = (1.0 - ownership.clip(0, 10) / 10.0).clip(0, 1)
+            xgi90 = (options["xG/90"].fillna(0).astype(float) +
+                     options["xA/90"].fillna(0).astype(float)).clip(0, 0.8)
+            attacking_bonus = xgi90 / 0.8  # 0..1, based on current public xG/xA fields
+
+            if risk == "Conservative":
+                # Strongly discounts low-minute/uncertain players; likely to prefer established minutes.
+                options["Decision score"] = options["Projected gain"] * minutes_reliability * availability_reliability
+            elif risk == "Aggressive":
+                # Mostly preserves upside while giving an explicit bonus to low-owned, attacking differentials.
+                options["Decision score"] = (
+                    options["Projected gain"]
+                    - 0.15 * (1.0 - minutes_reliability) * options["Projected gain"].clip(lower=0)
+                    - 0.25 * (1.0 - availability_reliability) * options["Projected gain"].clip(lower=0)
+                    + 1.25 * differential_bonus
+                    + 0.75 * attacking_bonus
+                )
+            else:
+                # Moderately discounts uncertainty without discarding projected points.
+                options["Decision score"] = (
+                    options["Projected gain"] * (0.45 + 0.55 * minutes_reliability)
+                    * availability_reliability
+                    + 0.45 * differential_bonus
+                    + 0.25 * attacking_bonus
+                )
+            options = options.sort_values(["Decision score","Projected gain","Minutes"], ascending=False).head(15)
+            if options.empty:
+                st.info("No affordable out-of-squad player candidates matched this position under the rough budget estimate.")
+            else:
+                st.caption(f"Replacement ceiling: approximately £{max_price:.1f}m, using the manager-specific sale estimate + synced bank. Confirm the current official FPL selling price before confirming a transfer.")
+                st.caption(f"Ranking mode: {risk}. Horizon: {horizon} GWs. Hit penalty: {4 if (transfer_hit and free_transfers == 0) else 0} points. Decision score now explicitly weights minutes reliability, availability, differential ownership and xG+xA/90.")
+                options["Minutes reliability (%)"] = (minutes_reliability * 100).round(0).astype(int)
+                options["Availability reliability (%)"] = (availability_reliability * 100).round(0).astype(int)
+                st.dataframe(options[["Player","Club","Price (£m)","Current club count","Club count after transfer","Form","PPG","Minutes","Minutes reliability (%)","Status","Chance (%)","Availability reliability (%)","xG","xA","xG/90","xA/90",f"Projected {horizon}GW pts","Selected (%)","Projected gain","Decision score"]], use_container_width=True, hide_index=True)
+                best=options.iloc[0]
+                st.success(f"Top candidate under {risk.lower()} settings: {best['Player']} ({best['Club']}) — projected gain {best['Projected gain']:+.1f} points over {horizon} GWs. Decision score includes your risk preference, minutes and availability reliability, ownership and xG/xA signals; it is not a guaranteed return.")
