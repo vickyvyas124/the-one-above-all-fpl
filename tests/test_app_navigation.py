@@ -5,7 +5,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import requests
-from streamlit.testing.v1 import AppTest
+
+try:
+    from streamlit.testing.v1 import AppTest
+except ModuleNotFoundError as exc:
+    if exc.name != "streamlit":
+        raise
+    AppTest = None
 
 
 SQUAD = [
@@ -161,6 +167,7 @@ def _values(elements):
     return [str(getattr(item, "value", "")) for item in elements]
 
 
+@unittest.skipIf(AppTest is None, "Streamlit is not installed in this environment")
 class DashboardNavigationAppTests(unittest.TestCase):
     def test_dashboard_tabs_recommendation_and_existing_controls_render(self):
         app_path = Path(__file__).parents[1] / "app.py"
