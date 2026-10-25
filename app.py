@@ -2148,12 +2148,13 @@ with decide_tab:
             reason_line = "No legal, affordable one-for-one transfers were found. Check squad matching, budget, and club-count warnings."
 
         _provisional = _model_status == "Fallback" or bool(unmatched) or (auto_controls and not latest_bank_known)
+        _provisional_badge = '<span class="provisional-badge">Provisional</span>' if _provisional else ""
         _candidate_safe = html.escape(candidate_summary)
         _gain_detail = f"Projected gain {gain:+.1f} points · needed {threshold:.1f}" if gain is not None else "Projected gain · not available"
         st.markdown(
             "<div class='verdict-card'><div class='verdict-topline'>"
             f"<span class='verdict-label'>Recommended action</span><span class='verdict-value'>{html.escape(decision_label)}</span>"
-            f"{'<span class=\"provisional-badge\">Provisional</span>' if _provisional else ''}</div>"
+            f"{_provisional_badge}</div>"
             f"<div class='verdict-candidate'>{_candidate_safe}</div>"
             f"<div class='verdict-gain'>{html.escape(_gain_detail)}</div>"
             f"<div class='verdict-reason'>{html.escape(reason_line)}</div></div>", unsafe_allow_html=True,
