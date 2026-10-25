@@ -171,8 +171,9 @@ def _values(elements):
 class DashboardNavigationAppTests(unittest.TestCase):
     def test_dashboard_tabs_recommendation_and_existing_controls_render(self):
         app_path = Path(__file__).parents[1] / "app.py"
-        with patch("requests.get", side_effect=mocked_fpl_get):
+        with patch("requests.get", side_effect=mocked_fpl_get) as network:
             app = AppTest.from_file(str(app_path), default_timeout=60).run()
+            initial_network_call_count = network.call_count
 
             self.assertFalse(app.exception, [item.message for item in app.exception])
             self.assertEqual(
@@ -180,18 +181,30 @@ class DashboardNavigationAppTests(unittest.TestCase):
                 ["Decide", "Squad", "Fixtures", "Model"],
             )
 
-            rendered_text = "\n".join(
-                value
-                for collection in ("info", "success", "warning", "markdown", "caption", "subheader")
-                for value in _values(getattr(app, collection))
+            decide_tab = app.tabs[0]
+            verdict_markdown = next(
+                element
+                for element in decide_tab.markdown
+                if "verdict-card" in str(element.value)
             )
-            self.assertTrue(
-                any("Decision: " in value for value in (
-                    *_values(app.info), *_values(app.success), *_values(app.warning)
-                )),
-                "The automatic transfer recommendation verdict was not rendered.",
+            self.assertIn("HOLD FOR NOW", verdict_markdown.value)
+            self.assertIn("Provisional", verdict_markdown.value)
+            default_table = next(
+                element
+                for element in decide_tab.dataframe
+                if list(element.value.columns) == ["Sell", "Buy", "Gain", "Needed", "Reliability"]
             )
-            self.assertIn("Automatic transfer recommendations", rendered_text)
+            child_positions = {
+                id(element): position
+                for position, element in decide_tab.children.items()
+            }
+            self.assertLess(
+                child_positions[id(verdict_markdown)],
+                child_positions[id(default_table)],
+                "The verdict must render before the default transfer table.",
+            )
+            self.assertTrue(any(item.label == "Squad is correct" for item in app.checkbox))
+            self.assertTrue(any(item.label == "Team news checked" for item in app.checkbox))
 
             team_id = next(item for item in app.number_input if item.label == "FPL Team ID")
             self.assertEqual(team_id.value, 2311669)
@@ -205,6 +218,7 @@ class DashboardNavigationAppTests(unittest.TestCase):
             budget_source.set_value("Manual override")
             app.run()
             self.assertFalse(app.exception, [item.message for item in app.exception])
+            self.assertEqual(network.call_count, initial_network_call_count, "UI control reruns must not add network requests.")
             self.assertTrue(any(item.label == "Bank (£m)" for item in app.number_input))
             free_transfers = next(item for item in app.selectbox if item.label == "Free transfers available")
             self.assertIn(free_transfers.value, [0, 1, 2, 3, 4, 5])
