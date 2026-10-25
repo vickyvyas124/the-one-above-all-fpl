@@ -21,6 +21,7 @@ class SnapshotPublisherIntegrationTests(unittest.TestCase):
         self._git(self.seed, "config", "user.name", "Snapshot Test")
         self._git(self.seed, "config", "user.email", "snapshot@example.test")
         self._git(self, "init", "--bare", "--initial-branch=fpl-snapshots", str(self.bare))
+        self._git(self, "--git-dir", str(self.bare), "config", "uploadpack.allowFilter", "true")
 
         self.old_manifest = "2026-27/gw05/24h/manifest.json"
         self.old_payload = "2026-27/gw05/24h/payloads/bootstrap-static.json.gz"
@@ -30,7 +31,10 @@ class SnapshotPublisherIntegrationTests(unittest.TestCase):
         initial = {
             self.old_manifest: b'{"identity":{"gameweek":5,"window_label":"24h"}}\n',
             self.old_payload: gzip.compress(b'{"elements":[]}', mtime=0),
-            self.old_diag: b'{"kind":"previous-diagnostic"}\n',
+            self.old_diag: (
+                b'{"kind":"previous-diagnostic-1"}\n'
+                b'{"kind":"previous-diagnostic-2"}\n'
+            ),
             self.old_actual: b'{"record_type":"actual_score","player_id":1,"revision":1}\n',
             self.old_index: b'{"2026-27:GW04":"2026-10-01T12:00:00+00:00"}\n',
         }
@@ -65,10 +69,14 @@ class SnapshotPublisherIntegrationTests(unittest.TestCase):
             self.fail(f"git {args!r} failed: {result.stderr}")
         return result
 
-    def _clone_partial(self, name):
+    def _clone_partial(self, name, *, shallow=False):
         destination = self.root / name
+        clone_args = ["git", "clone"]
+        if shallow:
+            clone_args.extend(["--depth", "1", "--filter=blob:none"])
+        clone_args.extend(["--no-checkout", "--branch", "fpl-snapshots", f"file://{self.bare}", str(destination)])
         result = subprocess.run(
-            ["git", "clone", "--no-checkout", "--branch", "fpl-snapshots", str(self.bare), str(destination)],
+            clone_args,
             check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         if result.returncode:
@@ -187,6 +195,70 @@ class SnapshotPublisherIntegrationTests(unittest.TestCase):
             publisher.publish(self.source, self.repo, push=True)
         after = self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip()
         self.assertEqual(after, self.initial_head)
+
+    def test_mutable_jsonl_truncation_preserves_remote_history_and_head(self):
+        # This is a true truncation: the source retains only the first of two
+        # existing records, rather than replacing the file with another value.
+        original = self.initial_bytes[self.old_diag]
+        self.assertEqual(len(original.splitlines()), 2)
+        self._write_source_file(self.old_diag, original.splitlines(keepends=True)[0])
+
+        with self.assertRaisesRegex(publisher.PublishSafetyError, "rewritten or truncated"):
+            publisher.publish(self.source, self.repo, push=True)
+
+        self.assertEqual(
+            self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip(),
+            self.initial_head,
+        )
+        self.assertEqual(self._remote_blob(self.old_diag), original)
+
+    def test_shallow_blob_filtered_clone_can_publish_without_parent_fallback(self):
+        repo = self._clone_partial("shallow-publisher", shallow=True)
+        self.assertEqual(self._git(repo, "rev-parse", "--is-shallow-repository").stdout.strip(), "true")
+        manifest, payload = self._source_with_new_6h_snapshot()
+
+        commit = publisher.publish(self.source, repo, push=True)
+
+        self.assertIsNotNone(commit)
+        self.assertEqual(self._remote_blob(manifest), (self.source / manifest).read_bytes())
+        self.assertEqual(self._remote_blob(payload), (self.source / payload).read_bytes())
+        self.assertEqual(self._remote_blob(self.old_manifest), self.initial_bytes[self.old_manifest])
+        self.assertEqual(self._remote_blob(self.old_payload), self.initial_bytes[self.old_payload])
+        changes = self._git(
+            repo, "diff-tree", "--no-commit-id", "--name-status", "-r", "--no-renames",
+            self.initial_head, "HEAD",
+        ).stdout.splitlines()
+        self.assertFalse(any(row.startswith("D\t") for row in changes))
+
+    def test_unavailable_prior_blob_in_shallow_clone_rejects_without_remote_change(self):
+        repo = self._clone_partial("missing-blob-publisher", shallow=True)
+        tree_entry = self._git(repo, "ls-tree", "HEAD", "--", self.old_manifest).stdout.split()
+        prior_blob = tree_entry[2].decode() if isinstance(tree_entry[2], bytes) else tree_entry[2]
+        self.assertNotEqual(
+            subprocess.run(
+                ["git", "-C", str(repo), "cat-file", "-e", prior_blob],
+                env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).returncode,
+            0,
+            "blob-filtered clone unexpectedly contains the immutable manifest blob",
+        )
+        # Prevent Git's promisor remote from fetching the omitted object. The
+        # publisher must reject uncertainty instead of treating it as absence.
+        self._git(repo, "remote", "set-url", "origin", str(self.root / "unavailable-remote.git"))
+        self._write_source_file(self.old_manifest, b'{"identity":{"rewritten":true}}\n')
+
+        with patch.dict(os.environ, {"GIT_NO_LAZY_FETCH": "1"}):
+            with self.assertRaises(publisher.PublishSafetyError):
+                publisher.publish(self.source, repo, push=True)
+
+        self.assertEqual(
+            self._git(self, "--git-dir", str(self.bare), "rev-parse", "refs/heads/fpl-snapshots").stdout.strip(),
+            self.initial_head,
+        )
+        self.assertEqual(self._remote_blob(self.old_manifest), self.initial_bytes[self.old_manifest])
 
     def test_invalid_new_actual_ledger_is_rejected(self):
         relative = "actuals/2026-27/gw06.jsonl"

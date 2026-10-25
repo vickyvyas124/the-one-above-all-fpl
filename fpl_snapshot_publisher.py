@@ -58,10 +58,45 @@ def _source_files(source: Path) -> list[tuple[Path, str]]:
     return files
 
 
-def _staged_changes(repository: Path) -> list[tuple[str, str]]:
+def _verified_base_commit(repository: Path, branch: str) -> str | None:
+    """Return the verified current commit, or None only for a proven unborn branch."""
     head = _git(repository, "rev-parse", "--verify", "HEAD", check=False)
+    if head.returncode == 0:
+        base_commit = head.stdout.strip()
+        if not base_commit:
+            raise PublishSafetyError("HEAD resolved to an empty commit identifier")
+        _git_bytes(repository, "cat-file", "-e", f"{base_commit}^{{commit}}")
+        _git_bytes(repository, "cat-file", "-e", f"{base_commit}^{{tree}}")
+        return base_commit
+
+    symbolic_head = _git(repository, "symbolic-ref", "-q", "HEAD", check=False)
+    expected_ref = f"refs/heads/{branch}"
+    if symbolic_head.returncode != 0 or symbolic_head.stdout.strip() != expected_ref:
+        raise PublishSafetyError(
+            f"Could not verify repository HEAD (expected unborn {expected_ref})"
+        )
+    refs = _git(
+        repository, "for-each-ref", "--format=%(refname)", expected_ref, check=False
+    )
+    if refs.returncode != 0:
+        raise PublishSafetyError(
+            f"Could not verify whether {expected_ref} exists: {refs.stderr.strip()}"
+        )
+    if expected_ref in refs.stdout.splitlines():
+        raise PublishSafetyError(
+            f"{expected_ref} exists but its commit object could not be verified"
+        )
+    return None
+
+
+def _staged_changes(
+    repository: Path, base_commit: str | None
+) -> list[tuple[str, str]]:
     args = ["diff", "--cached", "--name-status", "-z", "--no-renames"]
-    args.append("HEAD" if head.returncode == 0 else "--root")
+    if base_commit is None:
+        args.append("--root")
+    else:
+        args.append(base_commit)
     result = _git(repository, *args)
     fields = result.stdout.split("\0")
     if fields and fields[-1] == "":
@@ -86,11 +121,35 @@ def _git_bytes(repository: Path, *args: str) -> bytes:
     return result.stdout
 
 
-def _head_bytes(repository: Path, relative: str) -> bytes | None:
-    exists = _git(repository, "cat-file", "-e", f"HEAD:{relative}", check=False)
-    if exists.returncode:
+def _head_bytes(
+    repository: Path, relative: str, base_commit: str | None
+) -> bytes | None:
+    """Return a prior blob, None only when the verified base tree lacks the path."""
+    if base_commit is None:
         return None
-    return _git_bytes(repository, "show", f"HEAD:{relative}")
+    entries = _git_bytes(
+        repository, "ls-tree", "-r", "-z", "--full-tree", base_commit,
+        "--", f":(literal){relative}",
+    )
+    for entry in entries.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            metadata, entry_path = entry.split(b"\t", 1)
+            _mode, object_type, object_id = metadata.split(b" ", 2)
+            decoded_path = entry_path.decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise PublishSafetyError(
+                f"Could not parse prior tree entry for {relative}: {exc}"
+            ) from exc
+        if decoded_path != relative:
+            continue
+        if object_type != b"blob":
+            raise PublishSafetyError(f"Prior path is not a blob: {relative}")
+        # Reading by object ID triggers promisor lazy fetch when available. Any
+        # unavailable object is an error, never evidence that the path is new.
+        return _git_bytes(repository, "cat-file", "blob", object_id.decode("ascii"))
+    return None
 
 
 def _staged_bytes(repository: Path, relative: str) -> bytes:
@@ -98,7 +157,6 @@ def _staged_bytes(repository: Path, relative: str) -> bytes:
     if exists.returncode:
         raise PublishSafetyError(f"Staged path is missing from index: {relative}")
     return _git_bytes(repository, "show", f":{relative}")
-
 
 def _validate_append_only_jsonl(relative: str, before: bytes, after: bytes) -> None:
     if before and not before.endswith(b"\n"):
@@ -130,10 +188,21 @@ def _validate_mutable_bytes(relative: str, before: bytes, after: bytes) -> None:
             raise PublishSafetyError("Reconciliation index must be a JSON object")
 
 
-def validate_staged_changes(repository: str | Path) -> list[tuple[str, str]]:
-    """Print and validate the staged diff against the persistent snapshot policy."""
+_BASE_UNSET = object()
+
+
+def validate_staged_changes(
+    repository: str | Path, *, base_commit: str | None | object = _BASE_UNSET
+) -> list[tuple[str, str]]:
+    """Print and validate staged changes against a verified base tree."""
     repository = Path(repository).resolve()
-    changes = _staged_changes(repository)
+    if base_commit is _BASE_UNSET:
+        branch = _git(repository, "branch", "--show-current").stdout.strip()
+        base_commit = _verified_base_commit(repository, branch)
+    if base_commit is not None and not isinstance(base_commit, str):
+        raise PublishSafetyError("Invalid verified base commit")
+
+    changes = _staged_changes(repository, base_commit)
     if changes:
         print("Staged changes:")
         for status, relative in changes:
@@ -144,20 +213,25 @@ def validate_staged_changes(repository: str | Path) -> list[tuple[str, str]]:
     for status, relative in changes:
         if status == "D":
             raise PublishSafetyError(f"Staged deletion is forbidden: {relative}")
-        before = _head_bytes(repository, relative)
+        before = _head_bytes(repository, relative, base_commit)
         if before is None:
+            if status != "A":
+                raise PublishSafetyError(
+                    f"Prior path state could not be verified for staged {status}: {relative}"
+                )
             if not _mutable(relative) and SNAPSHOT_PATH.fullmatch(relative) is None:
                 raise PublishSafetyError(f"New file is outside the snapshot namespace: {relative}")
             if _mutable(relative):
                 _validate_mutable_bytes(relative, b"", _staged_bytes(repository, relative))
             continue
+        if status == "A":
+            raise PublishSafetyError(f"Staged addition already exists in the verified base: {relative}")
         if not _mutable(relative):
             raise PublishSafetyError(
                 f"Existing immutable snapshot or non-mutable path changed: {relative}"
             )
         _validate_mutable_bytes(relative, before, _staged_bytes(repository, relative))
     return changes
-
 
 def publish(source: str | Path, repository: str | Path, *,
             remote: str = "origin", branch: str = "fpl-snapshots",
@@ -176,8 +250,11 @@ def publish(source: str | Path, repository: str | Path, *,
         raise PublishSafetyError(
             f"Publisher repository is on {current_branch!r}, expected {branch!r}"
         )
-    if _staged_changes(repository):
-        validate_staged_changes(repository)
+    # Capture and verify the base before staging. None means a proven unborn
+    # branch only; shallow/missing commits and tree errors are fatal.
+    base_commit = _verified_base_commit(repository, branch)
+    if _staged_changes(repository, base_commit):
+        validate_staged_changes(repository, base_commit=base_commit)
         raise PublishSafetyError("Publisher repository already had staged changes before publication")
 
     # The source is intentionally partial. Copy only supplied files; never sync deletions.
@@ -187,10 +264,10 @@ def publish(source: str | Path, repository: str | Path, *,
         shutil.copyfile(source_file, destination)
 
     # --ignore-removal is a first defense against partial checkouts. The staged
-    # diff checks below independently reject all deletions and immutable edits.
+    # diff and verified-base checks below independently reject deletions/edits.
     top_level = sorted({PurePosixPath(relative).parts[0] for _, relative in files})
     _git(repository, "add", "--ignore-removal", "--", *top_level)
-    changes = validate_staged_changes(repository)
+    changes = validate_staged_changes(repository, base_commit=base_commit)
     if not changes:
         print("Snapshot branch already contains all captured data.")
         return None
@@ -199,29 +276,52 @@ def publish(source: str | Path, repository: str | Path, *,
           "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com",
           "commit", "-m", "Capture immutable FPL deadline snapshot")
 
-    # Check the committed tree against its parent again before any remote write.
-    parent = _git(repository, "rev-parse", "--verify", "HEAD^", check=False)
+    # Verify this commit has exactly the base captured above, then compare its
+    # tree directly with that known commit. Do not infer root status from HEAD^:
+    # the workflow uses depth-one clones whose earlier parent may be unavailable.
+    commit = _git(repository, "rev-parse", "--verify", "HEAD").stdout.strip()
+    parents = _git(repository, "rev-list", "--parents", "-n", "1", commit).stdout.split()
+    expected_parents = [commit] if base_commit is None else [commit, base_commit]
+    if parents != expected_parents:
+        raise PublishSafetyError(
+            f"Committed parent state could not be verified; expected {expected_parents}, got {parents}"
+        )
+
     diff_args = ["diff-tree", "--no-commit-id", "--name-status", "-r", "--no-renames"]
-    diff_args.extend(["HEAD^", "HEAD"] if parent.returncode == 0 else ["--root", "HEAD"])
+    diff_args.extend(["--root", commit] if base_commit is None else [base_commit, commit])
     committed_status = _git(repository, *diff_args).stdout.splitlines()
     for line in committed_status:
         status, relative = line.split("\t", 1)
         if status == "D":
             raise PublishSafetyError("Committed snapshot update contains a deletion; refusing push")
-        if status != "A" and not _mutable(relative):
+        prior = _head_bytes(repository, relative, base_commit)
+        if prior is None:
+            if status != "A":
+                raise PublishSafetyError(
+                    f"Committed prior path state could not be verified: {relative}; refusing push"
+                )
+            if not _mutable(relative) and SNAPSHOT_PATH.fullmatch(relative) is None:
+                raise PublishSafetyError(
+                    f"Committed new path is outside the snapshot namespace: {relative}; refusing push"
+                )
+            if _mutable(relative):
+                after = _git_bytes(repository, "show", f"{commit}:{relative}")
+                _validate_mutable_bytes(relative, b"", after)
+            continue
+        if status == "A":
+            raise PublishSafetyError(
+                f"Committed addition already exists in verified base: {relative}; refusing push"
+            )
+        if not _mutable(relative):
             raise PublishSafetyError(
                 f"Committed tree changed existing immutable path: {relative}; refusing push"
             )
-        if _mutable(relative):
-            before = b"" if status == "A" else _git_bytes(repository, "show", f"HEAD^:{relative}")
-            after = _git_bytes(repository, "show", f"HEAD:{relative}")
-            _validate_mutable_bytes(relative, before, after)
+        after = _git_bytes(repository, "show", f"{commit}:{relative}")
+        _validate_mutable_bytes(relative, prior, after)
 
-    commit = _git(repository, "rev-parse", "HEAD").stdout.strip()
     if push:
         _git(repository, "push", remote, f"HEAD:{branch}")
     return commit
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
