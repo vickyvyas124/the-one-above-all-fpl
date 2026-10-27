@@ -3,6 +3,33 @@
 from itertools import combinations
 
 
+def score_starting_xi(squad, projection_by_id):
+    """Fast expected XI plus captain score without building lineup details."""
+    if len(squad) != 15 or len({int(p.get("id", -1)) for p in squad}) != 15:
+        return 0.0
+    grouped = {"GK": [], "DEF": [], "MID": [], "FWD": []}
+    for player in squad:
+        role = str(player.get("Position", player.get("position", ""))).upper()
+        role = "GK" if role == "GKP" else role
+        if role not in grouped:
+            return 0.0
+        grouped[role].append(float(projection_by_id.get(int(player["id"]), 0.0)))
+    if tuple(len(grouped[r]) for r in ("GK", "DEF", "MID", "FWD")) != (2, 5, 5, 3):
+        return 0.0
+    goalkeepers = sorted(grouped["GK"], reverse=True)
+    best = float("-inf")
+    for defenders in range(3, 6):
+        for midfielders in range(2, 6):
+            forwards = 10 - defenders - midfielders
+            if not 1 <= forwards <= 3:
+                continue
+            chosen = (goalkeepers[:1] + sorted(grouped["DEF"], reverse=True)[:defenders]
+                      + sorted(grouped["MID"], reverse=True)[:midfielders]
+                      + sorted(grouped["FWD"], reverse=True)[:forwards])
+            best = max(best, sum(chosen) + max(chosen))
+    return best if best != float("-inf") else 0.0
+
+
 def validate_public_picks(picks, known_player_ids):
     """Return (valid, reason) for one complete, ordered 15-player FPL squad."""
     if not isinstance(picks, list) or len(picks) != 15:

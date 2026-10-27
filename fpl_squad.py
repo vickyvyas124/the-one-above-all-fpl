@@ -56,6 +56,13 @@ def validate_squad_ids(player_ids, known_player_ids):
         counts[role] += 1
     if counts != {"GK": 2, "DEF": 5, "MID": 5, "FWD": 3}:
         return False, "The selected roster must contain 2 goalkeepers, 5 defenders, 5 midfielders and 3 forwards."
+    clubs = {}
+    for player_id in ids:
+        club = known_player_ids[player_id].get("team")
+        if club is not None:
+            clubs[club] = clubs.get(club, 0) + 1
+    if any(n > 3 for n in clubs.values()):
+        return False, "The selected roster exceeds the maximum of three players per club."
     return True, ""
 
 
@@ -85,7 +92,11 @@ def apply_public_transfers(player_ids, transfer_rows, baseline_gw, target_gw, kn
         return list(player_ids), [], False, f"Transfer history contains an unverifiable transaction: {exc}"
 
     if not relevant:
-        return list(player_ids), [], False, "No public transactions were returned for this window; an empty history does not prove that no moves or chips occurred."
+        roster = [int(player_id) for player_id in player_ids]
+        valid, reason = validate_squad_ids(roster, known_player_ids)
+        if not valid:
+            return list(player_ids), [], False, f"The prior squad is invalid: {reason}"
+        return roster, [], True, "Complete public transfer history contains no transactions in this Gameweek window."
 
     roster = [int(player_id) for player_id in player_ids]
     applied = []
@@ -101,7 +112,7 @@ def apply_public_transfers(player_ids, transfer_rows, baseline_gw, target_gw, kn
 
 
 def load_public_squad(target_gw, events, fetch_picks, transfer_rows, transfer_history_available,
-                      known_player_ids, *, now=None):
+                      known_player_ids, *, chip_rows=None, now=None):
     """Load current picks, or a validated prior squad for a pre-deadline 404."""
     now = now or datetime.now(timezone.utc)
     try:
@@ -137,18 +148,32 @@ def load_public_squad(target_gw, events, fetch_picks, transfer_rows, transfer_hi
         else:
             roster, transactions, reconstructed = baseline_ids, [], False
             transfer_note = "Public transfer history could not be loaded; it cannot confirm that no moves occurred."
+        if reconstructed and isinstance(chip_rows, list):
+            relevant_chips = []
+            try:
+                for chip in chip_rows:
+                    event = int(chip.get("event"))
+                    name = str(chip.get("name", "")).lower().replace("_", "").replace("-", "")
+                    if baseline_gw < event <= int(target_gw) and "freehit" in name:
+                        relevant_chips.append(event)
+            except (AttributeError, TypeError, ValueError):
+                reconstructed = False
+                transfer_note = "Public chip history is malformed; a Free Hit situation cannot be ruled out."
+            if relevant_chips:
+                reconstructed = False
+                transfer_note = "A Free Hit is recorded in the reconstruction window; its temporary squad makes the persistent roster ambiguous until picks publish."
         by_id = {int(row["element"]): dict(row) for row in baseline_picks}
         for position, player_id in enumerate(roster, 1):
             by_id.setdefault(player_id, {"element": player_id})["position"] = position
         picks = [by_id[player_id] for player_id in roster]
-        message = (f"Last published squad: GW{baseline_gw}. GW{target_gw} picks are not public yet. "
-                   f"{len(transactions)} public transfer(s) applied. Confirm this roster includes all transfers and chip changes before using recommendations." if reconstructed else
+        message = (f"Auto-reconstructed from GW{baseline_gw} picks and public transfer history · provisional until GW{target_gw} picks publish. "
+                   f"{len(transactions)} public transfer(s) applied." if reconstructed else
                    f"Last published squad: GW{baseline_gw}. GW{target_gw} picks are not public yet. {transfer_note} "
                    "Confirm or correct all transfers and chip changes before using recommendations.")
         return {
             "available": True, "player_ids": roster, "picks": picks, "source": "prior", "baseline_gw": baseline_gw,
             "transactions": transactions, "transfer_history_reconstructed": reconstructed,
-            "needs_confirmation": True, "target_verified": False, "reason": message,
+            "needs_confirmation": not reconstructed, "target_verified": False, "reason": message,
         }
 
     picks = payload.get("picks", []) if isinstance(payload, dict) else []
