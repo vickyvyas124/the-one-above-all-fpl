@@ -1,4 +1,5 @@
 """Transparent per-Gameweek transfer projection arithmetic."""
+from decimal import Decimal, InvalidOperation
 
 def official_selling_price_tenths(purchase_price, current_price):
     """FPL sale price in tenths: initial cost plus half profit, rounded down."""
@@ -9,12 +10,16 @@ def official_selling_price_tenths(purchase_price, current_price):
 
 def transfer_budget_tenths(selling_price, bank):
     """Available one-player purchase budget in exact FPL tenths of a million."""
-    return int(selling_price) + int(bank)
+    sale, balance = _exact_tenths(selling_price), _exact_tenths(bank)
+    if sale is None or balance is None:
+        raise ValueError("Selling price and bank must be exact nonnegative FPL tenths.")
+    return sale + balance
 
 
 def is_affordable_tenths(player_price, budget):
     """Whether an FPL price in tenths fits within the exact transfer budget."""
-    return int(player_price) <= int(budget)
+    price, ceiling = _exact_tenths(player_price), _exact_tenths(budget)
+    return price is not None and ceiling is not None and price <= ceiling
 
 
 def transfer_hit_cost(free_transfers, allow_hit):
@@ -67,6 +72,39 @@ def _exact_tenths(value):
         return None
 
 
+def exact_fpl_tenths(value):
+    """Public exact nonnegative tenths parser for FPL cost fields."""
+    return _exact_tenths(value)
+
+
+def pounds_millions_to_tenths(value):
+    """Convert a decimal £m amount to exact tenths; reject sub-tenth values."""
+    try:
+        amount = Decimal(str(value))
+        tenths = amount * 10
+        if not amount.is_finite() or amount < 0 or tenths != tenths.to_integral_value():
+            return None
+        return int(tenths)
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
+        return None
+
+
+def verified_player_price_tenths(value):
+    """Return a positive exact player price, or None when the price is unknown/invalid."""
+    price = _exact_tenths(value)
+    return price if price is not None and price > 0 else None
+
+
+def transfer_plan_action_threshold(paid_transfers):
+    """Minimum cumulative horizon gain, net of hits, used for dashboard action.
+
+    Free-transfer plans require +4 points; any plan using paid transfers requires
+    +6 points. This is a conservative decision margin over the configured horizon,
+    not a guarantee of points or rank gain.
+    """
+    return 6.0 if int(paid_transfers) > 0 else 4.0
+
+
 def optimize_transfer_plans(squad, candidates, free_transfers, bank_tenths, *,
                             horizon=5, start_gw=1, beam_width=500,
                             candidate_limit=40, paid_transfer_limit=2,
@@ -95,15 +133,13 @@ def optimize_transfer_plans(squad, candidates, free_transfers, bank_tenths, *,
     # Treat malformed bank or missing manager-specific sale prices as
     # unverified. Keep projections available, but never label them affordable.
     verified_bank = _exact_tenths(bank_tenths)
-    budget_verified = bool(budget_verified and verified_bank is not None)
-    bank_tenths = verified_bank if budget_verified else None
+    budget_inputs_verified = bool(budget_verified and verified_bank is not None)
+    bank_tenths = verified_bank
     for player in squad:
         sale_price = _exact_tenths(player.get("sell_tenths"))
-        if sale_price is None:
-            budget_verified = False
-            player["sell_tenths"] = 0
-        else:
-            player["sell_tenths"] = sale_price
+        # A zero sale value is not a valid FPL selling price. Keep unknown values
+        # unknown; only the outgoing players in a plan affect its budget status.
+        player["sell_tenths"] = sale_price if sale_price and sale_price > 0 else None
     ft = max(0, min(5, int(free_transfers)))
     horizon = max(1, int(horizon))
     max_transfers = min(len(squad), ft + max(0, int(paid_transfer_limit)))
@@ -113,7 +149,7 @@ def optimize_transfer_plans(squad, candidates, free_transfers, bank_tenths, *,
     for player in candidates:
         try:
             player_id = int(player["id"])
-            price = _exact_tenths(player.get("price_tenths"))
+            price = verified_player_price_tenths(player.get("price_tenths"))
             projections = [float(value) for value in player["projections"][:horizon]]
         except (KeyError, TypeError, ValueError):
             continue
@@ -122,9 +158,8 @@ def optimize_transfer_plans(squad, candidates, free_transfers, bank_tenths, *,
                 or player_id in existing or player_id in seen_candidate_ids
                 or len(projections) != horizon or player.get("club") is None):
             continue
-        if price is None:
-            budget_verified = False
-            price = 0
+        # Zero/malformed costs are not genuine FPL prices. Keep the projection,
+        # but never turn an unknown cost into a free transfer.
         player["id"] = player_id
         player["position"] = position
         player["price_tenths"] = price
@@ -151,15 +186,31 @@ def optimize_transfer_plans(squad, candidates, free_transfers, bank_tenths, *,
 
     def make_plan(roster, moves):
         rows = score(roster, len(moves))
-        moved_sales = sum(int(m["out"].get("sell_tenths", 0)) for m in moves)
-        moved_buys = sum(int(m["in"]["price_tenths"]) for m in moves)
+        sale_values = [m["out"].get("sell_tenths") for m in moves]
+        buy_values = [m["in"].get("price_tenths") for m in moves]
+        plan_budget_verified = (budget_inputs_verified
+                                and all(value is not None for value in sale_values + buy_values))
+        moved_sales = sum(sale_values) if plan_budget_verified and moves else 0
+        moved_buys = sum(buy_values) if plan_budget_verified and moves else 0
+        budget_before = (bank_tenths + moved_sales) if plan_budget_verified and bank_tenths is not None else None
+        budget_after = (budget_before - moved_buys) if budget_before is not None and moves else budget_before
+        budget_reason = None
+        if moves and not plan_budget_verified:
+            if verified_bank is None or not budget_verified:
+                budget_reason = "Bank or manager budget inputs are unverified."
+            elif any(value is None for value in sale_values):
+                budget_reason = "An outgoing player has no verified manager-specific selling price."
+            else:
+                budget_reason = "An incoming player has no valid current purchase price."
         return {"transfers": list(moves), "transfer_count": len(moves),
                 "free_transfers_used": min(ft, len(moves)),
                 "paid_transfers": max(0, len(moves) - ft),
                 "hit_cost": max(0, len(moves) - ft) * 4,
-                "budget_before_tenths": (bank_tenths + moved_sales) if budget_verified else None,
-                "budget_after_tenths": (bank_tenths + moved_sales - moved_buys) if budget_verified else None,
-                "affordable": True if budget_verified else None, "gameweeks": rows,
+                "budget_before_tenths": budget_before,
+                "budget_after_tenths": budget_after,
+                "affordable": True if not moves else (True if plan_budget_verified else None),
+                "projection_only": bool(moves and not plan_budget_verified),
+                "budget_reason": budget_reason, "gameweeks": rows,
                 "cumulative_net_gain": sum(r["net_gain"] for r in rows), "roster": roster}
 
     results = {0: make_plan(squad, [])}
@@ -189,9 +240,13 @@ def optimize_transfer_plans(squad, candidates, free_transfers, bank_tenths, *,
                     if any(n > 3 for n in clubs.values()):
                         continue
                     new_moves = moves + [{"out": out, "in": incoming}]
-                    total_sales = sum(int(m["out"].get("sell_tenths", 0)) for m in new_moves)
-                    total_buys = sum(int(m["in"]["price_tenths"]) for m in new_moves)
-                    if budget_verified and total_sales + bank_tenths < total_buys:
+                    sale_values = [m["out"].get("sell_tenths") for m in new_moves]
+                    buy_values = [m["in"].get("price_tenths") for m in new_moves]
+                    can_verify_budget = (budget_inputs_verified
+                                         and all(value is not None for value in sale_values + buy_values))
+                    total_sales = sum(sale_values) if can_verify_budget else 0
+                    total_buys = sum(buy_values) if can_verify_budget else 0
+                    if can_verify_budget and total_sales + bank_tenths < total_buys:
                         continue
                     expanded.append((new_roster, new_moves, outs | {oid}, ins | {iid}))
         if not expanded:
@@ -203,10 +258,32 @@ def optimize_transfer_plans(squad, candidates, free_transfers, bank_tenths, *,
             key = frozenset(int(player["id"]) for player in state[0])
             unique_states.setdefault(key, state)
         expanded = list(unique_states.values())
-        expanded.sort(key=lambda state: sum(r["net_gain"] for r in score(state[0], depth)), reverse=True)
-        beam = expanded[:max(1, int(beam_width))]
-        best_state = beam[0]
-        results[depth] = make_plan(best_state[0], best_state[1])
+        width = max(1, int(beam_width))
+        # Keep confirmed-budget search states from being crowded out by a
+        # projection-only state with a misleadingly attractive unknown price.
+        ranked = sorted(expanded,
+                        key=lambda state: sum(r["net_gain"] for r in score(state[0], depth)),
+                        reverse=True)
+        verified_states, projection_states = [], []
+        for state in ranked:
+            plan = make_plan(state[0], state[1])
+            (verified_states if plan["affordable"] is True else projection_states).append(state)
+        beam = verified_states[:width]
+        if projection_states and len(beam) < width:
+            beam.extend(projection_states[:width - len(beam)])
+        elif projection_states and width > 1:
+            beam[-1] = projection_states[0]
+
+        best_verified = next((state for state in verified_states), None)
+        best_projection = next((state for state in projection_states), None)
+        selected_state = best_verified or best_projection
+        selected_plan = make_plan(selected_state[0], selected_state[1])
+        if best_verified and best_projection:
+            projection_plan = make_plan(best_projection[0], best_projection[1])
+            if frozenset(int(player["id"]) for player in projection_plan["roster"]) != frozenset(
+                    int(player["id"]) for player in selected_plan["roster"]):
+                selected_plan["projection_only_alternatives"] = [projection_plan]
+        results[depth] = selected_plan
     return results
 
 

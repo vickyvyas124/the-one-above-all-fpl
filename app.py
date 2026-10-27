@@ -20,6 +20,10 @@ from fpl_transfer import (
     transfer_hit_cost,
     transfer_projection_comparison,
     optimize_transfer_plans,
+    transfer_plan_action_threshold,
+    verified_player_price_tenths,
+    exact_fpl_tenths,
+    pounds_millions_to_tenths,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -526,24 +530,26 @@ with st.sidebar:
         control_hist_rows = control_history.get("current", []) if isinstance(control_history, dict) else []
         control_hist_rows = sorted([r for r in control_hist_rows if isinstance(r, dict) and r.get("event") is not None], key=lambda r: int(r.get("event", 0)))
         auto_bank_raw = control_hist_rows[-1].get("bank") if control_hist_rows else None
-    auto_bank = float(auto_bank_raw) / 10.0 if auto_bank_raw is not None else None
+    auto_bank_tenths = exact_fpl_tenths(auto_bank_raw)
+    auto_bank = auto_bank_tenths / 10.0 if auto_bank_tenths is not None else None
     # Adjust the last-deadline bank by publicly visible transactions in the upcoming GW where prices are included.
-    latest_bank_known = auto_bank_raw is not None
+    latest_bank_known = auto_bank_tenths is not None
     current_transactions = [r for r in (control_transfers if isinstance(control_transfers, list) else [])
                             if isinstance(r, dict) and str(r.get("event", "")) == str(control_gw)]
-    current_tx_adjustment = 0.0
+    current_tx_adjustment_tenths = 0
     for tx in current_transactions:
         try:
-            out_cost = tx.get("element_out_cost")
-            in_cost = tx.get("element_in_cost")
+            out_cost = verified_player_price_tenths(tx.get("element_out_cost"))
+            in_cost = verified_player_price_tenths(tx.get("element_in_cost"))
             if out_cost is None or in_cost is None:
                 latest_bank_known = False
                 continue
-            current_tx_adjustment += (float(out_cost) - float(in_cost)) / 10.0
+            current_tx_adjustment_tenths += out_cost - in_cost
         except (TypeError, ValueError):
             latest_bank_known = False
     if current_transactions and latest_bank_known:
-        auto_bank = max(0.0, min(20.0, auto_bank + current_tx_adjustment))
+        auto_bank_tenths = max(0, min(200, auto_bank_tenths + current_tx_adjustment_tenths))
+        auto_bank = auto_bank_tenths / 10.0
     sync_mode = st.selectbox("Budget & transfer source", ["Auto-sync from FPL history", "Manual override"], index=0,
                              help="Bank comes from the latest public deadline record plus visible current-Gameweek transfers. Free transfers are reconstructed from historical transfers, hit costs and chips; override if the FPL page differs.")
     auto_controls = sync_mode == "Auto-sync from FPL history"
@@ -562,6 +568,8 @@ with st.sidebar:
                                  help="Enter the current bank from your FPL Transfers page. This is the override for uncertain or unpublished current transfers.")
         free_transfers = st.selectbox("Free transfers available", [0,1,2,3,4,5], index=max(0, min(5, int(auto_ft))), key="manual_ft_override",
                                       help="Enter the exact number shown in the official FPL app.")
+    bank_tenths_current = (auto_bank_tenths if auto_controls and latest_bank_known
+                           else pounds_millions_to_tenths(bank_m))
     transfer_hit = st.checkbox("Allow a -4 hit if model sees a gain", value=False,
                                 help="If enabled, subtracts four points from the projected gain before ranking. A hit should only be considered for a clear multi-week advantage.")
     risk = st.select_slider("Risk appetite", options=["Conservative","Moderate","Aggressive"], value="Moderate",
@@ -2002,8 +2010,9 @@ with decide_tab:
         candidates = pd.DataFrame([{
             "Player": p.get("web_name"), "Position": pos_name(p,types),
             "Club": teams.get(p.get("team"),{}).get("short_name","?"),
-            "Price (£m)": round((p.get("now_cost") or 0)/10,1),
-            "Price (tenths)": int(p.get("now_cost") or 0),
+            "Price (£m)": ((verified_player_price_tenths(p.get("now_cost")) / 10)
+                            if verified_player_price_tenths(p.get("now_cost")) is not None else None),
+            "Price (tenths)": verified_player_price_tenths(p.get("now_cost")),
             "Form": float(p.get("form") or 0), "PPG": float(p.get("points_per_game") or 0),
             "Minutes": int(p.get("minutes") or 0), "Status": p.get("status","?"),
             "Chance (%)": p.get("chance_of_playing_next_round"),
@@ -2036,7 +2045,9 @@ with decide_tab:
                 _optimization_players[int(_row["id"])] = {
                     "id": int(_row["id"]), "Player": str(_row["Player"]),
                     "position": str(_row["Position"]), "Position": str(_row["Position"]),
-                    "club": str(_row["Club"]), "price_tenths": int(_row["Price (tenths)"]),
+                    "club": str(_row["Club"]),
+                    "price_tenths": (int(_row["Price (tenths)"])
+                                      if pd.notna(_row["Price (tenths)"]) else None),
                     "projections": [float(r["points"]) for r in _projection_series_for(_p)],
                     "Minutes": int(_row["Minutes"]), "Status": _row["Status"],
                     "Chance (%)": _row["Chance (%)"],
@@ -2063,10 +2074,10 @@ with decide_tab:
             if len(_optimization_squad) == 15:
                 _optimization_plans = optimize_transfer_plans(
                     _optimization_squad, list(_optimization_players.values()),
-                    free_transfers, round(float(bank_m) * 10) if bank_m is not None else None,
+                    free_transfers, bank_tenths_current,
                     horizon=int(horizon),
                     start_gw=int(gw), beam_width=120, candidate_limit=30,
-                    budget_verified=(bank_m is not None and all(int(r["id"]) in purchase_price_current_ids for r in resolved)),
+                    budget_verified=(bank_tenths_current is not None and all(int(r["id"]) in purchase_price_current_ids for r in resolved)),
                     score_roster=_lineup_points_for_roster,
                 )
         # AUTOMATIC TRANSFER SCAN: evaluate every possible player-out / player-in pair.
@@ -2075,9 +2086,9 @@ with decide_tab:
         hit_cost_auto = transfer_hit_cost(free_transfers, transfer_hit)
         _sale_prices_verified = all(int(row["id"]) in purchase_price_current_ids for row in resolved)
         _budget_state_verified = (
-            not auto_controls or
+            bank_tenths_current is not None and (not auto_controls or
             (latest_bank_known and auto_ft_confident
-             and (squad_source != "prior" or bool(squad_load.get("transfer_history_reconstructed"))))
+             and (squad_source != "prior" or bool(squad_load.get("transfer_history_reconstructed")))))
         )
         transfer_inputs_verified = _sale_prices_verified and _budget_state_verified
         auto_rows = []
@@ -2093,8 +2104,8 @@ with decide_tab:
 
         for _, outgoing in df.iterrows():
             outgoing_price_tenths = int(outgoing.get("Sell price (tenths)", round(float(outgoing.get("Sell price (£m)", outgoing["Price (£m)"])) * 10)))
-            bank_tenths = round(float(bank_m) * 10) if bank_m is not None else 0
-            budget_ceiling_tenths = transfer_budget_tenths(outgoing_price_tenths, bank_tenths) if bank_m is not None else -1
+            bank_tenths = bank_tenths_current if bank_tenths_current is not None else 0
+            budget_ceiling_tenths = transfer_budget_tenths(outgoing_price_tenths, bank_tenths) if bank_tenths_current is not None else -1
             budget_ceiling = budget_ceiling_tenths / 10
             same_position = candidates[candidates["Position"] == outgoing["Position"]]
             possible_buys = same_position[
@@ -2213,8 +2224,10 @@ with decide_tab:
                 reason_line = "Current pick data is missing an official purchase price for at least one player, so the selling-price budget cannot be verified."
             elif squad_source == "prior" and auto_controls:
                 reason_line = "The prior squad is manager-confirmed, but the bank and free-transfer count may still reflect GW{}; switch to Manual override and confirm both in FPL before using transfer advice.".format(squad_load.get("baseline_gw"))
+            elif bank_tenths_current is None:
+                reason_line = "The bank is missing or is not an exact £0.1m amount, so affordability cannot be verified. Confirm the FPL bank or enter a valid manual override."
             else:
-                reason_line = "Auto-synced bank or free-transfer history is uncertain. Confirm the values in FPL or use manual override before relying on a transfer shortlist."
+                reason_line = "Auto-synced free-transfer history is uncertain. Confirm the value in FPL or use manual override before relying on a transfer shortlist."
         if auto_rows:
             auto_df = pd.DataFrame(auto_rows)
             # Show the highest-scoring legal swap for each player we could sell.
@@ -2251,34 +2264,63 @@ with decide_tab:
             reason_line = "No legal, affordable one-for-one transfers were found. Check squad matching, budget, and club-count warnings."
 
         _preferred_plan = None
-        if _optimization_plans and transfer_inputs_verified and not unmatched:
-            _preferred_plan = max(_optimization_plans.values(), key=lambda plan: plan["cumulative_net_gain"])
-            _preferred_gain = float(_preferred_plan["cumulative_net_gain"])
-            _preferred_threshold = 6.0 if _preferred_plan["paid_transfers"] else 4.0
-            if _preferred_plan["transfer_count"] == 0 or _preferred_gain < _preferred_threshold:
-                decision_label = "HOLD / ROLL"
-                candidate_summary = "Retain free transfers"
-                gain = _preferred_gain
-                threshold = _preferred_threshold
-                reason_line = "The best legal plan does not clear the engine's projected advantage threshold over hold."
-            elif hours_to_deadline_now is not None and hours_to_deadline_now > 24:
-                decision_label = "HOLD FOR NOW"
-                candidate_summary = " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _preferred_plan["transfers"])
-                gain = _preferred_gain
-                threshold = _preferred_threshold
-                reason_line = "The plan clears the projected advantage threshold, but the deadline is more than 24 hours away. Recheck closer to deadline and after team news."
-            elif _preferred_plan["paid_transfers"]:
-                decision_label = "TRANSFER WITH -4 · ACCEPT HIT"
-                candidate_summary = " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _preferred_plan["transfers"])
-                gain = _preferred_gain
-                threshold = _preferred_threshold
-                reason_line = f"Best plan uses {_preferred_plan['free_transfers_used']} free transfer(s) and {_preferred_plan['paid_transfers']} paid transfer(s). Accept the {_preferred_plan['hit_cost']}-point hit before acting."
+        _all_optimization_plans = list(_optimization_plans.values())
+        _projection_only_plans = []
+        for _plan in _all_optimization_plans:
+            _projection_only_plans.extend(_plan.get("projection_only_alternatives", []))
+            if _plan.get("projection_only") and _plan.get("transfer_count", 0) > 0:
+                _projection_only_plans.append(_plan)
+        _verified_plans = [plan for plan in _all_optimization_plans if plan.get("affordable") is True]
+        _best_verified_plan = max(_verified_plans, key=lambda plan: plan["cumulative_net_gain"]) if _verified_plans else None
+        _best_projection_only = (max(_projection_only_plans, key=lambda plan: plan["cumulative_net_gain"])
+                                 if _projection_only_plans else None)
+        _projection_threshold = (transfer_plan_action_threshold(_best_projection_only["paid_transfers"])
+                                 if _best_projection_only else float("inf"))
+        _projection_only_outscores = bool(
+            _best_projection_only and _best_verified_plan
+            and _best_projection_only["cumulative_net_gain"] > _best_verified_plan["cumulative_net_gain"]
+            and _best_projection_only["cumulative_net_gain"] >= _projection_threshold
+        )
+        if _optimization_plans and transfer_inputs_verified and not unmatched and _projection_only_outscores:
+            _preferred_plan = None
+            decision_label = "VERIFY DATA"
+            candidate_summary = " · ".join(f"{m['out']['Player']} → {m['in']['Player']}"
+                                           for m in _best_projection_only["transfers"])
+            gain = float(_best_projection_only["cumulative_net_gain"])
+            threshold = transfer_plan_action_threshold(_best_projection_only["paid_transfers"])
+            reason_line = _best_projection_only.get("budget_reason") or "The higher-projected plan has unverified affordability; confirm its prices before acting."
+        elif _optimization_plans and transfer_inputs_verified and not unmatched:
+            _preferred_plan = _best_verified_plan
+            if _preferred_plan is None:
+                decision_label = "VERIFY DATA"
+                reason_line = "Only projection-only transfer plans are available; confirm bank and manager-specific prices before acting."
             else:
-                decision_label = "TRANSFER"
-                candidate_summary = " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _preferred_plan["transfers"])
-                gain = _preferred_gain
-                threshold = _preferred_threshold
-                reason_line = f"Best plan uses {_preferred_plan['free_transfers_used']} free transfer(s) and improves projected starting-XI points over hold."
+                _preferred_gain = float(_preferred_plan["cumulative_net_gain"])
+                _preferred_threshold = transfer_plan_action_threshold(_preferred_plan["paid_transfers"])
+                if _preferred_plan["transfer_count"] == 0 or _preferred_gain < _preferred_threshold:
+                    decision_label = "HOLD / ROLL"
+                    candidate_summary = "Retain free transfers"
+                    gain = _preferred_gain
+                    threshold = _preferred_threshold
+                    reason_line = "The best verified plan does not clear the engine's projected advantage threshold over hold."
+                elif hours_to_deadline_now is not None and hours_to_deadline_now > 24:
+                    decision_label = "HOLD FOR NOW"
+                    candidate_summary = " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _preferred_plan["transfers"])
+                    gain = _preferred_gain
+                    threshold = _preferred_threshold
+                    reason_line = "The plan clears the projected advantage threshold, but the deadline is more than 24 hours away. Recheck closer to deadline and after team news."
+                elif _preferred_plan["paid_transfers"]:
+                    decision_label = "TRANSFER WITH -4 · ACCEPT HIT"
+                    candidate_summary = " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _preferred_plan["transfers"])
+                    gain = _preferred_gain
+                    threshold = _preferred_threshold
+                    reason_line = f"Best verified plan uses {_preferred_plan['free_transfers_used']} free transfer(s) and {_preferred_plan['paid_transfers']} paid transfer(s). Accept the {_preferred_plan['hit_cost']}-point hit before acting."
+                else:
+                    decision_label = "TRANSFER"
+                    candidate_summary = " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _preferred_plan["transfers"])
+                    gain = _preferred_gain
+                    threshold = _preferred_threshold
+                    reason_line = f"Best verified plan uses {_preferred_plan['free_transfers_used']} free transfer(s) and improves projected starting-XI points over hold."
         elif _optimization_plans and not transfer_inputs_verified:
             decision_label = "VERIFY DATA"
             reason_line = "Projected plans are shown below, but current bank, free-transfer count, or selling-price inputs are uncertain; affordability is unverified."
@@ -2368,26 +2410,32 @@ with decide_tab:
 
         if _optimization_plans:
             st.markdown("#### Multi-transfer plans")
-            st.caption("Bounded beam search: at most 30 incoming candidates and 120 states per transfer count; plans are scored with the expected XI and captain bonus for each Gameweek. Up to two paid transfers are compared and require hit acceptance.")
+            st.caption("Bounded beam search: at most 30 incoming candidates and 120 states per transfer count; plans use the expected XI plus captain bonus each Gameweek. The preferred-plan threshold is +4 cumulative points over the selected horizon for free-transfer plans, or +6 after paid-transfer hits. Up to two paid transfers are compared and require hit acceptance. The search is approximate and does not prove a global optimum.")
             _plan_rows = []
             for _count, _plan in sorted(_optimization_plans.items()):
-                _move_text = " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _plan["transfers"]) or "Hold / roll"
-                _risk_text = " · ".join(
-                    f"{m['in']['Player']}: {int(m['in'].get('Minutes', 0))} min · {m['in'].get('Status', '?')} · {m['in'].get('Chance (%)') if pd.notna(m['in'].get('Chance (%)')) else 'chance n/a'}%"
-                    for m in _plan["transfers"]
-                ) or "No incoming-player risk"
-                _plan_rows.append({
-                    "Transfers": _move_text,
-                    "Free used": _plan["free_transfers_used"],
-                    "Paid": _plan["paid_transfers"],
-                    "Hit": f"-{_plan['hit_cost']} pts" if _plan["hit_cost"] else "None",
-                    "Budget before (£m)": (f"£{_plan['budget_before_tenths'] / 10:.1f}m" if _plan["budget_before_tenths"] is not None else "Unverified"),
-                    "Budget after (£m)": (f"£{_plan['budget_after_tenths'] / 10:.1f}m" if _plan["budget_after_tenths"] is not None else "Unverified"),
-                    "Affordability": "Verified" if _plan["affordable"] is True else "Unverified",
-                    "Minutes / availability": _risk_text,
-                    "Net gain vs hold": f"{_plan['cumulative_net_gain']:+.1f}",
-                    "By Gameweek": " · ".join(f"GW{r['gameweek']} {r['plan_points']:.1f} vs {r['hold_points']:.1f}" for r in _plan["gameweeks"]),
-                })
+                _table_plans = [_plan, *_plan.get("projection_only_alternatives", [])]
+                for _shown_plan in _table_plans:
+                    _move_text = " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _shown_plan["transfers"]) or "Hold / roll"
+                    _risk_text = " · ".join(
+                        f"{m['in']['Player']}: {int(m['in'].get('Minutes', 0))} min · {m['in'].get('Status', '?')} · {m['in'].get('Chance (%)') if pd.notna(m['in'].get('Chance (%)')) else 'chance n/a'}%"
+                        for m in _shown_plan["transfers"]
+                    ) or "No incoming-player risk"
+                    _plan_rows.append({
+                        "Transfers": _move_text,
+                        "Free used": _shown_plan["free_transfers_used"],
+                        "Paid": _shown_plan["paid_transfers"],
+                        "Hit": f"-{_shown_plan['hit_cost']} pts" if _shown_plan["hit_cost"] else "None",
+                        "Budget before (£m)": (f"£{_shown_plan['budget_before_tenths'] / 10:.1f}m" if _shown_plan["budget_before_tenths"] is not None else "Unverified"),
+                        "Budget after (£m)": (f"£{_shown_plan['budget_after_tenths'] / 10:.1f}m" if _shown_plan["budget_after_tenths"] is not None else "Unverified"),
+                        "Affordability": ("Not needed for hold" if _shown_plan["transfer_count"] == 0
+                                           else "Verified" if _shown_plan["affordable"] is True else "Unverified"),
+                        "Plan status": ("Hold / roll baseline" if _shown_plan["transfer_count"] == 0
+                                        else "Projection only — verify budget" if _shown_plan.get("projection_only")
+                                        else "Verified budget"),
+                        "Minutes / availability": _risk_text,
+                        "Net gain vs hold": f"{_shown_plan['cumulative_net_gain']:+.1f}",
+                        "By Gameweek": " · ".join(f"GW{r['gameweek']} {r['plan_points']:.1f} vs {r['hold_points']:.1f}" for r in _shown_plan["gameweeks"]),
+                    })
             st.dataframe(pd.DataFrame(_plan_rows), use_container_width=True, hide_index=True)
             if not transfer_inputs_verified:
                 st.warning("These projections do not establish affordability because a required budget or transfer input is unverified.")
@@ -2399,18 +2447,18 @@ with decide_tab:
             sell_name = st.selectbox("Sell player", squad_names, index=0)
             sell = df[df["Player"]==sell_name].iloc[0]
             sale_price_tenths = int(sell.get("Sell price (tenths)", round(float(sell.get("Sell price (£m)", sell["Price (£m)"])) * 10)))
-            bank_tenths = round(float(bank_m) * 10) if bank_m is not None else 0
+            bank_tenths = bank_tenths_current if bank_tenths_current is not None else 0
             max_price_tenths = transfer_budget_tenths(sale_price_tenths, bank_tenths)
             max_price = max_price_tenths / 10
             options = candidates[(candidates["Position"]==sell["Position"]) &
                                  (~candidates["Player"].isin(squad_names)) &
                                  candidates["Price (tenths)"].map(lambda price: is_affordable_tenths(price, max_price_tenths))].copy()
-            _manual_budget_verified = (not auto_controls or
-                                       (squad_source != "prior" and latest_bank_known and auto_ft_confident))
-            if (bank_m is None or int(sell["id"]) not in purchase_price_current_ids
+            _manual_budget_verified = (bank_tenths_current is not None and (not auto_controls or
+                                       (squad_source != "prior" and latest_bank_known and auto_ft_confident)))
+            if (bank_tenths_current is None or int(sell["id"]) not in purchase_price_current_ids
                     or not _manual_budget_verified):
                 options = options.iloc[0:0]
-                if bank_m is None:
+                if bank_tenths_current is None:
                     st.info("Current bank is unavailable. This comparison is withheld; switch to manual override and enter the FPL bank.")
                 if int(sell["id"]) not in purchase_price_current_ids:
                     st.info("The selected player's official current purchase price is unavailable, so the selling-price budget cannot be verified.")

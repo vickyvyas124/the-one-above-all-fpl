@@ -1,4 +1,5 @@
 import unittest
+from itertools import combinations
 
 from fpl_transfer import (
     gameweek_projection_series,
@@ -8,7 +9,10 @@ from fpl_transfer import (
     transfer_hit_cost,
     transfer_projection_comparison,
     optimize_transfer_plans,
+    transfer_plan_action_threshold,
+    pounds_millions_to_tenths,
 )
+from fpl_lineup import score_starting_xi
 
 
 class TransferProjectionTests(unittest.TestCase):
@@ -22,11 +26,20 @@ class TransferProjectionTests(unittest.TestCase):
         self.assertEqual(budget, 110)
         self.assertTrue(is_affordable_tenths(110, budget))
         self.assertFalse(is_affordable_tenths(111, budget))
+        with self.assertRaises(ValueError):
+            transfer_budget_tenths(100.5, 0)
+        self.assertEqual(pounds_millions_to_tenths("1.3"), 13)
+        self.assertIsNone(pounds_millions_to_tenths("1.35"))
 
     def test_hit_only_applies_when_enabled_and_no_free_transfer_exists(self):
         self.assertEqual(transfer_hit_cost(0, False), 0)
         self.assertEqual(transfer_hit_cost(0, True), 4)
         self.assertEqual(transfer_hit_cost(1, True), 0)
+
+    def test_plan_thresholds_apply_to_cumulative_horizon_gain_after_hits(self):
+        self.assertEqual(transfer_plan_action_threshold(0), 4.0)
+        self.assertEqual(transfer_plan_action_threshold(1), 6.0)
+        self.assertEqual(transfer_plan_action_threshold(2), 6.0)
 
     def test_series_uses_one_gameweek_per_row_including_blanks(self):
         def estimate(_player, _team, _fixtures, *, horizon, start_gw):
@@ -105,11 +118,15 @@ class TransferProjectionTests(unittest.TestCase):
                   "sell_tenths": 0, "price_tenths": 100, "projections": [1]}
                  for i, pos in enumerate(positions)]
         candidates = [
-            {"id": 100, "position": "GK", "club": "NEW1", "price_tenths": 0,
+            {"id": 100, "position": "GK", "club": "NEW1", "price_tenths": 100,
              "sell_tenths": 1000, "projections": [10]},
-            {"id": 101, "position": "GK", "club": "NEW2", "price_tenths": 100,
+            {"id": 101, "position": "GK", "club": "NEW2", "price_tenths": 201,
              "projections": [20]},
         ]
+        # The first purchase pretends to carry £100m of resale value. It must
+        # never fund the second purchase; only original sale proceeds count.
+        for player in squad:
+            player["sell_tenths"] = 100
         plans = optimize_transfer_plans(squad, candidates, 2, 0, horizon=1)
         self.assertNotIn(2, plans)
         self.assertTrue(all(move["out"]["id"] <= 15
@@ -128,12 +145,106 @@ class TransferProjectionTests(unittest.TestCase):
         self.assertIsNone(plans[1]["affordable"])
         self.assertIsNone(plans[1]["budget_before_tenths"])
         self.assertIsNone(plans[1]["budget_after_tenths"])
+        self.assertIsNone(plans[0]["budget_before_tenths"])
+        self.assertIsNone(plans[0]["budget_after_tenths"])
         fractional_bank = optimize_transfer_plans(squad, candidates, 1, 0.5, horizon=1)
         self.assertIsNone(fractional_bank[1]["affordable"])
         missing_sales = [dict(player, sell_tenths=100) for player in squad]
         missing_sales[0].pop("sell_tenths")
         missing_price = optimize_transfer_plans(missing_sales, candidates, 1, 10, horizon=1)
-        self.assertIsNone(missing_price[1]["affordable"])
+        self.assertTrue(missing_price[1]["affordable"])
+        self.assertNotEqual(missing_price[1]["transfers"][0]["out"]["id"], missing_sales[0]["id"])
+
+        all_gk_sales_unknown = [dict(player, sell_tenths=100) for player in squad]
+        all_gk_sales_unknown[0]["sell_tenths"] = None
+        all_gk_sales_unknown[1]["sell_tenths"] = None
+        missing_selected_sale = optimize_transfer_plans(all_gk_sales_unknown, candidates, 1, 10, horizon=1)
+        self.assertIsNone(missing_selected_sale[1]["affordable"])
+        self.assertIn("selling price", missing_selected_sale[1]["budget_reason"])
+
+    def test_candidate_price_uncertainty_is_local_and_never_uses_zero(self):
+        positions = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3
+        squad = [{"id": i + 1, "position": pos, "club": f"C{i // 3}",
+                  "sell_tenths": 100, "price_tenths": 100, "projections": [1]}
+                 for i, pos in enumerate(positions)]
+        known = {"id": 100, "position": "GK", "club": "KNOWN", "price_tenths": 100,
+                 "projections": [8]}
+        unknown = {"id": 101, "position": "GK", "club": "UNKNOWN", "price_tenths": None,
+                   "projections": [20]}
+        plans = optimize_transfer_plans(squad, [known, unknown], 1, 0, horizon=1)
+        self.assertTrue(plans[1]["affordable"])
+        self.assertEqual(plans[1]["transfers"][0]["in"]["id"], 100)
+        alternatives = plans[1]["projection_only_alternatives"]
+        self.assertEqual(len(alternatives), 1)
+        self.assertIsNone(alternatives[0]["affordable"])
+        self.assertTrue(alternatives[0]["projection_only"])
+        self.assertIsNone(alternatives[0]["transfers"][0]["in"]["price_tenths"])
+        self.assertIsNone(alternatives[0]["budget_after_tenths"])
+
+        # Missing price on an unused candidate cannot downgrade the verified plan.
+        unused_unknown = dict(unknown, projections=[5])
+        known_only = optimize_transfer_plans(squad, [known, unused_unknown], 1, 0, horizon=1,
+                                             candidate_limit=1)
+        self.assertTrue(known_only[1]["affordable"])
+        malformed = dict(unknown, id=102, price_tenths="not-a-price")
+        malformed_plan = optimize_transfer_plans(squad, [malformed], 1, 0, horizon=1)
+        self.assertIsNone(malformed_plan[1]["affordable"])
+        self.assertIsNone(malformed_plan[1]["transfers"][0]["in"]["price_tenths"])
+        zero_price = dict(unknown, id=103, price_tenths=0)
+        zero_plan = optimize_transfer_plans(squad, [zero_price], 1, 0, horizon=1)
+        self.assertIsNone(zero_plan[1]["affordable"])
+
+    def test_unselected_missing_sale_price_does_not_downgrade_plan(self):
+        positions = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3
+        squad = [{"id": i + 1, "position": pos, "club": f"C{i // 3}",
+                  "sell_tenths": 100, "price_tenths": 100, "projections": [1]}
+                 for i, pos in enumerate(positions)]
+        squad[1]["sell_tenths"] = None
+        candidate = {"id": 100, "position": "GK", "club": "NEW", "price_tenths": 100,
+                     "projections": [10]}
+        plans = optimize_transfer_plans(squad, [candidate], 1, 0, horizon=1)
+        self.assertTrue(plans[1]["affordable"])
+        self.assertEqual(plans[1]["transfers"][0]["out"]["id"], 1)
+
+    def test_bounded_search_matches_exhaustive_two_transfer_search(self):
+        positions = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3
+        current_points = [2, 1, 6, 6, 6, 6, 6, 5, 6, 8, 9, 10, 4, 4, 4]
+        squad = [{"id": i + 1, "position": pos, "club": f"C{i // 3}",
+                  "sell_tenths": 100, "price_tenths": 100, "projections": [current_points[i]]}
+                 for i, pos in enumerate(positions)]
+        candidates = [
+            {"id": 100, "position": "MID", "club": "NEW1", "price_tenths": 100,
+             "projections": [8]},
+            {"id": 101, "position": "MID", "club": "NEW2", "price_tenths": 100,
+             "projections": [7]},
+        ]
+
+        def score(roster, _week):
+            return score_starting_xi(roster, {p["id"]: p["projections"][0] for p in roster})
+
+        plans = optimize_transfer_plans(squad, candidates, 2, 0, horizon=1,
+                                        beam_width=100, candidate_limit=2,
+                                        score_roster=score)
+        hold_score = score(squad, 0)
+        one_gain = max(score(plan["roster"], 0) - hold_score for plan in [plans[1]])
+        self.assertLess(one_gain, transfer_plan_action_threshold(0))
+
+        exhaustive_best = float("-inf")
+        for out_pair in combinations(squad, 2):
+            for in_pair in combinations(candidates, 2):
+                if sorted(p["position"] for p in out_pair) != sorted(p["position"] for p in in_pair):
+                    continue
+                roster = [p for p in squad if p not in out_pair] + list(in_pair)
+                clubs = {}
+                for player in roster:
+                    clubs[player["club"]] = clubs.get(player["club"], 0) + 1
+                if max(clubs.values()) > 3:
+                    continue
+                if sum(p["sell_tenths"] for p in out_pair) < sum(p["price_tenths"] for p in in_pair):
+                    continue
+                exhaustive_best = max(exhaustive_best, score(roster, 0))
+        self.assertGreater(exhaustive_best - hold_score, one_gain)
+        self.assertEqual(score(plans[2]["roster"], 0), exhaustive_best)
 
     def test_position_and_club_constraints_hold_after_each_move(self):
         positions = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3
