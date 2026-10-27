@@ -51,6 +51,10 @@ class ModelLineupTests(unittest.TestCase):
         self.assertIn(selection["captain"]["id"], {p["id"] for p in starters})
         self.assertIn(selection["vice"]["id"], {p["id"] for p in starters})
         self.assertNotEqual(selection["captain"]["id"], selection["vice"]["id"])
+        base_total = sum(player["GW projected pts"] for player in starters)
+        self.assertEqual(selection["base_xi_projected_points"], base_total)
+        self.assertEqual(selection["captain_extra_points"], selection["captain"]["GW projected pts"])
+        self.assertEqual(selection["projected_points"], base_total + selection["captain"]["GW projected pts"])
 
     def test_rejects_duplicate_or_invalid_squad_shape(self):
         squad = make_squad()

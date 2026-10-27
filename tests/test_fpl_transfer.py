@@ -2,7 +2,9 @@ import unittest
 
 from fpl_transfer import (
     gameweek_projection_series,
+    is_affordable_tenths,
     official_selling_price_tenths,
+    transfer_budget_tenths,
     transfer_hit_cost,
     transfer_projection_comparison,
 )
@@ -13,6 +15,12 @@ class TransferProjectionTests(unittest.TestCase):
         self.assertEqual(official_selling_price_tenths(100, 107), 103)
         self.assertEqual(official_selling_price_tenths(100, 101), 100)
         self.assertEqual(official_selling_price_tenths(107, 100), 100)
+
+    def test_budget_uses_exact_fpl_tenths_and_includes_sale_plus_bank(self):
+        budget = transfer_budget_tenths(103, 7)
+        self.assertEqual(budget, 110)
+        self.assertTrue(is_affordable_tenths(110, budget))
+        self.assertFalse(is_affordable_tenths(111, budget))
 
     def test_hit_only_applies_when_enabled_and_no_free_transfer_exists(self):
         self.assertEqual(transfer_hit_cost(0, False), 0)

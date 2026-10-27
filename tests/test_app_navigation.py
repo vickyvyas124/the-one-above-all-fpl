@@ -213,6 +213,24 @@ class DashboardNavigationAppTests(unittest.TestCase):
             self.assertEqual(xi_table.value["Captain"].eq("C").sum(), 1)
             self.assertEqual(xi_table.value["Vice"].eq("VC").sum(), 1)
             self.assertIn("Kostoulas", xi_names + bench_names)
+            _captain_xi_row = xi_table.value.loc[xi_table.value["Captain"].eq("C")].iloc[0]
+            _xi_base_total = float(xi_table.value["GW2 pts"].sum())
+            _xi_with_captain = next(
+                item for item in model_tab.metric
+                if item.label == "XI + captain projected points"
+            )
+            self.assertAlmostEqual(float(_xi_with_captain.value), _xi_base_total + float(_captain_xi_row["GW2 pts"]))
+            _captain_table = next(
+                item for item in app.tabs[1].dataframe
+                if {"Projected GW points", "Captain 2× estimate"}.issubset(item.value.columns)
+            )
+            _captain_candidate = _captain_table.value.loc[
+                _captain_table.value["Player"].eq(_captain_xi_row["Player"])
+            ].iloc[0]
+            self.assertAlmostEqual(
+                float(_captain_candidate["Captain 2× estimate"]),
+                2 * float(_captain_candidate["Projected GW points"]),
+            )
             _formation_metric = next(item for item in model_tab.metric if item.label == "Model-best formation")
             _defenders, _midfielders, _forwards = map(int, _formation_metric.value.split("-"))
             self.assertTrue(3 <= _defenders <= 5 and 2 <= _midfielders <= 5 and 1 <= _forwards <= 3)
@@ -266,6 +284,14 @@ class DashboardNavigationAppTests(unittest.TestCase):
                 if item.label == "Transfer to inspect"
             )
             self.assertTrue(_detail_select.options)
+            _budget_table = next(
+                item for item in decide_tab.dataframe
+                if {"Buy price (£m)", "Budget ceiling (£m)"}.issubset(item.value.columns)
+            )
+            self.assertTrue(
+                (_budget_table.value["Buy price (£m)"] <= _budget_table.value["Budget ceiling (£m)"]).all(),
+                "Every automatic transfer candidate must fit within official sale price plus bank.",
+            )
             _comparison = next(
                 item for item in decide_tab.dataframe
                 if {"Hold current player", "Transfer candidate", "Cumulative net"}.issubset(item.value.columns)

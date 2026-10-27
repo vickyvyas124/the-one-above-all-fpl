@@ -106,5 +106,8 @@ def select_model_lineup(squad, projection_by_id):
     return {
         "starters": best, "bench": bench, "captain": captain, "vice": vice,
         "formation": f"{roles['DEF']}-{roles['MID']}-{roles['FWD']}",
-        "projected_points": sum(item["GW projected pts"] for item in best),
+        "base_xi_projected_points": sum(item["GW projected pts"] for item in best),
+        "captain_extra_points": captain["GW projected pts"],
+        # FPL scores the captain at 2x; the lineup sum already includes their base 1x.
+        "projected_points": sum(item["GW projected pts"] for item in best) + captain["GW projected pts"],
     }

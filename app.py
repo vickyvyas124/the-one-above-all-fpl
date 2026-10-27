@@ -13,7 +13,9 @@ from fpl_ui_labels import status_chip_labels
 from fpl_lineup import select_model_lineup, validate_public_picks
 from fpl_transfer import (
     gameweek_projection_series,
+    is_affordable_tenths,
     official_selling_price_tenths,
+    transfer_budget_tenths,
     transfer_hit_cost,
     transfer_projection_comparison,
 )
@@ -876,6 +878,10 @@ for row in squad_rows:
                 purchase_price_by_id.get(int(p["id"]), int(p.get("now_cost") or 0)),
                 int(p.get("now_cost") or 0),
             ) / 10, 1),
+            "Sell price (tenths)": official_selling_price_tenths(
+                purchase_price_by_id.get(int(p["id"]), int(p.get("now_cost") or 0)),
+                int(p.get("now_cost") or 0),
+            ),
             "Selling price source": "Current FPL picks" if int(p["id"]) in purchase_price_current_ids else "Estimated from current price",
             "Form": float(p.get("form") or 0), "PPG": float(p.get("points_per_game") or 0),
             "Minutes": int(p.get("minutes") or 0), "Status": p.get("status","?"),
@@ -1701,7 +1707,10 @@ with model_tab:
         vice_pick = selected_lineup["vice"]
         xi_a, xi_b, xi_c = st.columns([1.1, 1.1, 1.8])
         xi_a.metric("Model-best formation", selected_lineup["formation"])
-        xi_b.metric("XI projected points", f"{selected_lineup['projected_points']:.1f}")
+        xi_b.metric("XI + captain projected points", f"{selected_lineup['projected_points']:.1f}",
+                    help=(f"Starter projections total {selected_lineup['base_xi_projected_points']:.1f}; "
+                          f"the captain's extra 1× projection adds {selected_lineup['captain_extra_points']:.1f}. "
+                          "Vice-captain points are conditional and are not added."))
         xi_c.metric("Captain / vice-captain", f"{captain_pick['Player']} / {vice_pick['Player']}", help="These are selected from the same legal XI displayed on the Squad tab.")
         xi_tab, bench_tab = st.columns([1.4, 1])
         with xi_tab:
@@ -1851,6 +1860,7 @@ with decide_tab:
             "Player": p.get("web_name"), "Position": pos_name(p,types),
             "Club": teams.get(p.get("team"),{}).get("short_name","?"),
             "Price (£m)": round((p.get("now_cost") or 0)/10,1),
+            "Price (tenths)": int(p.get("now_cost") or 0),
             "Form": float(p.get("form") or 0), "PPG": float(p.get("points_per_game") or 0),
             "Minutes": int(p.get("minutes") or 0), "Status": p.get("status","?"),
             "Chance (%)": p.get("chance_of_playing_next_round"),
@@ -1889,12 +1899,14 @@ with decide_tab:
             return mins_rel, avail_rel
 
         for _, outgoing in df.iterrows():
-            outgoing_price = float(outgoing.get("Sell price (£m)", outgoing["Price (£m)"]))
-            budget_ceiling = outgoing_price + float(bank_m) if bank_m is not None else -1.0
+            outgoing_price_tenths = int(outgoing.get("Sell price (tenths)", round(float(outgoing.get("Sell price (£m)", outgoing["Price (£m)"])) * 10)))
+            bank_tenths = round(float(bank_m) * 10) if bank_m is not None else 0
+            budget_ceiling_tenths = transfer_budget_tenths(outgoing_price_tenths, bank_tenths) if bank_m is not None else -1
+            budget_ceiling = budget_ceiling_tenths / 10
             same_position = candidates[candidates["Position"] == outgoing["Position"]]
             possible_buys = same_position[
                 (~same_position["Player"].isin(squad_names)) &
-                (same_position["Price (£m)"] <= budget_ceiling)
+                same_position["Price (tenths)"].map(lambda price: is_affordable_tenths(price, budget_ceiling_tenths))
             ]
             for _, incoming in possible_buys.iterrows():
                 # If buying from the same club as the outgoing player, the sale frees that club slot.
@@ -2132,10 +2144,13 @@ with decide_tab:
             squad_names = sorted(df["Player"].unique().tolist())
             sell_name = st.selectbox("Sell player", squad_names, index=0)
             sell = df[df["Player"]==sell_name].iloc[0]
-            max_price = float(sell.get("Sell price (£m)", sell["Price (£m)"])) + (bank_m if bank_m is not None else 0.0)
+            sale_price_tenths = int(sell.get("Sell price (tenths)", round(float(sell.get("Sell price (£m)", sell["Price (£m)"])) * 10)))
+            bank_tenths = round(float(bank_m) * 10) if bank_m is not None else 0
+            max_price_tenths = transfer_budget_tenths(sale_price_tenths, bank_tenths)
+            max_price = max_price_tenths / 10
             options = candidates[(candidates["Position"]==sell["Position"]) &
                                  (~candidates["Player"].isin(squad_names)) &
-                                 (candidates["Price (£m)"] <= max_price)].copy()
+                                 candidates["Price (tenths)"].map(lambda price: is_affordable_tenths(price, max_price_tenths))].copy()
             if bank_m is None or sell.get("Selling price source") != "Current FPL picks":
                 options = options.iloc[0:0]
                 if bank_m is None:

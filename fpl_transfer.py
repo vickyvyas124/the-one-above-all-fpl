@@ -8,6 +8,16 @@ def official_selling_price_tenths(purchase_price, current_price):
     return current if current <= purchase else purchase + (current - purchase) // 2
 
 
+def transfer_budget_tenths(selling_price, bank):
+    """Available one-player purchase budget in exact FPL tenths of a million."""
+    return int(selling_price) + int(bank)
+
+
+def is_affordable_tenths(player_price, budget):
+    """Whether an FPL price in tenths fits within the exact transfer budget."""
+    return int(player_price) <= int(budget)
+
+
 def transfer_hit_cost(free_transfers, allow_hit):
     """Cost for the one proposed transfer under the current hit setting."""
     return 4 if bool(allow_hit) and int(free_transfers) == 0 else 0
