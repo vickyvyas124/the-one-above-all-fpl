@@ -10,7 +10,7 @@ import fpl_engine
 import fpl_learning
 from fpl_availability import availability_adjustment
 from fpl_ui_labels import status_chip_labels
-from fpl_lineup import select_model_lineup
+from fpl_lineup import score_starting_xi, select_model_lineup
 from fpl_squad import load_public_squad, validate_squad_ids
 from fpl_transfer import (
     gameweek_projection_series,
@@ -19,6 +19,7 @@ from fpl_transfer import (
     transfer_budget_tenths,
     transfer_hit_cost,
     transfer_projection_comparison,
+    optimize_transfer_plans,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -214,9 +215,9 @@ def get_entry_transfers(team_id):
                          headers={"User-Agent":"Mozilla/5.0 The-One-Above-All-FPL/2.9"})
         r.raise_for_status()
         payload = r.json()
-        return payload if isinstance(payload, list) else []
+        return payload if isinstance(payload, list) else None
     except Exception:
-        return []
+        return None
 
 
 def infer_free_transfers(history_payload, bootstrap_events, upcoming_gw, transfer_rows=None):
@@ -514,8 +515,6 @@ with st.sidebar:
     try:
         control_transfers = get_entry_transfers(int(team_id))
         control_transfer_history_available = isinstance(control_transfers, list)
-        if not control_transfer_history_available:
-            control_transfers = None
     except Exception:
         control_transfers = None
     auto_ft, auto_ft_confident, auto_ft_note = infer_free_transfers(
@@ -608,10 +607,12 @@ elements_by_id = {int(p["id"]): p for p in players}
 squad_load = load_public_squad(
     int(gw), events, lambda event_id: get_entry_picks(int(team_id), int(event_id)),
     control_transfers, control_transfer_history_available, elements_by_id,
+    chip_rows=(control_history.get("chips") if isinstance(control_history, dict) else None),
 )
 squad_rows = []
 public_picks_for_display = list(squad_load.get("picks", []))
-picks_sync_ok = bool(squad_load.get("target_verified"))
+picks_sync_ok = bool(squad_load.get("target_verified") or
+                      (squad_load.get("available") and not squad_load.get("needs_confirmation")))
 picks_sync_note = str(squad_load.get("reason", "Live squad unavailable. No example or saved squad is substituted."))
 squad_source = str(squad_load.get("source", "unavailable"))
 squad_recommendations_allowed = picks_sync_ok
@@ -1061,9 +1062,11 @@ else:
 
 _model_status = "Trained" if fpl_learning.validate_model(fpl_engine.TRAINED_MODEL) else "Fallback"
 _squad_source_status = (
-    f"verified public picks · GW{gw}" if picks_sync_ok else
-    f"last published GW{squad_load.get('baseline_gw')} · {'confirmed · provisional' if squad_recommendations_allowed else 'confirm roster'}"
-    if squad_load.get("source") == "prior" else
+    f"verified public picks · GW{gw}" if squad_source == "current" else
+    f"auto-reconstructed from GW{squad_load.get('baseline_gw')} · provisional until GW{gw} picks publish"
+    if squad_source == "prior" and squad_recommendations_allowed else
+    f"last published GW{squad_load.get('baseline_gw')} · manual correction needed"
+    if squad_source == "prior" else
     "unavailable · check public picks"
 )
 if squad_source == "prior" and auto_controls and not squad_load.get("transfer_history_reconstructed"):
@@ -1086,15 +1089,15 @@ st.markdown(
 )
 
 with st.expander("How decisions are made", expanded=False):
-    st.markdown("**Decision rule:** HOLD unless a transfer clears the existing points-gain and reliability gates. Check the official FPL bank and selling price before acting. This dashboard never submits transfers automatically.")
-    st.write("The engine can recommend HOLD. A transfer candidate must clear the existing estimated Gameweek-by-Gameweek points edge, incoming minutes and availability checks, squad matching, and any points-hit justification.")
+    st.markdown("**Decision rule:** HOLD unless a legal multi-transfer plan clears the projected starting-XI advantage threshold after hits. Check the official FPL bank and selling price before acting. This dashboard never submits transfers automatically.")
+    st.write("Plans compare hold and roll with up to all free transfers plus two paid transfers. Paid plans always appear for comparison and require you to accept their hit.")
     st.markdown("""
     - Blends PPG/form with xG+xA, shrinks small samples toward a position baseline, estimates minutes from starts and appearances, and adjusts scheduled fixtures individually.
     - Uses public player status and chance-of-playing fields where available.
     - Does not access your FPL password, private `my-team` endpoint, or personal selling prices.
     - Model weights remain heuristic and are evaluated against historical and live validation metrics.
     - Public FPL data is unofficial and may change. Refresh requests use the existing cache and refresh controls.
-    - Current public picks are preferred. Before deadline, a validated last-published squad is shown as a provisional reference; confirm or correct it before recommendations are generated.
+    - Current public picks are preferred. Before deadline, the last completed picks and complete public transfer history are used to reconstruct a provisional squad. Manual correction appears only if that evidence is missing, inconsistent or ambiguous.
     """)
 
 decide_tab, squad_tab, fixtures_tab, model_tab = st.tabs(["Decide", "Squad", "Fixtures", "Model"])
@@ -1178,7 +1181,8 @@ with squad_tab:
         _latest_gw_label = latest_history.get("event", "—") if latest_history else "—"
         _lineup_source_label = (
             f"model-selected XI from verified GW{gw} picks" if selected_lineup and picks_sync_ok else
-            "model-selected from manager-confirmed prior squad · provisional" if selected_lineup else
+            "model-selected from auto-reconstructed prior squad · provisional" if selected_lineup and squad_source == "prior" else
+            "model-selected from verified public picks" if selected_lineup else
             f"last published GW{squad_load.get('baseline_gw')} reference · confirm before recommendations" if reference_lineup else
             "unavailable · public squad could not be verified"
         )
@@ -1863,7 +1867,7 @@ with model_tab:
             st.dataframe(bench_frame[["Order", "Player", "Position", "GW projected pts"]].rename(columns={"GW projected pts": f"GW{gw} pts"}), use_container_width=True, hide_index=True)
         st.caption("Projection source is the current v3.0 one-Gameweek forecast when available, otherwise the live prediction engine. These estimates do not guarantee points or submit changes to FPL.")
     elif resolved and not squad_recommendations_allowed:
-        st.info("This is the last published roster reference. Confirm or correct it in the sidebar to generate a current projected XI.")
+        st.info("A projected XI is withheld because current picks and public transfer history do not provide a complete, consistent roster. Correct the roster in the sidebar to continue.")
     elif resolved:
         st.warning("The current FPL roster does not form a valid 15-player squad and legal XI. Transfer and chip advice are withheld until roster data is verified.")
     else:
@@ -2019,6 +2023,52 @@ with decide_tab:
             "xA/90": round(float(p.get("expected_assists") or 0) / max(90, int(p.get("minutes") or 0)) * 90, 3),
             "Selected (%)": float(p.get("selected_by_percent") or 0), "id": p["id"],
         } for p in players])
+        # Rank complete legal plans by the same per-GW lineup selector used by
+        # the dashboard, so bench upgrades do not masquerade as XI gains.
+        _optimization_plans = {}
+        if selected_lineup:
+            _candidate_rows = candidates.sort_values(f"Projected {horizon}GW pts", ascending=False).head(30)
+            _optimization_players = {}
+            for _, _row in _candidate_rows.iterrows():
+                _p = _players_by_id.get(int(_row["id"]))
+                if not _p:
+                    continue
+                _optimization_players[int(_row["id"])] = {
+                    "id": int(_row["id"]), "Player": str(_row["Player"]),
+                    "position": str(_row["Position"]), "Position": str(_row["Position"]),
+                    "club": str(_row["Club"]), "price_tenths": int(_row["Price (tenths)"]),
+                    "projections": [float(r["points"]) for r in _projection_series_for(_p)],
+                    "Minutes": int(_row["Minutes"]), "Status": _row["Status"],
+                    "Chance (%)": _row["Chance (%)"],
+                }
+            _optimization_squad = []
+            for _r in resolved:
+                _p = _players_by_id.get(int(_r["id"]))
+                if not _p:
+                    continue
+                _optimization_squad.append({
+                    "id": int(_r["id"]), "Player": str(_r["Player"]),
+                    "position": str(_r["Position"]), "Position": str(_r["Position"]),
+                    "club": str(_r["Club"]), "price_tenths": int(_p.get("now_cost") or 0),
+                    "sell_tenths": int(_r["Sell price (tenths)"]),
+                    "projections": [float(r["points"]) for r in _projection_series_for(_p)],
+                    "Minutes": int(_r["Minutes"]), "Status": _r["Status"],
+                    "Chance (%)": _r["Chance (%)"],
+                })
+
+            def _lineup_points_for_roster(_roster, _gw_index):
+                _projection_map = {int(p["id"]): float(p["projections"][_gw_index]) for p in _roster}
+                return score_starting_xi(_roster, _projection_map)
+
+            if len(_optimization_squad) == 15:
+                _optimization_plans = optimize_transfer_plans(
+                    _optimization_squad, list(_optimization_players.values()),
+                    free_transfers, round(float(bank_m) * 10) if bank_m is not None else None,
+                    horizon=int(horizon),
+                    start_gw=int(gw), beam_width=120, candidate_limit=30,
+                    budget_verified=(bank_m is not None and all(int(r["id"]) in purchase_price_current_ids for r in resolved)),
+                    score_roster=_lineup_points_for_roster,
+                )
         # AUTOMATIC TRANSFER SCAN: evaluate every possible player-out / player-in pair.
         squad_names = sorted(df["Player"].dropna().unique().tolist())
         club_counts_auto = df["Club"].value_counts().to_dict()
@@ -2200,6 +2250,33 @@ with decide_tab:
         else:
             reason_line = "No legal, affordable one-for-one transfers were found. Check squad matching, budget, and club-count warnings."
 
+        _preferred_plan = None
+        if _optimization_plans and transfer_inputs_verified and not unmatched:
+            _preferred_plan = max(_optimization_plans.values(), key=lambda plan: plan["cumulative_net_gain"])
+            _preferred_gain = float(_preferred_plan["cumulative_net_gain"])
+            _preferred_threshold = 6.0 if _preferred_plan["paid_transfers"] else 4.0
+            if _preferred_plan["transfer_count"] == 0 or _preferred_gain < _preferred_threshold:
+                decision_label = "HOLD / ROLL"
+                candidate_summary = "Retain free transfers"
+                gain = _preferred_gain
+                threshold = _preferred_threshold
+                reason_line = "The best legal plan does not clear the engine's projected advantage threshold over hold."
+            elif _preferred_plan["paid_transfers"]:
+                decision_label = "TRANSFER WITH -4 · ACCEPT HIT"
+                candidate_summary = " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _preferred_plan["transfers"])
+                gain = _preferred_gain
+                threshold = _preferred_threshold
+                reason_line = f"Best plan uses {_preferred_plan['free_transfers_used']} free transfer(s) and {_preferred_plan['paid_transfers']} paid transfer(s). Accept the {_preferred_plan['hit_cost']}-point hit before acting."
+            else:
+                decision_label = "TRANSFER"
+                candidate_summary = " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _preferred_plan["transfers"])
+                gain = _preferred_gain
+                threshold = _preferred_threshold
+                reason_line = f"Best plan uses {_preferred_plan['free_transfers_used']} free transfer(s) and improves projected starting-XI points over hold."
+        elif _optimization_plans and not transfer_inputs_verified:
+            decision_label = "VERIFY DATA"
+            reason_line = "Projected plans are shown below, but current bank, free-transfer count, or selling-price inputs are uncertain; affordability is unverified."
+
         _provisional = (_model_status == "Fallback" or bool(unmatched) or squad_source == "prior"
                         or (auto_controls and (not latest_bank_known or not auto_ft_confident))
                         or not transfer_inputs_verified)
@@ -2282,6 +2359,32 @@ with decide_tab:
                 st.caption(f"Risk mode: {risk} · Horizon: {horizon} GWs · Transfer hit applied: {hit_cost_auto} points.")
                 st.dataframe(best_each[["Sell","Sell club","Selling price source","Buy","Buy club","Position","Buy price (£m)","Budget ceiling (£m)","Club count after transfer","Outgoing projected pts","Incoming projected pts","Projected gain","Minimum gain to act","Expected minutes this GW","Availability factor","Minutes reliability (%)","Availability reliability (%)","Captaincy exposure","Actionable","Ownership (%)","Decision score","Verdict"]], use_container_width=True, hide_index=True)
                 st.caption("PR #53 expected minutes scale the fallback projection; the trained v3.0 model does not use that estimate as a prediction feature. Current availability adjusts the nearest Gameweek only. The separate reliability score uses season minutes and availability flags; today's injury status is not assumed to persist across later weeks.")
+
+        if _optimization_plans:
+            st.markdown("#### Multi-transfer plans")
+            st.caption("Bounded beam search: at most 30 incoming candidates and 120 states per transfer count; plans are scored with the expected XI and captain bonus for each Gameweek. Up to two paid transfers are compared and require hit acceptance.")
+            _plan_rows = []
+            for _count, _plan in sorted(_optimization_plans.items()):
+                _move_text = " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _plan["transfers"]) or "Hold / roll"
+                _risk_text = " · ".join(
+                    f"{m['in']['Player']}: {int(m['in'].get('Minutes', 0))} min · {m['in'].get('Status', '?')} · {m['in'].get('Chance (%)') if pd.notna(m['in'].get('Chance (%)')) else 'chance n/a'}%"
+                    for m in _plan["transfers"]
+                ) or "No incoming-player risk"
+                _plan_rows.append({
+                    "Transfers": _move_text,
+                    "Free used": _plan["free_transfers_used"],
+                    "Paid": _plan["paid_transfers"],
+                    "Hit": f"-{_plan['hit_cost']} pts" if _plan["hit_cost"] else "None",
+                    "Budget before (£m)": (f"£{_plan['budget_before_tenths'] / 10:.1f}m" if _plan["budget_before_tenths"] is not None else "Unverified"),
+                    "Budget after (£m)": (f"£{_plan['budget_after_tenths'] / 10:.1f}m" if _plan["budget_after_tenths"] is not None else "Unverified"),
+                    "Affordability": "Verified" if _plan["affordable"] is True else "Unverified",
+                    "Minutes / availability": _risk_text,
+                    "Net gain vs hold": f"{_plan['cumulative_net_gain']:+.1f}",
+                    "By Gameweek": " · ".join(f"GW{r['gameweek']} {r['plan_points']:.1f} vs {r['hold_points']:.1f}" for r in _plan["gameweeks"]),
+                })
+            st.dataframe(pd.DataFrame(_plan_rows), use_container_width=True, hide_index=True)
+            if not transfer_inputs_verified:
+                st.warning("These projections do not establish affordability because a required budget or transfer input is unverified.")
 
         with st.expander("Manual transfer comparison (optional)", expanded=False):
 

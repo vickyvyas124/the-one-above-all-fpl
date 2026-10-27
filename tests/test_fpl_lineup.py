@@ -1,6 +1,6 @@
 import unittest
 
-from fpl_lineup import is_legal_formation, select_model_lineup, validate_public_picks
+from fpl_lineup import is_legal_formation, score_starting_xi, select_model_lineup, validate_public_picks
 
 
 def make_squad():
@@ -36,6 +36,12 @@ class PublicPickValidationTests(unittest.TestCase):
 
 
 class ModelLineupTests(unittest.TestCase):
+    def test_fast_starting_xi_score_matches_full_lineup_with_captain_bonus(self):
+        squad = make_squad()
+        projections = {index: float(index) for index in range(1, 16)}
+        selection = select_model_lineup(squad, projections)
+        self.assertEqual(score_starting_xi(squad, projections), selection["projected_points"])
+
     def test_selects_eleven_and_four_unique_members_from_all_fifteen(self):
         squad = make_squad()
         projections = {index: float(index) for index in range(1, 16)}

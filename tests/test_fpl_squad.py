@@ -67,8 +67,9 @@ class PreDeadlineSquadTests(unittest.TestCase):
         self.assertNotIn(13, result["player_ids"])
         self.assertIn(16, result["player_ids"])
         self.assertTrue(result["transfer_history_reconstructed"])
-        self.assertTrue(result["needs_confirmation"])
-        self.assertIn("Last published squad: GW8", result["reason"])
+        self.assertFalse(result["needs_confirmation"])
+        self.assertIn("Auto-reconstructed from GW8 picks", result["reason"])
+        self.assertIn("provisional until GW9 picks publish", result["reason"])
 
     def test_transactions_are_applied_in_chronological_order(self):
         self.players[16] = {"id": 16, "element_type": 4}
@@ -89,16 +90,16 @@ class PreDeadlineSquadTests(unittest.TestCase):
         self.assertNotIn(16, roster)
         self.assertIn(17, roster)
 
-    def test_empty_or_failed_transfer_history_does_not_prove_no_changes(self):
+    def test_successful_empty_transfer_history_proves_no_public_moves(self):
         empty = self.load(rows=[], transfer_available=True, target_error=http_error(404))
         failed = self.load(rows=None, transfer_available=False, target_error=http_error(404))
         self.assertTrue(empty["available"])
         self.assertTrue(failed["available"])
-        self.assertFalse(empty["transfer_history_reconstructed"])
+        self.assertTrue(empty["transfer_history_reconstructed"])
         self.assertFalse(failed["transfer_history_reconstructed"])
-        self.assertTrue(empty["needs_confirmation"])
+        self.assertFalse(empty["needs_confirmation"])
         self.assertTrue(failed["needs_confirmation"])
-        self.assertIn("does not prove", empty["reason"])
+        self.assertIn("Auto-reconstructed", empty["reason"])
         self.assertIn("could not be loaded", failed["reason"])
 
     def test_invalid_prior_roster_never_becomes_available(self):
@@ -148,6 +149,16 @@ class PreDeadlineSquadTests(unittest.TestCase):
         self.assertEqual(applied, [])
         self.assertFalse(valid)
         self.assertIn("missing", reason)
+
+    def test_free_hit_chip_makes_prior_picks_ambiguous(self):
+        result = load_public_squad(
+            9, self.events, lambda event: (_ for _ in ()).throw(http_error(404)) if event == 9 else picks(),
+            [], True, self.players, chip_rows=[{"event": 9, "name": "freehit"}], now=self.now,
+        )
+        self.assertTrue(result["available"])
+        self.assertTrue(result["needs_confirmation"])
+        self.assertFalse(result["transfer_history_reconstructed"])
+        self.assertIn("Free Hit", result["reason"])
 
 
 if __name__ == "__main__":
