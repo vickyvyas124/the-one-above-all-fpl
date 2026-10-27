@@ -68,6 +68,12 @@ class TransferProjectionTests(unittest.TestCase):
         self.assertEqual(plans[3]["gameweeks"][1]["hit_cost"], 0)
         self.assertEqual(plans[4]["paid_transfers"], 2)
         self.assertEqual(plans[4]["hit_cost"], 8)
+        one_ft = optimize_transfer_plans(squad, candidates, 1, 0, horizon=2,
+                                         beam_width=200, candidate_limit=30)
+        self.assertEqual(one_ft[2]["paid_transfers"], 1)
+        self.assertEqual(one_ft[2]["hit_cost"], 4)
+        self.assertEqual(one_ft[3]["paid_transfers"], 2)
+        self.assertEqual(one_ft[3]["hit_cost"], 8)
 
     def test_optimizer_respects_combined_budget_and_roster_club_limit(self):
         positions = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3
@@ -88,6 +94,81 @@ class TransferProjectionTests(unittest.TestCase):
         exact_plans = optimize_transfer_plans(squad, exact_pair, 2, 0, horizon=1)
         self.assertIn(2, exact_plans)
         self.assertEqual(exact_plans[2]["budget_after_tenths"], 0)
+        self.assertEqual(exact_plans[2]["budget_before_tenths"], 200)
+        original_ids = {player["id"] for player in squad}
+        self.assertTrue(all(move["out"]["id"] in original_ids
+                            for move in exact_plans[2]["transfers"]))
+
+    def test_acquired_player_cannot_become_outgoing_or_fund_a_later_move(self):
+        positions = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3
+        squad = [{"id": i + 1, "position": pos, "club": f"C{i // 3}",
+                  "sell_tenths": 0, "price_tenths": 100, "projections": [1]}
+                 for i, pos in enumerate(positions)]
+        candidates = [
+            {"id": 100, "position": "GK", "club": "NEW1", "price_tenths": 0,
+             "sell_tenths": 1000, "projections": [10]},
+            {"id": 101, "position": "GK", "club": "NEW2", "price_tenths": 100,
+             "projections": [20]},
+        ]
+        plans = optimize_transfer_plans(squad, candidates, 2, 0, horizon=1)
+        self.assertNotIn(2, plans)
+        self.assertTrue(all(move["out"]["id"] <= 15
+                            for plan in plans.values() for move in plan["transfers"]))
+
+    def test_unverified_bank_or_sales_keep_projections_but_not_affordability_claim(self):
+        positions = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3
+        squad = [{"id": i + 1, "position": pos, "club": f"C{i // 3}",
+                  "price_tenths": 100, "projections": [1]}
+                 for i, pos in enumerate(positions)]
+        candidates = [{"id": 100, "position": "GK", "club": "NEW",
+                       "price_tenths": 100, "projections": [5]}]
+        plans = optimize_transfer_plans(squad, candidates, 1, None, horizon=1,
+                                        budget_verified=True)
+        self.assertIn(1, plans)
+        self.assertIsNone(plans[1]["affordable"])
+        self.assertIsNone(plans[1]["budget_before_tenths"])
+        self.assertIsNone(plans[1]["budget_after_tenths"])
+        fractional_bank = optimize_transfer_plans(squad, candidates, 1, 0.5, horizon=1)
+        self.assertIsNone(fractional_bank[1]["affordable"])
+        missing_sales = [dict(player, sell_tenths=100) for player in squad]
+        missing_sales[0].pop("sell_tenths")
+        missing_price = optimize_transfer_plans(missing_sales, candidates, 1, 10, horizon=1)
+        self.assertIsNone(missing_price[1]["affordable"])
+
+    def test_position_and_club_constraints_hold_after_each_move(self):
+        positions = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3
+        squad = [{"id": i + 1, "position": pos, "club": "C0" if i < 3 else f"C{i}",
+                  "sell_tenths": 100, "price_tenths": 100, "projections": [1]}
+                 for i, pos in enumerate(positions)]
+        candidates = [
+            {"id": 100, "position": "GK", "club": "C0", "price_tenths": 100,
+             "projections": [5]},
+            {"id": 101, "position": "MID", "club": "C0", "price_tenths": 100,
+             "projections": [5]},
+        ]
+        plans = optimize_transfer_plans(squad, candidates, 2, 0, horizon=1)
+        self.assertIn(1, plans)
+        self.assertNotIn(2, plans)  # The second incoming would exceed C0's three-player limit.
+        wrong_position = [{"id": 102, "position": "WING", "club": "NEW",
+                           "price_tenths": 100, "projections": [10]}]
+        wrong_position_plans = optimize_transfer_plans(squad, wrong_position, 1, 0, horizon=1)
+        self.assertEqual(set(wrong_position_plans), {0})
+
+    def test_hold_remains_when_every_transfer_is_unaffordable_or_not_an_upgrade(self):
+        positions = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3
+        squad = [{"id": i + 1, "position": pos, "club": f"C{i // 3}",
+                  "sell_tenths": 100, "price_tenths": 100, "projections": [5]}
+                 for i, pos in enumerate(positions)]
+        unaffordable = [{"id": 100, "position": "GK", "club": "NEW",
+                         "price_tenths": 201, "projections": [20]}]
+        plans = optimize_transfer_plans(squad, unaffordable, 1, 0, horizon=1)
+        self.assertEqual(set(plans), {0})
+        self.assertEqual(plans[0]["cumulative_net_gain"], 0)
+        inferior = [{"id": 101, "position": "GK", "club": "NEW",
+                     "price_tenths": 100, "projections": [1]}]
+        plans = optimize_transfer_plans(squad, inferior, 1, 0, horizon=1)
+        self.assertEqual(plans[0]["cumulative_net_gain"], 0)
+        self.assertLessEqual(plans[1]["cumulative_net_gain"], plans[0]["cumulative_net_gain"])
 
     def test_zero_free_transfers_include_hold_and_multiple_hits(self):
         positions = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3

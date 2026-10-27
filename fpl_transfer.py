@@ -56,6 +56,17 @@ def transfer_projection_comparison(outgoing, incoming, transfer_hit=0):
     return rows
 
 
+def _exact_tenths(value):
+    """Return an exact integer tenths value, rejecting fractional prices."""
+    try:
+        if isinstance(value, bool):
+            return None
+        integer = int(value)
+        return integer if float(value) == integer and integer >= 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def optimize_transfer_plans(squad, candidates, free_transfers, bank_tenths, *,
                             horizon=5, start_gw=1, beam_width=500,
                             candidate_limit=40, paid_transfer_limit=2,
@@ -75,18 +86,52 @@ def optimize_transfer_plans(squad, candidates, free_transfers, bank_tenths, *,
     role_counts = {}
     club_counts = {}
     for player in squad:
-        role = str(player.get("position", player.get("Position", ""))).upper()
-        role = "GK" if role == "GKP" else role
+        role = _transfer_position(player)
         role_counts[role] = role_counts.get(role, 0) + 1
         club = player.get("club")
         club_counts[club] = club_counts.get(club, 0) + 1
     if role_counts != {"GK": 2, "DEF": 5, "MID": 5, "FWD": 3} or any(n > 3 for n in club_counts.values()):
         return {}
+    # Treat malformed bank or missing manager-specific sale prices as
+    # unverified. Keep projections available, but never label them affordable.
+    verified_bank = _exact_tenths(bank_tenths)
+    budget_verified = bool(budget_verified and verified_bank is not None)
+    bank_tenths = verified_bank if budget_verified else None
+    for player in squad:
+        sale_price = _exact_tenths(player.get("sell_tenths"))
+        if sale_price is None:
+            budget_verified = False
+            player["sell_tenths"] = 0
+        else:
+            player["sell_tenths"] = sale_price
     ft = max(0, min(5, int(free_transfers)))
     horizon = max(1, int(horizon))
-    max_transfers = min(len(squad), ft + max(1, int(paid_transfer_limit)))
+    max_transfers = min(len(squad), ft + max(0, int(paid_transfer_limit)))
     existing = {int(p["id"]) for p in squad}
-    candidates = [p for p in candidates if int(p["id"]) not in existing]
+    valid_candidates = []
+    seen_candidate_ids = set()
+    for player in candidates:
+        try:
+            player_id = int(player["id"])
+            price = _exact_tenths(player.get("price_tenths"))
+            projections = [float(value) for value in player["projections"][:horizon]]
+        except (KeyError, TypeError, ValueError):
+            continue
+        position = _transfer_position(player)
+        if (position not in {"GK", "DEF", "MID", "FWD"}
+                or player_id in existing or player_id in seen_candidate_ids
+                or len(projections) != horizon or player.get("club") is None):
+            continue
+        if price is None:
+            budget_verified = False
+            price = 0
+        player["id"] = player_id
+        player["position"] = position
+        player["price_tenths"] = price
+        player["projections"] = projections
+        seen_candidate_ids.add(player_id)
+        valid_candidates.append(player)
+    candidates = valid_candidates
     candidates.sort(key=lambda p: sum(map(float, p.get("projections", [])[:horizon])), reverse=True)
     candidates = candidates[:max(1, int(candidate_limit))]
     def score(roster, transfers):
@@ -112,8 +157,8 @@ def optimize_transfer_plans(squad, candidates, free_transfers, bank_tenths, *,
                 "free_transfers_used": min(ft, len(moves)),
                 "paid_transfers": max(0, len(moves) - ft),
                 "hit_cost": max(0, len(moves) - ft) * 4,
-                "budget_before_tenths": (int(bank_tenths or 0) + moved_sales) if budget_verified else None,
-                "budget_after_tenths": (int(bank_tenths or 0) + moved_sales - moved_buys) if budget_verified else None,
+                "budget_before_tenths": (bank_tenths + moved_sales) if budget_verified else None,
+                "budget_after_tenths": (bank_tenths + moved_sales - moved_buys) if budget_verified else None,
                 "affordable": True if budget_verified else None, "gameweeks": rows,
                 "cumulative_net_gain": sum(r["net_gain"] for r in rows), "roster": roster}
 
@@ -124,15 +169,20 @@ def optimize_transfer_plans(squad, candidates, free_transfers, bank_tenths, *,
     for depth in range(1, max_transfers + 1):
         expanded = []
         for roster, moves, outs, ins in beam:
-            for out in roster:
+            # Each transaction must sell a distinct member of the original
+            # squad. An acquired player cannot be sold in this same plan.
+            for out in squad:
                 oid = int(out["id"])
                 if oid in outs:
                     continue
                 for incoming in candidates:
                     iid = int(incoming["id"])
-                    if iid in ins or incoming.get("position") != out.get("position"):
+                    if iid in ins or _transfer_position(incoming) != _transfer_position(out):
                         continue
-                    new_roster = [p for p in roster if int(p["id"]) != oid] + [incoming]
+                    if int(incoming["id"]) not in {int(p["id"]) for p in roster}:
+                        new_roster = [p for p in roster if int(p["id"]) != oid] + [incoming]
+                    else:
+                        continue
                     clubs = {}
                     for p in new_roster:
                         clubs[p["club"]] = clubs.get(p["club"], 0) + 1
@@ -141,7 +191,7 @@ def optimize_transfer_plans(squad, candidates, free_transfers, bank_tenths, *,
                     new_moves = moves + [{"out": out, "in": incoming}]
                     total_sales = sum(int(m["out"].get("sell_tenths", 0)) for m in new_moves)
                     total_buys = sum(int(m["in"]["price_tenths"]) for m in new_moves)
-                    if budget_verified and total_sales + int(bank_tenths or 0) < total_buys:
+                    if budget_verified and total_sales + bank_tenths < total_buys:
                         continue
                     expanded.append((new_roster, new_moves, outs | {oid}, ins | {iid}))
         if not expanded:
@@ -150,7 +200,7 @@ def optimize_transfer_plans(squad, candidates, free_transfers, bank_tenths, *,
         # for each final set of moved players before applying the beam cap.
         unique_states = {}
         for state in expanded:
-            key = (frozenset(state[2]), frozenset(state[3]))
+            key = frozenset(int(player["id"]) for player in state[0])
             unique_states.setdefault(key, state)
         expanded = list(unique_states.values())
         expanded.sort(key=lambda state: sum(r["net_gain"] for r in score(state[0], depth)), reverse=True)
@@ -158,3 +208,8 @@ def optimize_transfer_plans(squad, candidates, free_transfers, bank_tenths, *,
         best_state = beam[0]
         results[depth] = make_plan(best_state[0], best_state[1])
     return results
+
+
+def _transfer_position(player):
+    position = str(player.get("position", player.get("Position", ""))).upper()
+    return "GK" if position == "GKP" else position

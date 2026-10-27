@@ -1180,7 +1180,7 @@ with squad_tab:
     with pitch_col:
         _latest_gw_label = latest_history.get("event", "—") if latest_history else "—"
         _lineup_source_label = (
-            f"model-selected XI from verified GW{gw} picks" if selected_lineup and picks_sync_ok else
+            f"model-selected XI from verified GW{gw} picks" if selected_lineup and squad_source == "current" else
             "model-selected from auto-reconstructed prior squad · provisional" if selected_lineup and squad_source == "prior" else
             "model-selected from verified public picks" if selected_lineup else
             f"last published GW{squad_load.get('baseline_gw')} reference · confirm before recommendations" if reference_lineup else
@@ -2261,6 +2261,12 @@ with decide_tab:
                 gain = _preferred_gain
                 threshold = _preferred_threshold
                 reason_line = "The best legal plan does not clear the engine's projected advantage threshold over hold."
+            elif hours_to_deadline_now is not None and hours_to_deadline_now > 24:
+                decision_label = "HOLD FOR NOW"
+                candidate_summary = " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _preferred_plan["transfers"])
+                gain = _preferred_gain
+                threshold = _preferred_threshold
+                reason_line = "The plan clears the projected advantage threshold, but the deadline is more than 24 hours away. Recheck closer to deadline and after team news."
             elif _preferred_plan["paid_transfers"]:
                 decision_label = "TRANSFER WITH -4 · ACCEPT HIT"
                 candidate_summary = " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _preferred_plan["transfers"])
