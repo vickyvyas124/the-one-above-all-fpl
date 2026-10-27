@@ -5,13 +5,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 import requests
+import streamlit as st
 
 try:
+    import streamlit as st
     from streamlit.testing.v1 import AppTest
 except ModuleNotFoundError as exc:
     if exc.name != "streamlit":
         raise
     AppTest = None
+    st = None
 
 
 SQUAD = [
@@ -55,7 +58,10 @@ def mocked_fpl_get(url, **_kwargs):
     if url.endswith("/trained_fpl_model.json"):
         return MockResponse(status_code=404)
     if url.endswith("/forecast_log.csv"):
-        return MockResponse(status_code=200, text="season,gameweek,player_id\n")
+        return MockResponse(
+            status_code=200,
+            text="season,gameweek,player_id,model_version,projection_model\n2026-27,2,1,legacy-unknown,4.2\n",
+        )
     if url.endswith("/historical_backtest_summary.csv"):
         return MockResponse(status_code=404)
     if url.endswith("/bootstrap-static/"):
@@ -139,6 +145,15 @@ def mocked_fpl_get(url, **_kwargs):
     raise AssertionError(f"AppTest attempted an unmocked network request: {url}")
 
 
+def mocked_fpl_get_invalid_picks(url, **kwargs):
+    response = mocked_fpl_get(url, **kwargs)
+    if "/entry/2311669/event/" in url and url.endswith("/picks/"):
+        picks = response.payload["picks"]
+        picks[-1]["position"] = picks[-2]["position"]
+        return MockResponse({"picks": picks})
+    return response
+
+
 def _player(player_id, first, second, web_name, position, team_id, *, premium=False):
     return {
         "id": player_id,
@@ -180,6 +195,56 @@ class DashboardNavigationAppTests(unittest.TestCase):
                 [tab.label for tab in app.tabs],
                 ["Decide", "Squad", "Fixtures", "Model"],
             )
+            model_tab = app.tabs[3]
+            xi_table = next(
+                item for item in model_tab.dataframe
+                if {"Position", "Player", "Captain", "Vice"}.issubset(item.value.columns)
+            )
+            bench_table = next(
+                item for item in model_tab.dataframe
+                if {"Order", "Player", "Position"}.issubset(item.value.columns)
+            )
+            xi_names = xi_table.value["Player"].tolist()
+            bench_names = bench_table.value["Player"].tolist()
+            self.assertEqual(len(xi_names), 11)
+            self.assertEqual(len(bench_names), 4)
+            self.assertEqual(len(set(xi_names + bench_names)), 15)
+            self.assertCountEqual(xi_names + bench_names, [row[2] for row in SQUAD])
+            self.assertEqual(xi_table.value["Captain"].eq("C").sum(), 1)
+            self.assertEqual(xi_table.value["Vice"].eq("VC").sum(), 1)
+            self.assertIn("Kostoulas", xi_names + bench_names)
+            _captain_xi_row = xi_table.value.loc[xi_table.value["Captain"].eq("C")].iloc[0]
+            _xi_base_total = float(xi_table.value["GW2 pts"].sum())
+            _xi_with_captain = next(
+                item for item in model_tab.metric
+                if item.label == "XI + captain projected points"
+            )
+            self.assertAlmostEqual(float(_xi_with_captain.value), _xi_base_total + float(_captain_xi_row["GW2 pts"]))
+            _captain_table = next(
+                item for item in app.tabs[1].dataframe
+                if {"Projected GW points", "Captain 2× estimate"}.issubset(item.value.columns)
+            )
+            _captain_candidate = _captain_table.value.loc[
+                _captain_table.value["Player"].eq(_captain_xi_row["Player"])
+            ].iloc[0]
+            self.assertAlmostEqual(
+                float(_captain_candidate["Captain 2× estimate"]),
+                2 * float(_captain_candidate["Projected GW points"]),
+            )
+            _formation_metric = next(item for item in model_tab.metric if item.label == "Model-best formation")
+            _defenders, _midfielders, _forwards = map(int, _formation_metric.value.split("-"))
+            self.assertTrue(3 <= _defenders <= 5 and 2 <= _midfielders <= 5 and 1 <= _forwards <= 3)
+            _forecast_metric = next(item for item in model_tab.metric if item.label == "Forecast record")
+            self.assertEqual(_forecast_metric.value, "Not saved")
+            fixture_text = "\n".join(str(item.value) for item in app.tabs[2].markdown)
+            self.assertIn("one-Gameweek estimate", fixture_text)
+            for _, bench_row in bench_table.value.iterrows():
+                self.assertIn(f"{bench_row['Player']} {float(bench_row['GW2 pts']):.1f}", fixture_text)
+            squad_markup = "\n".join(str(item.value) for item in app.tabs[1].markdown)
+            _captain_name = xi_table.value.loc[xi_table.value["Captain"].eq("C"), "Player"].iloc[0]
+            _vice_name = xi_table.value.loc[xi_table.value["Vice"].eq("VC"), "Player"].iloc[0]
+            self.assertIn(f"{_captain_name} · C", squad_markup)
+            self.assertIn(f"{_vice_name} · VC", squad_markup)
             status_strip = next(
                 element.value
                 for element in app.markdown
@@ -195,6 +260,11 @@ class DashboardNavigationAppTests(unittest.TestCase):
             )
             self.assertIn("HOLD FOR NOW", verdict_markdown.value)
             self.assertIn("Provisional", verdict_markdown.value)
+            decision_summary = next(
+                item for item in decide_tab.markdown
+                if "Captain and vice-captain" in str(item.value)
+            )
+            self.assertIn(f"C: {_captain_name} · VC: {_vice_name}", decision_summary.value)
             default_table = next(
                 element
                 for element in decide_tab.dataframe
@@ -209,6 +279,24 @@ class DashboardNavigationAppTests(unittest.TestCase):
                 child_positions[id(default_table)],
                 "The verdict must render before the default transfer table.",
             )
+            _detail_select = next(
+                item for item in decide_tab.selectbox
+                if item.label == "Transfer to inspect"
+            )
+            self.assertTrue(_detail_select.options)
+            _budget_table = next(
+                item for item in decide_tab.dataframe
+                if {"Buy price (£m)", "Budget ceiling (£m)"}.issubset(item.value.columns)
+            )
+            self.assertTrue(
+                (_budget_table.value["Buy price (£m)"] <= _budget_table.value["Budget ceiling (£m)"]).all(),
+                "Every automatic transfer candidate must fit within official sale price plus bank.",
+            )
+            _comparison = next(
+                item for item in decide_tab.dataframe
+                if {"Hold current player", "Transfer candidate", "Cumulative net"}.issubset(item.value.columns)
+            )
+            self.assertEqual(len(_comparison.value), 5)
             self.assertTrue(any(item.label == "Squad is correct" for item in app.checkbox))
             self.assertTrue(any(item.label == "Team news checked" for item in app.checkbox))
 
@@ -237,6 +325,22 @@ class DashboardNavigationAppTests(unittest.TestCase):
             captions = "\n".join(_values(app.caption))
             self.assertIn("Risk mode: Aggressive", captions)
             self.assertIn("Horizon: 3 GWs", captions)
+
+    def test_invalid_public_roster_fails_closed_without_sample_squad(self):
+        st.cache_data.clear()
+        app_path = Path(__file__).parents[1] / "app.py"
+        with patch("requests.get", side_effect=mocked_fpl_get_invalid_picks):
+            app = AppTest.from_file(str(app_path), default_timeout=60).run()
+        self.assertFalse(app.exception, [item.message for item in app.exception])
+        status_strip = next(item.value for item in app.markdown if "class='status-strip'" in str(item.value))
+        self.assertIn("unavailable · no sample data", status_strip)
+        verdict = next(item.value for item in app.tabs[0].markdown if "verdict-card" in str(item.value))
+        self.assertIn("VERIFY DATA", verdict)
+        self.assertIn("No example or saved squad is substituted", verdict)
+        self.assertFalse(any(
+            {"Sell", "Buy", "Gain", "Needed", "Reliability"}.issubset(item.value.columns)
+            for item in app.tabs[0].dataframe
+        ))
 
 
 if __name__ == "__main__":
