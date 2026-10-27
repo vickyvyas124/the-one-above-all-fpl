@@ -10,7 +10,8 @@ import fpl_engine
 import fpl_learning
 from fpl_availability import availability_adjustment
 from fpl_ui_labels import status_chip_labels
-from fpl_lineup import select_model_lineup, validate_public_picks
+from fpl_lineup import select_model_lineup
+from fpl_squad import load_public_squad, validate_squad_ids
 from fpl_transfer import (
     gameweek_projection_series,
     is_affordable_tenths,
@@ -492,7 +493,8 @@ with st.sidebar:
     control_profile = {}
     control_history = {}
     control_boot = {}
-    control_transfers = []
+    control_transfers = None
+    control_transfer_history_available = False
     try:
         control_profile = get_manager_profile(int(team_id))
     except Exception:
@@ -511,10 +513,14 @@ with st.sidebar:
     control_gw = int(control_next.get("id")) if control_next else int((control_current or {}).get("id", 7)) + 1
     try:
         control_transfers = get_entry_transfers(int(team_id))
+        control_transfer_history_available = isinstance(control_transfers, list)
+        if not control_transfer_history_available:
+            control_transfers = None
     except Exception:
-        control_transfers = []
+        control_transfers = None
     auto_ft, auto_ft_confident, auto_ft_note = infer_free_transfers(
-        control_history, control_events, control_gw, control_transfers
+        control_history, control_events, control_gw,
+        control_transfers if isinstance(control_transfers, list) else [],
     )
     auto_bank_raw = control_profile.get("last_deadline_bank") if isinstance(control_profile, dict) else None
     if auto_bank_raw is None:
@@ -524,7 +530,8 @@ with st.sidebar:
     auto_bank = float(auto_bank_raw) / 10.0 if auto_bank_raw is not None else None
     # Adjust the last-deadline bank by publicly visible transactions in the upcoming GW where prices are included.
     latest_bank_known = auto_bank_raw is not None
-    current_transactions = [r for r in control_transfers if isinstance(r, dict) and str(r.get("event", "")) == str(control_gw)]
+    current_transactions = [r for r in (control_transfers if isinstance(control_transfers, list) else [])
+                            if isinstance(r, dict) and str(r.get("event", "")) == str(control_gw)]
     current_tx_adjustment = 0.0
     for tx in current_transactions:
         try:
@@ -597,29 +604,94 @@ except Exception:
 
 # Public endpoints do not require the user's FPL password. Never substitute a
 # hand-entered example squad when current FPL picks cannot be verified.
+elements_by_id = {int(p["id"]): p for p in players}
+squad_load = load_public_squad(
+    int(gw), events, lambda event_id: get_entry_picks(int(team_id), int(event_id)),
+    control_transfers, control_transfer_history_available, elements_by_id,
+)
 squad_rows = []
-public_picks_for_display = []
-picks_sync_ok = False
-picks_sync_note = "Live squad unavailable: public picks for the selected Gameweek are not available. No sample squad is substituted."
-try:
-    picks_payload = get_entry_picks(int(team_id), int(gw))
-    picks = picks_payload.get("picks", []) if isinstance(picks_payload, dict) else []
-    elements_by_id = {int(p["id"]): p for p in players}
-    _picks_valid, _picks_reason = validate_public_picks(picks, elements_by_id)
-    if _picks_valid:
-        dynamic_rows = []
-        for pick in sorted(picks, key=lambda x: int(x.get("position", 99))):
-            player = elements_by_id[int(pick["element"])]
-            full_name = (player.get("first_name", "") + " " + player.get("second_name", "")).strip()
-            dynamic_rows.append((full_name, pos_name(player, types), player.get("web_name", full_name), int(pick["element"])))
-        squad_rows = dynamic_rows
-        public_picks_for_display = sorted(picks, key=lambda x: int(x.get("position", 99)))
-        picks_sync_ok = True
-        picks_sync_note = f"Squad loaded from verified public picks for GW{gw}."
-    else:
-        picks_sync_note = f"Live squad unavailable: {_picks_reason} No example or saved squad is substituted."
-except Exception:
-    picks_sync_note = "Live squad unavailable: current public picks could not be verified. No example or saved squad is substituted."
+public_picks_for_display = list(squad_load.get("picks", []))
+picks_sync_ok = bool(squad_load.get("target_verified"))
+picks_sync_note = str(squad_load.get("reason", "Live squad unavailable. No example or saved squad is substituted."))
+squad_source = str(squad_load.get("source", "unavailable"))
+squad_recommendations_allowed = picks_sync_ok
+manual_purchase_price_overrides = {}
+if squad_load.get("available"):
+    roster_ids = list(squad_load["player_ids"])
+    if squad_load.get("needs_confirmation"):
+        with st.sidebar:
+            st.warning(picks_sync_note)
+            st.caption("Prior published picks cannot prove that no current transfers, Wildcard or Free Hit changes are pending.")
+            if auto_controls:
+                st.caption("The auto-synced bank and free-transfer count may still reflect the prior deadline. Switch to Manual override and confirm both before using transfer-budget advice.")
+            roster_options = sorted(elements_by_id)
+            _player_label_by_id = {
+                pid: f"{elements_by_id[pid].get('web_name', 'Player')} · {pos_name(elements_by_id[pid], types)} · {teams.get(elements_by_id[pid].get('team'), {}).get('short_name', '?')} · #{pid}"
+                for pid in roster_options
+            }
+            _corrected_roster_ids = st.multiselect(
+                "Confirm or correct current 15-player roster",
+                options=roster_options, default=roster_ids,
+                format_func=lambda player_id: _player_label_by_id[int(player_id)],
+                key=f"confirmed_roster_{int(team_id)}_{int(gw)}",
+                help="Use this roster editor to apply any transfer not reflected in public history. It must contain exactly 2 goalkeepers, 5 defenders, 5 midfielders and 3 forwards.",
+            )
+            _manual_roster_valid, _manual_roster_reason = validate_squad_ids(_corrected_roster_ids, elements_by_id)
+            if not _manual_roster_valid:
+                st.error(_manual_roster_reason)
+            _roster_confirmed = st.checkbox(
+                "I confirm this roster includes all transfers and chip changes",
+                key=f"confirm_roster_{int(team_id)}_{int(gw)}",
+            )
+            _known_purchase_prices = {
+                int(row["element"]): int(row["purchase_price"])
+                for row in squad_load.get("picks", [])
+                if row.get("purchase_price") is not None
+            }
+            _known_purchase_prices.update({
+                int(row["in"]): int(row["purchase_price"])
+                for row in squad_load.get("transactions", [])
+                if row.get("purchase_price") is not None
+            })
+            _missing_purchase_price_ids = [
+                int(pid) for pid in _corrected_roster_ids if int(pid) not in _known_purchase_prices
+            ]
+            _purchase_prices_confirmed = not _missing_purchase_price_ids
+            if _missing_purchase_price_ids:
+                st.caption("Transfer advice also needs the official purchase price for corrected players; current market price is not the same as selling price.")
+                for _pid in _missing_purchase_price_ids:
+                    _current_tenths = int(elements_by_id[_pid].get("now_cost") or 0)
+                    manual_purchase_price_overrides[_pid] = round(st.number_input(
+                        f"{elements_by_id[_pid].get('web_name', 'Player')} purchase price (£m)",
+                        min_value=4.0, max_value=20.0, value=round(_current_tenths / 10, 1),
+                        step=0.1, key=f"manual_purchase_price_{int(team_id)}_{int(gw)}_{_pid}",
+                        help="Enter the price shown for this player in your official FPL squad/transfer view.",
+                    ) * 10)
+                _purchase_prices_confirmed = st.checkbox(
+                    "I verified these purchase prices in FPL",
+                    key=f"confirm_purchase_prices_{int(team_id)}_{int(gw)}",
+                )
+                if _purchase_prices_confirmed:
+                    for _pid in _missing_purchase_price_ids:
+                        _known_purchase_prices[_pid] = manual_purchase_price_overrides[_pid]
+            if _roster_confirmed and _manual_roster_valid:
+                roster_ids = [int(pid) for pid in _corrected_roster_ids]
+                squad_recommendations_allowed = True
+                picks_sync_note += " Manager-confirmed roster; recommendations are provisional until current GW picks are published."
+            else:
+                squad_recommendations_allowed = False
+                picks_sync_note += " Recommendations are withheld until you confirm or correct the roster."
+
+    for player_id in roster_ids:
+        player = elements_by_id[player_id]
+        full_name = (player.get("first_name", "") + " " + player.get("second_name", "")).strip()
+        squad_rows.append((full_name, pos_name(player, types), player.get("web_name", full_name), player_id))
+    if squad_load.get("needs_confirmation") and roster_ids != squad_load.get("player_ids"):
+        _prior_pick_by_id = {int(row["element"]): dict(row) for row in public_picks_for_display}
+        public_picks_for_display = [
+            {**_prior_pick_by_id.get(pid, {}), "element": pid, "position": position}
+            for position, pid in enumerate(roster_ids, 1)
+        ]
 
 # Pull player-level history for the current squad and a bounded pool of likely transfer targets.
 # The full pool still receives a transparent baseline projection; history enrichment is intentionally cached.
@@ -824,12 +896,17 @@ else:
 # the manager-specific selling price rather than assuming every asset sells at today's market price.
 purchase_price_by_id = {}
 purchase_price_current_ids = set()
+purchase_price_source_by_id = {}
 for _pick in public_picks_for_display:
     try:
         if _pick.get("purchase_price") is not None:
             _price_id = int(_pick.get("element"))
             purchase_price_by_id[_price_id] = int(_pick.get("purchase_price"))
             purchase_price_current_ids.add(_price_id)
+            purchase_price_source_by_id[_price_id] = (
+                "Current FPL picks" if picks_sync_ok else
+                f"Last published GW{squad_load.get('baseline_gw')} picks"
+            )
     except (TypeError, ValueError):
         continue
 if not purchase_price_by_id:
@@ -842,8 +919,20 @@ if not purchase_price_by_id:
             for _pick in _last_picks:
                 if _pick.get("purchase_price") is not None and _pick.get("element") is not None:
                     purchase_price_by_id[int(_pick["element"])] = int(_pick["purchase_price"])
+                    purchase_price_source_by_id[int(_pick["element"])] = "Last completed GW picks"
     except Exception:
         pass
+for _transaction in squad_load.get("transactions", []):
+    if _transaction.get("purchase_price") is not None:
+        purchase_price_by_id[int(_transaction["in"])] = int(_transaction["purchase_price"])
+        purchase_price_current_ids.add(int(_transaction["in"]))
+        purchase_price_source_by_id[int(_transaction["in"])] = "Public transfer record"
+if squad_load.get("needs_confirmation"):
+    for _pid, _price in manual_purchase_price_overrides.items():
+        if _pid in roster_ids and _purchase_prices_confirmed:
+            purchase_price_by_id[_pid] = int(_price)
+            purchase_price_current_ids.add(int(_pid))
+            purchase_price_source_by_id[int(_pid)] = "Manager-verified FPL purchase price"
 
 _player_projection_series_cache = {}
 def _projection_series_for(player):
@@ -882,7 +971,7 @@ for row in squad_rows:
                 purchase_price_by_id.get(int(p["id"]), int(p.get("now_cost") or 0)),
                 int(p.get("now_cost") or 0),
             ),
-            "Selling price source": "Current FPL picks" if int(p["id"]) in purchase_price_current_ids else "Estimated from current price",
+            "Selling price source": purchase_price_source_by_id.get(int(p["id"]), "Estimated from current price"),
             "Form": float(p.get("form") or 0), "PPG": float(p.get("points_per_game") or 0),
             "Minutes": int(p.get("minutes") or 0), "Status": p.get("status","?"),
             "Chance (%)": p.get("chance_of_playing_next_round"),
@@ -917,9 +1006,37 @@ for _resolved in resolved:
         "Club": str(_resolved["Club"]), "Price (£m)": float(_resolved["Price (£m)"]),
         "GW projected pts": float(_projection), "id": _pid,
     })
-selected_lineup = select_model_lineup(lineup_candidates, lineup_projection_by_id)
+selected_lineup = (select_model_lineup(lineup_candidates, lineup_projection_by_id)
+                   if squad_recommendations_allowed else None)
 model_xi_start_ids = ({int(player["id"]) for player in selected_lineup["starters"]}
                       if selected_lineup else set())
+# Before confirmation, show the verified last-published roster's positional layout
+# as a reference. It is not treated as a current model lineup or recommendation.
+reference_lineup = None
+if selected_lineup:
+    reference_lineup = selected_lineup
+elif squad_load.get("available") and len(resolved) == 15:
+    _resolved_by_id = {int(row["id"]): row for row in resolved}
+    _ordered_reference = [
+        {"id": int(pick["element"]), "Player": _resolved_by_id[int(pick["element"])]["Player"],
+         "Position": _resolved_by_id[int(pick["element"])]["Position"],
+         "GW projected pts": float(lineup_projection_by_id.get(int(pick["element"]), 0.0))}
+        for pick in public_picks_for_display if int(pick["element"]) in _resolved_by_id
+    ]
+    if len(_ordered_reference) == 15:
+        _ref_ids = {int(pick["element"]): pick for pick in public_picks_for_display}
+        _reference_captain = next((p for p in _ordered_reference if _ref_ids[p["id"]].get("is_captain")), None)
+        _reference_vice = next((p for p in _ordered_reference if _ref_ids[p["id"]].get("is_vice_captain")), None)
+        _role_order = {"GK": 1, "GKP": 1, "DEF": 2, "MID": 3, "FWD": 4}
+        _starters = sorted(_ordered_reference[:11], key=lambda p: (_role_order.get(p["Position"].upper(), 9), p["id"]))
+        _bench = _ordered_reference[11:]
+        _formation_counts = {role: sum(p["Position"].upper() == role for p in _starters) for role in ("DEF", "MID", "FWD")}
+        reference_lineup = {
+            "starters": _starters, "bench": _bench, "captain": _reference_captain,
+            "vice": _reference_vice,
+            "formation": f"{_formation_counts['DEF']}-{_formation_counts['MID']}-{_formation_counts['FWD']}",
+            "source_reference": True,
+        }
 
 def _deadline_text(deadline, zone_name, zone_label):
     if deadline is None:
@@ -943,7 +1060,14 @@ else:
         deadline_countdown = f"{_countdown_days}d {_countdown_hours}h {_countdown_remainder // 60}m"
 
 _model_status = "Trained" if fpl_learning.validate_model(fpl_engine.TRAINED_MODEL) else "Fallback"
-_squad_source_status = f"verified public picks · GW{gw}" if picks_sync_ok else "unavailable · no sample data"
+_squad_source_status = (
+    f"verified public picks · GW{gw}" if picks_sync_ok else
+    f"last published GW{squad_load.get('baseline_gw')} · {'confirmed · provisional' if squad_recommendations_allowed else 'confirm roster'}"
+    if squad_load.get("source") == "prior" else
+    "unavailable · check public picks"
+)
+if squad_source == "prior" and auto_controls and not squad_load.get("transfer_history_reconstructed"):
+    _bank_state, _ft_state = "prior deadline · verify", "verify in FPL"
 st.markdown(
     "<div class='decision-header'>"
     f"<div class='decision-brand'>⚽ The-One-Above-All · GW{int(gw)}</div>"
@@ -970,7 +1094,7 @@ with st.expander("How decisions are made", expanded=False):
     - Does not access your FPL password, private `my-team` endpoint, or personal selling prices.
     - Model weights remain heuristic and are evaluated against historical and live validation metrics.
     - Public FPL data is unofficial and may change. Refresh requests use the existing cache and refresh controls.
-    - Public FPL picks supply the live squad. If they are missing or invalid, squad-specific projections and recommendations are withheld instead of substituting sample names.
+    - Current public picks are preferred. Before deadline, a validated last-published squad is shown as a provisional reference; confirm or correct it before recommendations are generated.
     """)
 
 decide_tab, squad_tab, fixtures_tab, model_tab = st.tabs(["Decide", "Squad", "Fixtures", "Model"])
@@ -1052,8 +1176,12 @@ with squad_tab:
 
     with pitch_col:
         _latest_gw_label = latest_history.get("event", "—") if latest_history else "—"
-        _lineup_source_label = ("model-selected XI from verified public picks" if selected_lineup
-                                else "unavailable · no verified live squad")
+        _lineup_source_label = (
+            f"model-selected XI from verified GW{gw} picks" if selected_lineup and picks_sync_ok else
+            "model-selected from manager-confirmed prior squad · provisional" if selected_lineup else
+            f"last published GW{squad_load.get('baseline_gw')} reference · confirm before recommendations" if reference_lineup else
+            "unavailable · public squad could not be verified"
+        )
         st.markdown(f"**Latest GW result · GW{_latest_gw_label}**")
         st.caption("Latest recorded points and rank from the public manager history.")
         st.markdown(f"**Next GW · GW{int(gw)}**")
@@ -1085,13 +1213,13 @@ with squad_tab:
                 return (f"<div class='player-tile'><div class='tile-top'>{esc(short)}{(' · ' + _role) if _role else ''}</div>"
                         f"<div class='tile-avatar'>{shirt}</div><div class='tile-meta'>{esc(club)} · £{float(r['Price (£m)']):.1f}m<br>"
                          f"<span class='tile-pts'>{float(pts):.1f} proj.</span></div></div>")
-            if selected_lineup:
+            if reference_lineup:
                 _role_titles = {"GK": "GOALKEEPER", "GKP": "GOALKEEPER", "DEF": "DEFENDERS", "MID": "MIDFIELDERS", "FWD": "FORWARDS"}
                 _lineup_groups = {"GOALKEEPER": [], "DEFENDERS": [], "MIDFIELDERS": [], "FORWARDS": []}
-                for _player in selected_lineup["starters"]:
+                for _player in reference_lineup["starters"]:
                     _lineup_groups[_role_titles[_player["Position"].upper()]].append(_player["Player"])
                 xi_rows = list(_lineup_groups.items())
-                bench_names = [player["Player"] for player in selected_lineup["bench"]]
+                bench_names = [player["Player"] for player in reference_lineup["bench"]]
             else:
                 xi_rows, bench_names = [], []
             last_gw = latest_history if latest_history else {}
@@ -1110,12 +1238,16 @@ with squad_tab:
                 "</div>"
             )
             st.markdown(scoreband, unsafe_allow_html=True)
-            pitch_html = "<div class='pitch-wrap'><div class='pitch-lines'></div><div class='pitch-title'>Model-selected starting XI · one-GW projections</div>"
+            _pitch_title = ("Model-selected starting XI · one-GW projections" if selected_lineup
+                            else f"GW{squad_load.get('baseline_gw')} published roster layout · reference only")
+            pitch_html = f"<div class='pitch-wrap'><div class='pitch-lines'></div><div class='pitch-title'>{esc(_pitch_title)}</div>"
             for label, names in xi_rows:
                 pitch_html += f"<div class='pitch-title'>{label}</div><div class='pitch-row'>"
                 pitch_html += "".join(tile(name) for name in names)
                 pitch_html += "</div>"
-            pitch_html += "<div class='pitch-caption'>Formation, captain choices and Bench Boost estimates use this same selected XI. Projections are estimates, not guaranteed points.</div></div>"
+            _pitch_note = ("Formation, captain choices and Bench Boost estimates use this same selected XI. Projections are estimates, not guaranteed points."
+                           if selected_lineup else "This is the last published positional layout, not a current lineup recommendation. Confirm or correct your current roster in the sidebar.")
+            pitch_html += f"<div class='pitch-caption'>{esc(_pitch_note)}</div></div>"
             st.markdown(pitch_html, unsafe_allow_html=True)
             st.markdown("#### Bench")
             bench_parts=[]
@@ -1141,7 +1273,7 @@ with squad_tab:
         unsafe_allow_html=True
     )
 
-    if resolved:
+    if resolved and squad_recommendations_allowed:
         player_by_id = {int(player["id"]): player for player in players if player.get("id") is not None}
         captain_pool_ids = set(model_xi_start_ids)
         captain_source = "Model-selected legal XI" if selected_lineup else "Unavailable: no verified legal XI"
@@ -1229,11 +1361,14 @@ with squad_tab:
 
             if current_captain_id is not None:
                 current_captain_name = player_by_id.get(current_captain_id, {}).get("web_name", "Unknown")
-                st.caption(f"Currently recorded captain: {current_captain_name}. Candidate source: {captain_source}.")
+                if picks_sync_ok:
+                    st.caption(f"Currently recorded captain: {current_captain_name}. Candidate source: {captain_source}.")
+                else:
+                    st.caption(f"Last published GW{squad_load.get('baseline_gw')} captain: {current_captain_name}; this is not assumed for GW{gw}. Candidate source: {captain_source}.")
             else:
                 st.caption(f"Candidate source: {captain_source}.")
             if not picks_sync_ok:
-                st.warning("Current public picks were unavailable. The recommendation uses the model-optimized legal XI based on your matched 15-player squad; verify your actual team before the deadline.")
+                st.warning("This captain recommendation uses your manager-confirmed prior roster and is provisional. Verify all transfers, chip changes and team news before the deadline.")
             if not any(int(row.get("Fixtures this GW", 0)) > 0 for row in captain_rows):
                 st.info("Fixture assignments for the next Gameweek may not be complete yet. Captain recommendations are provisional.")
 
@@ -1250,6 +1385,8 @@ with squad_tab:
             )
         else:
             st.warning("Could not identify starting-XI players for the captaincy comparison. Refresh data or verify the squad.")
+    elif resolved:
+        st.info("Captain recommendations are withheld until you confirm or correct the current roster in the sidebar.")
     else:
         st.warning("Captaincy recommendations require matched squad players.")
 
@@ -1639,7 +1776,7 @@ with fixtures_tab:
     ]
     if not selected_lineup:
         chip_cards = [
-            (name, status, "—", "Not available", "No verified live squad and legal model-selected XI are available for this estimate.")
+            (name, status, "—", "Not available", "Confirm a current roster in the sidebar before using a chip estimate.")
             if status == "Available" else (name, status, score, action, detail)
             for name, status, score, action, detail in chip_cards
         ]
@@ -1725,6 +1862,8 @@ with model_tab:
             bench_frame["Order"] = ["Goalkeeper bench", "Outfield 1", "Outfield 2", "Outfield 3"]
             st.dataframe(bench_frame[["Order", "Player", "Position", "GW projected pts"]].rename(columns={"GW projected pts": f"GW{gw} pts"}), use_container_width=True, hide_index=True)
         st.caption("Projection source is the current v3.0 one-Gameweek forecast when available, otherwise the live prediction engine. These estimates do not guarantee points or submit changes to FPL.")
+    elif resolved and not squad_recommendations_allowed:
+        st.info("This is the last published roster reference. Confirm or correct it in the sidebar to generate a current projected XI.")
     elif resolved:
         st.warning("The current FPL roster does not form a valid 15-player squad and legal XI. Transfer and chip advice are withheld until roster data is verified.")
     else:
@@ -1885,7 +2024,11 @@ with decide_tab:
         club_counts_auto = df["Club"].value_counts().to_dict()
         hit_cost_auto = transfer_hit_cost(free_transfers, transfer_hit)
         _sale_prices_verified = all(int(row["id"]) in purchase_price_current_ids for row in resolved)
-        _budget_state_verified = (not auto_controls or (latest_bank_known and auto_ft_confident))
+        _budget_state_verified = (
+            not auto_controls or
+            (latest_bank_known and auto_ft_confident
+             and (squad_source != "prior" or bool(squad_load.get("transfer_history_reconstructed"))))
+        )
         transfer_inputs_verified = _sale_prices_verified and _budget_state_verified
         auto_rows = []
 
@@ -2018,6 +2161,8 @@ with decide_tab:
                 reason_line = "At least one public squad member could not be matched; transfer legality cannot be verified."
             elif not _sale_prices_verified:
                 reason_line = "Current pick data is missing an official purchase price for at least one player, so the selling-price budget cannot be verified."
+            elif squad_source == "prior" and auto_controls:
+                reason_line = "The prior squad is manager-confirmed, but the bank and free-transfer count may still reflect GW{}; switch to Manual override and confirm both in FPL before using transfer advice.".format(squad_load.get("baseline_gw"))
             else:
                 reason_line = "Auto-synced bank or free-transfer history is uncertain. Confirm the values in FPL or use manual override before relying on a transfer shortlist."
         if auto_rows:
@@ -2055,7 +2200,7 @@ with decide_tab:
         else:
             reason_line = "No legal, affordable one-for-one transfers were found. Check squad matching, budget, and club-count warnings."
 
-        _provisional = (_model_status == "Fallback" or bool(unmatched)
+        _provisional = (_model_status == "Fallback" or bool(unmatched) or squad_source == "prior"
                         or (auto_controls and (not latest_bank_known or not auto_ft_confident))
                         or not transfer_inputs_verified)
         _provisional_badge = '<span class="provisional-badge">Provisional</span>' if _provisional else ""
@@ -2151,12 +2296,17 @@ with decide_tab:
             options = candidates[(candidates["Position"]==sell["Position"]) &
                                  (~candidates["Player"].isin(squad_names)) &
                                  candidates["Price (tenths)"].map(lambda price: is_affordable_tenths(price, max_price_tenths))].copy()
-            if bank_m is None or sell.get("Selling price source") != "Current FPL picks":
+            _manual_budget_verified = (not auto_controls or
+                                       (squad_source != "prior" and latest_bank_known and auto_ft_confident))
+            if (bank_m is None or int(sell["id"]) not in purchase_price_current_ids
+                    or not _manual_budget_verified):
                 options = options.iloc[0:0]
                 if bank_m is None:
                     st.info("Current bank is unavailable. This comparison is withheld; switch to manual override and enter the FPL bank.")
-                if sell.get("Selling price source") != "Current FPL picks":
+                if int(sell["id"]) not in purchase_price_current_ids:
                     st.info("The selected player's official current purchase price is unavailable, so the selling-price budget cannot be verified.")
+                if not _manual_budget_verified:
+                    st.info("This prior-squad fallback does not verify current bank or free transfers. Switch to Manual override and confirm both before comparing transfers.")
 
             # Enforce the official maximum of three players from any one club.
             # If selling from the candidate's club, the outgoing player frees a slot there.

@@ -46,7 +46,9 @@ class MockResponse:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise requests.HTTPError(f"mock HTTP {self.status_code}")
+            error = requests.HTTPError(f"mock HTTP {self.status_code}")
+            error.response = self
+            raise error
 
     def json(self):
         if self.payload is None:
@@ -152,6 +154,12 @@ def mocked_fpl_get_invalid_picks(url, **kwargs):
         picks[-1]["position"] = picks[-2]["position"]
         return MockResponse({"picks": picks})
     return response
+
+
+def mocked_fpl_get_predeadline_picks(url, **kwargs):
+    if "/entry/2311669/event/2/picks/" in url:
+        return MockResponse(status_code=404)
+    return mocked_fpl_get(url, **kwargs)
 
 
 def _player(player_id, first, second, web_name, position, team_id, *, premium=False):
@@ -333,7 +341,7 @@ class DashboardNavigationAppTests(unittest.TestCase):
             app = AppTest.from_file(str(app_path), default_timeout=60).run()
         self.assertFalse(app.exception, [item.message for item in app.exception])
         status_strip = next(item.value for item in app.markdown if "class='status-strip'" in str(item.value))
-        self.assertIn("unavailable · no sample data", status_strip)
+        self.assertIn("unavailable · check public picks", status_strip)
         verdict = next(item.value for item in app.tabs[0].markdown if "verdict-card" in str(item.value))
         self.assertIn("VERIFY DATA", verdict)
         self.assertIn("No example or saved squad is substituted", verdict)
@@ -341,6 +349,62 @@ class DashboardNavigationAppTests(unittest.TestCase):
             {"Sell", "Buy", "Gain", "Needed", "Reliability"}.issubset(item.value.columns)
             for item in app.tabs[0].dataframe
         ))
+
+    def test_predeadline_404_shows_prior_squad_and_requires_confirmation(self):
+        st.cache_data.clear()
+        app_path = Path(__file__).parents[1] / "app.py"
+        with patch("requests.get", side_effect=mocked_fpl_get_predeadline_picks):
+            app = AppTest.from_file(str(app_path), default_timeout=60).run()
+            self.assertFalse(app.exception, [item.message for item in app.exception])
+            self.assertTrue(any(
+                "Last published squad: GW1" in str(getattr(item, "value", ""))
+                for item in app.sidebar.warning
+            ))
+            _status_strip = next(item.value for item in app.markdown if "class='status-strip'" in str(item.value))
+            self.assertIn("prior deadline · verify", _status_strip)
+            self.assertTrue(any(
+                {"Player", "Club"}.issubset(item.value.columns)
+                for item in app.tabs[2].dataframe
+            ), "The verified prior roster should restore the fixture matrix.")
+            self.assertTrue(any("GW1 published roster layout" in str(item.value)
+                                for item in app.tabs[1].markdown))
+            _reference_markup = "\n".join(str(item.value) for item in app.tabs[1].markdown)
+            self.assertEqual(_reference_markup.count("class='player-tile'"), 11)
+            self.assertEqual(_reference_markup.count("class='bench-card'"), 4)
+            self.assertFalse(any(
+                {"Position", "Player", "Captain", "Vice"}.issubset(item.value.columns)
+                for item in app.tabs[3].dataframe
+            ), "An unconfirmed prior roster must not generate model lineup recommendations.")
+
+            roster_widget = next(
+                item for item in app.sidebar.multiselect
+                if item.label == "Confirm or correct current 15-player roster"
+            )
+            corrected_ids = [pid for pid in roster_widget.value if pid != 15] + [19]
+            roster_widget.set_value(corrected_ids)
+            next(item for item in app.sidebar.checkbox
+                 if item.label == "I confirm this roster includes all transfers and chip changes").set_value(True)
+            app.run()
+            self.assertFalse(app.exception, [item.message for item in app.exception])
+            _corrected_xi = next(
+                item.value for item in app.tabs[3].dataframe
+                if {"Position", "Player", "Captain", "Vice"}.issubset(item.value.columns)
+            )
+            _corrected_bench = next(
+                item.value for item in app.tabs[3].dataframe
+                if {"Order", "Player", "Position"}.issubset(item.value.columns)
+            )
+            self.assertEqual(len(_corrected_xi), 11)
+            self.assertEqual(len(_corrected_bench), 4)
+            self.assertEqual(len(set(_corrected_xi["Player"].tolist() + _corrected_bench["Player"].tolist())), 15)
+            self.assertIn("Candidate FWD", _corrected_xi["Player"].tolist() + _corrected_bench["Player"].tolist())
+            verdict = next(item.value for item in app.tabs[0].markdown if "verdict-card" in str(item.value))
+            self.assertIn("Provisional", verdict)
+            self.assertIn("VERIFY DATA", verdict)
+            self.assertTrue(any(
+                item.label == "I verified these purchase prices in FPL"
+                for item in app.sidebar.checkbox
+            ))
 
 
 if __name__ == "__main__":
