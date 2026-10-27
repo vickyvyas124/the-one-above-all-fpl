@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import fpl_engine
 import fpl_learning
+from fpl_availability import availability_adjustment
 from fpl_ui_labels import status_chip_labels
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -1997,16 +1998,10 @@ with decide_tab:
         def reliability_for_candidate(cand):
             mins = float(cand.get("Minutes", 0) or 0)
             mins_rel = max(0.15, min(1.0, mins / 600.0))
-            status_val = str(cand.get("Status", "")).lower()
-            chance_val = cand.get("Chance (%)")
-            if status_val in {"i", "s", "u"}:
-                avail_rel = 0.20
-            elif status_val == "d":
-                avail_rel = 0.60
-            elif pd.notna(chance_val):
-                avail_rel = max(0.20, min(1.0, float(chance_val) / 100.0))
-            else:
-                avail_rel = 0.88
+            avail_rel = availability_adjustment({
+                "status": cand.get("Status"),
+                "chance_of_playing_next_round": cand.get("Chance (%)"),
+            })
             return mins_rel, avail_rel
 
         for _, outgoing in df.iterrows():
@@ -2235,13 +2230,13 @@ with decide_tab:
             # Reliability is deliberately stronger than in v1.3: fewer than 300 minutes
             # should materially reduce confidence in a transfer recommendation.
             minutes_reliability = (options["Minutes"].astype(float) / 600.0).clip(0.15, 1.0)
-            unknown_status = options["Chance (%)"].isna()
-            doubtful = options["Status"].astype(str).str.lower().eq("d")
-            availability_reliability = pd.Series(1.0, index=options.index)
-            availability_reliability.loc[unknown_status] = 0.88
-            availability_reliability.loc[doubtful] = 0.60
-            unavailable = options["Status"].astype(str).str.lower().isin(["i", "s", "u"])
-            availability_reliability.loc[unavailable] = 0.20
+            availability_reliability = options.apply(
+                lambda row: availability_adjustment({
+                    "status": row.get("Status"),
+                    "chance_of_playing_next_round": row.get("Chance (%)"),
+                }),
+                axis=1,
+            )
 
             # Differential upside is capped: low ownership alone must never dominate the model.
             differential_bonus = (1.0 - ownership.clip(0, 10) / 10.0).clip(0, 1)

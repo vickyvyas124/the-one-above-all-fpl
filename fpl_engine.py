@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import math
 
 import fpl_learning
+from fpl_availability import availability_adjustment
 
 # Set by the dashboard (remote artifact) or worker (persistent fpl-data branch).
 TRAINED_MODEL = None
@@ -89,23 +90,7 @@ def _availability_override(p, weeks_ahead=0):
     """
     if int(weeks_ahead) > 0:
         return 1.0
-    status = str(p.get("status") or "").lower()
-    chance = p.get("chance_of_playing_next_round")
-    if status in {"i", "s", "u"}:
-        return 0.20
-    if status == "d":
-        if chance is not None:
-            try:
-                return max(0.20, min(1.0, float(chance) / 100.0))
-            except (TypeError, ValueError):
-                pass
-        return 0.55
-    if chance is not None:
-        try:
-            return max(0.20, min(1.0, float(chance) / 100.0))
-        except (TypeError, ValueError):
-            return 1.0
-    return 1.0
+    return availability_adjustment(p)
 
 
 def _upcoming_fixtures(p, fixtures, horizon=5, start_gw=None):
@@ -197,19 +182,7 @@ def _estimate_minutes_parts(p, history_signal=None):
         expected_minutes = 0.60 * expected_minutes + 0.40 * float(recent_minutes)
     expected_minutes = max(0.0, min(90.0, expected_minutes))
 
-    status = str(p.get("status") or "").lower()
-    chance = p.get("chance_of_playing_next_round")
-    if status in {"i", "s", "u"}:
-        availability_factor = 0.20
-    elif status == "d":
-        availability_factor = 0.55
-    elif chance is not None:
-        try:
-            availability_factor = max(0.20, min(1.0, float(chance) / 100.0))
-        except (TypeError, ValueError):
-            availability_factor = 0.90
-    else:
-        availability_factor = 0.90
+    availability_factor = availability_adjustment(p)
     return expected_minutes, availability_factor
 
 
