@@ -372,8 +372,11 @@ class DashboardNavigationAppTests(unittest.TestCase):
             self.assertTrue(any("Model-selected starting XI" in str(item.value)
                                 for item in app.tabs[1].markdown))
             _reference_markup = "\n".join(str(item.value) for item in app.tabs[1].markdown)
-            self.assertEqual(_reference_markup.count("class='player-tile'"), 11)
-            self.assertEqual(_reference_markup.count("class='bench-card'"), 4)
+            # The pitch renders the model-selected XI and the bench as player tiles;
+            # only the XI should be marked as starters.
+            self.assertEqual(_reference_markup.count("class='player-tile'"), 15)
+            self.assertEqual(_reference_markup.count("Starting XI ·"), 11)
+            self.assertEqual(_reference_markup.count("<span class='tile-status'>Bench</span>"), 4)
             self.assertTrue(any(
                 {"Position", "Player", "Captain", "Vice"}.issubset(item.value.columns)
                 for item in app.tabs[3].dataframe

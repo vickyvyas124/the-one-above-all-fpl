@@ -11,6 +11,7 @@ import fpl_learning
 from fpl_availability import availability_adjustment
 from fpl_ui_labels import status_chip_labels
 from fpl_lineup import score_starting_xi, select_model_lineup
+from fpl_visuals import club_badge_url, player_headshot_url, player_initials
 from fpl_squad import load_public_squad, validate_squad_ids
 from fpl_transfer import (
     gameweek_projection_series,
@@ -456,6 +457,18 @@ h2,h3 {letter-spacing:-.025em;}
 .pitch-title {margin:5px 0 10px;}
 .pitch-row {gap:clamp(3px,1vw,12px);margin:12px auto;}
 .manager-overview-note {background:#f3f6f8;border-left:3px solid var(--green-dark);padding:9px 10px;border-radius:8px;color:#465762;font-size:.78rem;line-height:1.45;margin-top:10px;}
+.tile-avatar {position:relative;}
+.player-headshot-wrap {position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden;background:linear-gradient(180deg,#eff6f1,#dcebe2);}
+.player-initials {font-size:1.12rem;font-weight:900;color:#214530;letter-spacing:.02em;}
+.player-headshot {position:absolute;inset:0;width:100%;height:100%;object-fit:contain;object-position:center bottom;}
+.player-badge {position:absolute;right:2px;bottom:2px;width:20px;height:20px;object-fit:contain;background:#fff;border:1px solid #d9e1e5;border-radius:50%;padding:1px;}
+.player-badge-fallback {position:absolute;right:2px;bottom:2px;min-width:20px;height:20px;display:flex;align-items:center;justify-content:center;background:#fff;border:1px solid #d9e1e5;border-radius:50%;padding:0 2px;color:#243b4a;font-size:.45rem;font-weight:900;}
+.bench-grid .player-tile {width:100%;max-width:150px;justify-self:center;}
+.tile-status {font-size:.58rem;color:#61717e;}
+.player-details {background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:10px 0;color:var(--ink);}
+.player-details table {width:100%;font-size:.82rem;border-collapse:collapse;}
+.player-details td {padding:4px 6px;border-bottom:1px solid #eef1f3;}
+.player-details td:first-child {color:var(--muted);width:42%;}
 @media(max-width:900px) {
  .gw-scoreband {grid-template-columns:repeat(2,minmax(0,1fr));}
  .player-tile {width:23%;max-width:98px;}
@@ -1199,6 +1212,10 @@ with squad_tab:
         st.caption("Latest recorded points and rank from the public manager history.")
         st.markdown(f"**Next GW · GW{int(gw)}**")
         st.caption(f"Lineup source: {_lineup_source_label}. Pitch numbers are projections for the selected horizon.")
+        display_mode = st.radio(
+            "Squad display", ["Pitch view", "List view"], horizontal=True,
+            key="squad_display_mode", label_visibility="collapsed",
+        )
         if unmatched:
             st.warning("Names not uniquely matched to public data (review manually): " + ", ".join(unmatched))
         if resolved:
@@ -1209,23 +1226,33 @@ with squad_tab:
             squad_lookup = {norm(r["Player"]): r for _, r in squad.iterrows()}
             def get_squad_record(alias):
                 return squad_lookup.get(norm(alias))
-            def tile(alias):
+            def tile(alias, squad_status):
                 r = get_squad_record(alias)
                 if r is None:
-                    return f"<div class='player-tile'><div class='tile-top'>{esc(alias)}</div><div class='tile-avatar'>?</div><div class='tile-meta'>Data pending</div></div>"
+                    return (f"<div class='player-tile'><div class='tile-top'>{esc(alias)}</div>"
+                            f"<div class='tile-avatar'><div class='player-headshot-wrap'><span class='player-initials'>?</span></div></div>"
+                            f"<div class='tile-meta'>Data pending<br>{esc(squad_status)}</div></div>")
                 short = str(r["Player"])
-                _role = ("C" if selected_lineup and int(r["id"]) == int(selected_lineup["captain"]["id"])
-                        else "VC" if selected_lineup and int(r["id"]) == int(selected_lineup["vice"]["id"]) else "")
+                _display_captain = reference_lineup.get("captain") if reference_lineup else None
+                _display_vice = reference_lineup.get("vice") if reference_lineup else None
+                _role = ("C" if _display_captain and int(r["id"]) == int(_display_captain["id"])
+                        else "VC" if _display_vice and int(r["id"]) == int(_display_vice["id"]) else "")
                 pts = lineup_projection_by_id.get(int(r["id"]), 0.0)
                 club = str(r["Club"])
-                color = "#52715e"
-                shirt = (f"<svg class='kit-icon' viewBox='0 0 64 64' aria-label='shirt'>"
-                         f"<path d='M21 8 L13 12 L4 28 L14 34 L20 24 L20 56 L44 56 L44 24 L50 34 L60 28 L51 12 L43 8 C39 15 25 15 21 8Z' fill='{color}' stroke='#ffffff' stroke-width='1.7' stroke-linejoin='round'/>"
-                         f"<path d='M24 8 C26 18 38 18 40 8' fill='none' stroke='#f9f6fb' stroke-width='3'/>"
-                         f"<text x='32' y='39' text-anchor='middle' font-size='12' font-weight='900' fill='#ffffff'> {esc(club[:3])} </text></svg>")
+                _player_data = _players_by_id.get(int(r["id"]), {})
+                _headshot_url = player_headshot_url(_player_data)
+                _badge_url = club_badge_url(teams, _player_data.get("team"))
+                _headshot = (f"<img class='player-headshot' src='{_headshot_url}' alt='' loading='lazy' decoding='async' fetchpriority='low' onload=\"this.previousElementSibling.style.display='none'\" onerror=\"this.style.display='none'\">"
+                             if _headshot_url else "")
+                _badge = (f"<img class='player-badge' src='{_badge_url}' alt='' loading='lazy' decoding='async' fetchpriority='low' onload=\"this.previousElementSibling.style.display='none'\" onerror=\"this.style.display='none'\">"
+                          if _badge_url else "")
+                _initials = esc(player_initials(_player_data))
+                _badge_fallback = esc(club[:3].upper() if club and club != "?" else "⚽")
                 return (f"<div class='player-tile'><div class='tile-top'>{esc(short)}{(' · ' + _role) if _role else ''}</div>"
-                        f"<div class='tile-avatar'>{shirt}</div><div class='tile-meta'>{esc(club)} · £{float(r['Price (£m)']):.1f}m<br>"
-                         f"<span class='tile-pts'>{float(pts):.1f} proj.</span></div></div>")
+                        f"<div class='tile-avatar'><div class='player-headshot-wrap'><span class='player-initials'>{_initials}</span>{_headshot}"
+                        f"<span class='player-badge-fallback'>{_badge_fallback}</span>{_badge}</div></div>"
+                        f"<div class='tile-meta'>{esc(club)} · £{float(r['Price (£m)']):.1f}m<br>"
+                        f"<span class='tile-pts'>{float(pts):.1f} pts</span><br><span class='tile-status'>{esc(squad_status)}</span></div></div>")
             if reference_lineup:
                 _role_titles = {"GK": "GOALKEEPER", "GKP": "GOALKEEPER", "DEF": "DEFENDERS", "MID": "MIDFIELDERS", "FWD": "FORWARDS"}
                 _lineup_groups = {"GOALKEEPER": [], "DEFENDERS": [], "MIDFIELDERS": [], "FORWARDS": []}
@@ -1250,32 +1277,126 @@ with squad_tab:
                 f"<div class='gw-scorebox'><div class='num'>{esc(entry.get('summary_overall_points', '—') if entry else '—')}</div><div class='lbl'>Total points</div></div>"
                 "</div>"
             )
-            st.markdown(scoreband, unsafe_allow_html=True)
-            _pitch_title = ("Model-selected starting XI · one-GW projections" if selected_lineup
-                            else f"GW{squad_load.get('baseline_gw')} published roster layout · reference only")
-            pitch_html = f"<div class='pitch-wrap'><div class='pitch-lines'></div><div class='pitch-title'>{esc(_pitch_title)}</div>"
-            for label, names in xi_rows:
-                pitch_html += f"<div class='pitch-title'>{label}</div><div class='pitch-row'>"
-                pitch_html += "".join(tile(name) for name in names)
-                pitch_html += "</div>"
-            _pitch_note = ("Formation, captain choices and Bench Boost estimates use this same selected XI. Projections are estimates, not guaranteed points."
-                           if selected_lineup else "This is the last published positional layout, not a current lineup recommendation. Confirm or correct your current roster in the sidebar.")
-            pitch_html += f"<div class='pitch-caption'>{esc(_pitch_note)}</div></div>"
-            st.markdown(pitch_html, unsafe_allow_html=True)
-            st.markdown("#### Bench")
-            bench_parts=[]
-            for name in bench_names:
-                r=get_squad_record(name)
-                if r is not None:
-                    sub=f"{esc(r['Club'])} · £{float(r['Price (£m)']):.1f}m · {lineup_projection_by_id.get(int(r['id']), 0.0):.1f} GW pts"
-                else:
-                    sub="Data pending"
-                bench_parts.append(f"<div class='bench-card'><div class='bench-name'>{esc(name)}</div><div class='bench-sub'>{sub}</div></div>")
-            st.markdown("<div class='bench-grid'>"+"".join(bench_parts)+"</div>", unsafe_allow_html=True)
+            if display_mode == "Pitch view":
+                st.markdown(scoreband, unsafe_allow_html=True)
+                _pitch_title = (f"Model-selected starting XI · GW{gw} projections" if selected_lineup
+                                else f"GW{squad_load.get('baseline_gw')} published roster layout · reference only")
+                pitch_html = f"<div class='pitch-wrap'><div class='pitch-lines'></div><div class='pitch-title'>{esc(_pitch_title)}</div>"
+                for label, names in xi_rows:
+                    pitch_html += f"<div class='pitch-title'>{label}</div><div class='pitch-row'>"
+                    _role_label = label.rstrip("S").title()
+                    _starter_label = "Starting XI" if selected_lineup else "Published XI reference"
+                    pitch_html += "".join(tile(name, f"{_starter_label} · {_role_label}") for name in names)
+                    pitch_html += "</div>"
+                _pitch_note = ("The model-selected XI, captain and vice-captain are the same choices used by the Squad and Model tabs."
+                               if selected_lineup else "Last published lineup shown as a reference; it is not a current model recommendation.")
+                pitch_html += f"<div class='pitch-caption'>{esc(_pitch_note)}</div></div>"
+                st.markdown(pitch_html, unsafe_allow_html=True)
+                st.markdown("#### Bench · substitutes")
+                bench_parts = [tile(name, "Bench") for name in bench_names]
+                st.markdown("<div class='bench-grid'>" + "".join(bench_parts) + "</div>", unsafe_allow_html=True)
+            else:
+                st.markdown("**Squad list · starting XI and substitutes**")
+                _list_squad = squad.copy()
+                _starter_ids = model_xi_start_ids if selected_lineup else {
+                    int(player["id"]) for player in (reference_lineup or {}).get("starters", [])
+                }
+                _list_squad["Squad role"] = _list_squad["id"].map(
+                    lambda player_id: (
+                        "Model starting XI" if selected_lineup and int(player_id) in _starter_ids else
+                        "Model bench" if selected_lineup else
+                        "Published XI reference" if reference_lineup and int(player_id) in _starter_ids else
+                        "Published bench reference" if reference_lineup else "Unassigned"
+                    )
+                )
+                st.dataframe(_list_squad.drop(columns=["id"]), use_container_width=True, hide_index=True)
             total_current_cost = squad["Price (£m)"].sum()
             st.caption(f"Public prices sum to £{total_current_cost:.1f}m for matched players. This is not necessarily your squad's purchase/selling value.")
-            with st.expander("View full squad statistics"):
-                st.dataframe(squad.drop(columns=["id"]), use_container_width=True, hide_index=True)
+            if display_mode == "Pitch view":
+                with st.expander("View full squad statistics"):
+                    st.dataframe(squad.drop(columns=["id"]), use_container_width=True, hide_index=True)
+
+            _resolved_detail_by_id = {int(row["id"]): row for row in resolved}
+            _detail_ids = list(_resolved_detail_by_id)
+            _detail_id = st.selectbox(
+                "Player details", _detail_ids,
+                format_func=lambda player_id: (
+                    f"{_players_by_id.get(int(player_id), {}).get('web_name', 'Player')} · "
+                    f"{teams.get(_players_by_id.get(int(player_id), {}).get('team'), {}).get('short_name', '?')} · #{int(player_id)}"
+                ),
+                key="squad_player_details",
+            )
+            _detail_row = pd.Series(_resolved_detail_by_id[int(_detail_id)])
+            _detail_name = str(_detail_row["Player"])
+            _detail_player = _players_by_id.get(_detail_id)
+            if _detail_player:
+                _detail_series = _projection_series_for(_detail_player)
+                _detail_expected_minutes = fpl_engine.estimate_expected_minutes(
+                    _detail_player, PLAYER_HISTORY_SIGNALS.get(_detail_id, {}),
+                    fpl_engine.team_fixture_count(fixtures, _detail_player.get("team"), int(gw)),
+                )
+                _detail_role = ("Starting XI" if _detail_id in model_xi_start_ids else "Bench") if selected_lineup else (
+                    "Published XI reference" if _detail_id in {int(p["id"]) for p in (reference_lineup or {}).get("starters", [])}
+                    else "Published bench reference" if reference_lineup else "Unavailable"
+                )
+                _detail_captain = (reference_lineup or {}).get("captain")
+                _detail_vice = (reference_lineup or {}).get("vice")
+                _captain_role = (
+                    "Model captain" if selected_lineup and _detail_captain and _detail_id == int(_detail_captain["id"]) else
+                    "Model vice-captain" if selected_lineup and _detail_vice and _detail_id == int(_detail_vice["id"]) else
+                    "Last published captain" if not selected_lineup and _detail_captain and _detail_id == int(_detail_captain["id"]) else
+                    "Last published vice-captain" if not selected_lineup and _detail_vice and _detail_id == int(_detail_vice["id"]) else
+                    "No captain marker"
+                )
+                _price_verified = _detail_id in purchase_price_current_ids
+                _sale_text = (f"£{float(_detail_row['Sell price (£m)']):.1f}m · verified"
+                              if _price_verified else "Unverified")
+                _detail_current_price = _detail_player.get("now_cost")
+                _current_price_text = (f"£{int(_detail_current_price) / 10:.1f}m"
+                                       if isinstance(_detail_current_price, (int, float)) and _detail_current_price > 0
+                                       else "Unavailable")
+                _detail_status = str(_detail_player.get("status") or "unknown")
+                _detail_chance = _detail_player.get("chance_of_playing_next_round")
+                _availability_text = (f"FPL status {_detail_status}; chance {_detail_chance}%"
+                                      if _detail_chance is not None else f"FPL status {_detail_status}; chance not published")
+                _summary_items = [
+                    ("Lineup role", _detail_role), ("Captaincy", _captain_role),
+                    ("Selected GW points", f"{_detail_series[0]['points']:.1f}" if _detail_series else "Unavailable"),
+                    (f"GW{gw}–GW{gw + horizon - 1} projection", f"{sum(row['points'] for row in _detail_series):.1f} points" if _detail_series else "Unavailable"),
+                    ("Expected minutes this GW", f"{_detail_expected_minutes} min" if _detail_expected_minutes is not None else "Unavailable"),
+                    ("Availability", _availability_text), ("Current market price", _current_price_text),
+                    ("Official selling price", _sale_text),
+                ]
+                _details_html = "<div class='player-details'><strong>" + esc(_detail_name) + " · player details</strong><table>"
+                _details_html += "".join(f"<tr><td>{esc(label)}</td><td>{esc(value)}</td></tr>" for label, value in _summary_items)
+                _details_html += "</table></div>"
+                st.markdown(_details_html, unsafe_allow_html=True)
+                if _detail_series:
+                    st.caption("Projected points by Gameweek")
+                    st.dataframe(pd.DataFrame([
+                        {"Gameweek": f"GW{row['gameweek']}", "Projected points": round(float(row["points"]), 1)}
+                        for row in _detail_series
+                    ]), use_container_width=True, hide_index=True)
+                _detail_fixtures = []
+                for _fixture in fixtures:
+                    _event = _fixture.get("event")
+                    if (_event is None or not int(gw) <= int(_event) < int(gw) + int(horizon)
+                            or _fixture.get("finished")
+                            or _detail_player.get("team") not in (_fixture.get("team_h"), _fixture.get("team_a"))):
+                        continue
+                    _is_home = _fixture.get("team_h") == _detail_player.get("team")
+                    _opponent_id = _fixture.get("team_a") if _is_home else _fixture.get("team_h")
+                    _fdr_field = "team_h_difficulty" if _is_home else "team_a_difficulty"
+                    _detail_fixtures.append({
+                        "Gameweek": int(_event), "Opponent": teams.get(_opponent_id, {}).get("short_name", "TBC"),
+                        "Venue": "Home" if _is_home else "Away", "FDR": _fixture.get(_fdr_field, "—"),
+                        "Kickoff": str(_fixture.get("kickoff_time") or "TBC"),
+                    })
+                if _detail_fixtures:
+                    st.caption("Upcoming fixtures across the selected projection horizon")
+                    st.dataframe(pd.DataFrame(_detail_fixtures), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No upcoming fixtures are currently assigned in the selected horizon.")
         else:
             st.warning(picks_sync_note)
 
@@ -2345,9 +2466,18 @@ with decide_tab:
                                          - int(_preferred_plan["paid_transfers"]))
                     _marginal_gate = transfer_plan_action_threshold(_marginal_paid)
                     if _incremental < _marginal_gate:
-                        reason_line += (f" The second transfer adds only {_incremental:+.1f} net "
-                                        f"starting-XI points (needs {_marginal_gate:.1f}), so the "
+                        reason_line += (f" The second transfer adds only {_incremental:+.2f} net "
+                                        f"starting-XI points (needs {_marginal_gate:.2f}), so the "
                                         "single transfer is preferred.")
+                elif _preferred_plan["transfer_count"] == 2 and 1 in _optimization_plans:
+                    _one_move = _optimization_plans[1]
+                    _incremental = (_preferred_gain - float(_one_move["cumulative_net_gain"]))
+                    _marginal_paid = max(0, int(_preferred_plan["paid_transfers"])
+                                         - int(_one_move["paid_transfers"]))
+                    _marginal_gate = transfer_plan_action_threshold(_marginal_paid)
+                    reason_line += (f" The second transfer adds {_incremental:+.2f} net "
+                                    f"starting-XI points over the best single and clears the "
+                                    f"+{_marginal_gate:.2f} incremental gate.")
         elif _optimization_plans and not transfer_inputs_verified:
             # Give a useful projected idea even when exact manager-specific
             # prices or controls are missing. Never call it an actionable
@@ -2387,6 +2517,26 @@ with decide_tab:
                     candidate_summary = _move_names
                     reason_line = (f"Top projected plan adds {gain:+.1f} net starting-XI points over "
                                    f"{horizon} Gameweeks. Confirm the items below before making these moves.")
+                    if _display_plan["transfer_count"] == 2 and 1 in _projected_plan_by_count:
+                        _single_plan = _projected_plan_by_count[1]
+                        _incremental = gain - float(_single_plan["cumulative_net_gain"])
+                        _marginal_paid = max(0, int(_display_plan["paid_transfers"])
+                                             - int(_single_plan["paid_transfers"]))
+                        _marginal_gate = transfer_plan_action_threshold(_marginal_paid)
+                        reason_line += (f" The second transfer adds {_incremental:+.2f} net points "
+                                        f"over the best single and "
+                                        f"{'clears' if _incremental >= _marginal_gate else 'does not clear'} "
+                                        f"the +{_marginal_gate:.2f} incremental gate.")
+                    elif _display_plan["transfer_count"] == 1 and 2 in _projected_plan_by_count:
+                        _two_plan = _projected_plan_by_count[2]
+                        _incremental = (float(_two_plan["cumulative_net_gain"]) - gain)
+                        _marginal_paid = max(0, int(_two_plan["paid_transfers"])
+                                             - int(_display_plan["paid_transfers"]))
+                        _marginal_gate = transfer_plan_action_threshold(_marginal_paid)
+                        reason_line += (f" The two-transfer option projects "
+                                        f"{float(_two_plan['cumulative_net_gain']):+.1f} net points, "
+                                        f"but its second move adds only {_incremental:+.2f} "
+                                        f"(needs +{_marginal_gate:.2f}), so the single is preferred.")
                 else:
                     decision_label = "HOLD / ROLL · FOR NOW"
                     candidate_summary = f"No move clears the gate · best projection: {_move_names}"
@@ -2538,12 +2688,12 @@ with decide_tab:
                         "Gross XI gain vs hold": f"{sum(r['plan_points'] - r['hold_points'] for r in _shown_plan['gameweeks']):+.1f}",
                         "Incremental vs previous transfer count": (
                             "—" if _count == 0 or (_count - 1) not in _optimization_plans else
-                            f"{_shown_plan['cumulative_net_gain'] - _optimization_plans[_count - 1]['cumulative_net_gain']:+.1f}"
+                            f"{_shown_plan['cumulative_net_gain'] - _optimization_plans[_count - 1]['cumulative_net_gain']:+.2f}"
                         ),
                         "Action gate": (
                             "HOLD baseline" if _count == 0 else
-                            f"Total ≥ {transfer_plan_action_threshold(_shown_plan['paid_transfers']):.0f}; "
-                            f"increment ≥ {transfer_plan_action_threshold(max(0, int(_shown_plan['paid_transfers']) - int(_optimization_plans.get(_count - 1, {}).get('paid_transfers', 0)))):.0f}"
+                            f"Total ≥ {transfer_plan_action_threshold(_shown_plan['paid_transfers']):.2f}; "
+                            f"increment ≥ {transfer_plan_action_threshold(max(0, int(_shown_plan['paid_transfers']) - int(_optimization_plans.get(_count - 1, {}).get('paid_transfers', 0)))):.2f}"
                         ),
                         "By Gameweek": " · ".join(f"GW{r['gameweek']} {r['plan_points']:.1f} vs {r['hold_points']:.1f}" for r in _shown_plan["gameweeks"]),
                     })
