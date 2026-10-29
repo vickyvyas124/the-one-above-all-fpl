@@ -2466,9 +2466,18 @@ with decide_tab:
                                          - int(_preferred_plan["paid_transfers"]))
                     _marginal_gate = transfer_plan_action_threshold(_marginal_paid)
                     if _incremental < _marginal_gate:
-                        reason_line += (f" The second transfer adds only {_incremental:+.1f} net "
-                                        f"starting-XI points (needs {_marginal_gate:.1f}), so the "
+                        reason_line += (f" The second transfer adds only {_incremental:+.2f} net "
+                                        f"starting-XI points (needs {_marginal_gate:.2f}), so the "
                                         "single transfer is preferred.")
+                elif _preferred_plan["transfer_count"] == 2 and 1 in _optimization_plans:
+                    _one_move = _optimization_plans[1]
+                    _incremental = (_preferred_gain - float(_one_move["cumulative_net_gain"]))
+                    _marginal_paid = max(0, int(_preferred_plan["paid_transfers"])
+                                         - int(_one_move["paid_transfers"]))
+                    _marginal_gate = transfer_plan_action_threshold(_marginal_paid)
+                    reason_line += (f" The second transfer adds {_incremental:+.2f} net "
+                                    f"starting-XI points over the best single and clears the "
+                                    f"+{_marginal_gate:.2f} incremental gate.")
         elif _optimization_plans and not transfer_inputs_verified:
             # Give a useful projected idea even when exact manager-specific
             # prices or controls are missing. Never call it an actionable
@@ -2508,6 +2517,26 @@ with decide_tab:
                     candidate_summary = _move_names
                     reason_line = (f"Top projected plan adds {gain:+.1f} net starting-XI points over "
                                    f"{horizon} Gameweeks. Confirm the items below before making these moves.")
+                    if _display_plan["transfer_count"] == 2 and 1 in _projected_plan_by_count:
+                        _single_plan = _projected_plan_by_count[1]
+                        _incremental = gain - float(_single_plan["cumulative_net_gain"])
+                        _marginal_paid = max(0, int(_display_plan["paid_transfers"])
+                                             - int(_single_plan["paid_transfers"]))
+                        _marginal_gate = transfer_plan_action_threshold(_marginal_paid)
+                        reason_line += (f" The second transfer adds {_incremental:+.2f} net points "
+                                        f"over the best single and "
+                                        f"{'clears' if _incremental >= _marginal_gate else 'does not clear'} "
+                                        f"the +{_marginal_gate:.2f} incremental gate.")
+                    elif _display_plan["transfer_count"] == 1 and 2 in _projected_plan_by_count:
+                        _two_plan = _projected_plan_by_count[2]
+                        _incremental = (float(_two_plan["cumulative_net_gain"]) - gain)
+                        _marginal_paid = max(0, int(_two_plan["paid_transfers"])
+                                             - int(_display_plan["paid_transfers"]))
+                        _marginal_gate = transfer_plan_action_threshold(_marginal_paid)
+                        reason_line += (f" The two-transfer option projects "
+                                        f"{float(_two_plan['cumulative_net_gain']):+.1f} net points, "
+                                        f"but its second move adds only {_incremental:+.2f} "
+                                        f"(needs +{_marginal_gate:.2f}), so the single is preferred.")
                 else:
                     decision_label = "HOLD / ROLL · FOR NOW"
                     candidate_summary = f"No move clears the gate · best projection: {_move_names}"
@@ -2659,12 +2688,12 @@ with decide_tab:
                         "Gross XI gain vs hold": f"{sum(r['plan_points'] - r['hold_points'] for r in _shown_plan['gameweeks']):+.1f}",
                         "Incremental vs previous transfer count": (
                             "—" if _count == 0 or (_count - 1) not in _optimization_plans else
-                            f"{_shown_plan['cumulative_net_gain'] - _optimization_plans[_count - 1]['cumulative_net_gain']:+.1f}"
+                            f"{_shown_plan['cumulative_net_gain'] - _optimization_plans[_count - 1]['cumulative_net_gain']:+.2f}"
                         ),
                         "Action gate": (
                             "HOLD baseline" if _count == 0 else
-                            f"Total ≥ {transfer_plan_action_threshold(_shown_plan['paid_transfers']):.0f}; "
-                            f"increment ≥ {transfer_plan_action_threshold(max(0, int(_shown_plan['paid_transfers']) - int(_optimization_plans.get(_count - 1, {}).get('paid_transfers', 0)))):.0f}"
+                            f"Total ≥ {transfer_plan_action_threshold(_shown_plan['paid_transfers']):.2f}; "
+                            f"increment ≥ {transfer_plan_action_threshold(max(0, int(_shown_plan['paid_transfers']) - int(_optimization_plans.get(_count - 1, {}).get('paid_transfers', 0)))):.2f}"
                         ),
                         "By Gameweek": " · ".join(f"GW{r['gameweek']} {r['plan_points']:.1f} vs {r['hold_points']:.1f}" for r in _shown_plan["gameweeks"]),
                     })

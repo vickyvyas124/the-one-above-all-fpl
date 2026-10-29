@@ -21,8 +21,10 @@ class TransferProjectionTests(unittest.TestCase):
         plans = {
             0: {"affordable": True, "cumulative_net_gain": 0.0, "paid_transfers": 0},
             1: {"affordable": True, "cumulative_net_gain": 8.0, "paid_transfers": 0},
-            2: {"affordable": True, "cumulative_net_gain": 10.0, "paid_transfers": 0},
+            2: {"affordable": True, "cumulative_net_gain": 11.96, "paid_transfers": 0},
         }
+        # A one-decimal table rounds this marginal gain to +4.0, but the true
+        # value is +3.96 and must not clear the +4.0 threshold.
         self.assertIs(select_actionable_transfer_plan(plans), plans[1])
         plans[2]["cumulative_net_gain"] = 12.0
         self.assertIs(select_actionable_transfer_plan(plans), plans[2])
