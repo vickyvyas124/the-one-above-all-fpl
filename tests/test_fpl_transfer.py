@@ -35,6 +35,17 @@ class TransferProjectionTests(unittest.TestCase):
         }
         self.assertIs(select_actionable_transfer_plan(plans), plans[0])
 
+    def test_unverified_inputs_still_return_a_clearly_provisional_best_plan(self):
+        plans = {
+            0: {"affordable": True, "cumulative_net_gain": 0.0, "paid_transfers": 0},
+            1: {"affordable": None, "cumulative_net_gain": 8.0, "paid_transfers": 0},
+            2: {"affordable": None, "cumulative_net_gain": 10.0, "paid_transfers": 0},
+        }
+        self.assertIs(select_actionable_transfer_plan(plans), plans[0])
+        self.assertIs(select_actionable_transfer_plan(plans, require_verified_budget=False), plans[1])
+        plans[2]["cumulative_net_gain"] = 12.0
+        self.assertIs(select_actionable_transfer_plan(plans, require_verified_budget=False), plans[2])
+
     def test_official_selling_price_uses_half_profit_rounded_down(self):
         self.assertEqual(official_selling_price_tenths(100, 107), 103)
         self.assertEqual(official_selling_price_tenths(100, 101), 100)

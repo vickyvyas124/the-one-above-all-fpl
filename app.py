@@ -2349,8 +2349,74 @@ with decide_tab:
                                         f"starting-XI points (needs {_marginal_gate:.1f}), so the "
                                         "single transfer is preferred.")
         elif _optimization_plans and not transfer_inputs_verified:
-            decision_label = "VERIFY DATA"
-            reason_line = "Projected plans are shown below, but current bank, free-transfer count, or selling-price inputs are uncertain; affordability is unverified."
+            # Give a useful projected idea even when exact manager-specific
+            # prices or controls are missing. Never call it an actionable
+            # transfer until its squad, bank, free transfers and sale values
+            # are confirmed.
+            _projected_plan_by_count = {}
+            if 0 in _optimization_plans:
+                _projected_plan_by_count[0] = _optimization_plans[0]
+            for _count, _plan in _optimization_plans.items():
+                for _candidate_plan in [_plan, *_plan.get("projection_only_alternatives", [])]:
+                    if _candidate_plan.get("affordable") is False:
+                        continue
+                    _prior = _projected_plan_by_count.get(_count)
+                    if (_prior is None or _candidate_plan["cumulative_net_gain"]
+                            > _prior["cumulative_net_gain"]):
+                        _projected_plan_by_count[_count] = _candidate_plan
+            _best_projected_action = select_actionable_transfer_plan(
+                _projected_plan_by_count, require_verified_budget=False
+            )
+            _best_projected_idea = max(
+                (plan for count, plan in _projected_plan_by_count.items() if count > 0),
+                key=lambda plan: plan["cumulative_net_gain"], default=None,
+            )
+            if selected_lineup and not unmatched and _best_projected_idea:
+                _display_plan = (_best_projected_action
+                                 if _best_projected_action and _best_projected_action["transfer_count"] > 0
+                                 else _best_projected_idea)
+                _move_names = " · ".join(
+                    f"{move['out']['Player']} → {move['in']['Player']}"
+                    for move in _display_plan["transfers"]
+                )
+                gain = float(_display_plan["cumulative_net_gain"])
+                threshold = transfer_plan_action_threshold(_display_plan["paid_transfers"])
+                if (_best_projected_action
+                        and _best_projected_action["transfer_count"] > 0):
+                    decision_label = "PROJECTED PICK · CHECK INPUTS"
+                    candidate_summary = _move_names
+                    reason_line = (f"Top projected plan adds {gain:+.1f} net starting-XI points over "
+                                   f"{horizon} Gameweeks. Confirm the items below before making these moves.")
+                else:
+                    decision_label = "HOLD / ROLL · FOR NOW"
+                    candidate_summary = f"No move clears the gate · best projection: {_move_names}"
+                    reason_line = (f"The leading projected plan is {gain:+.1f} net points and does not "
+                                   f"clear the {threshold:.0f}-point action gate. Keep the transfers for now; "
+                                   "the projected option is shown for comparison.")
+                _checks = []
+                if not _budget_state_verified:
+                    if bank_tenths_current is None or not latest_bank_known:
+                        _checks.append("confirm the current FPL bank")
+                    if auto_controls and not auto_ft_confident:
+                        _checks.append("confirm the exact free-transfer count")
+                    if squad_source == "prior" and not squad_load.get("transfer_history_reconstructed"):
+                        _checks.append("confirm current transfers and squad")
+                if not _sale_prices_verified:
+                    _missing_sells = [
+                        move["out"]["Player"] for move in _display_plan["transfers"]
+                        if int(move["out"]["id"]) not in purchase_price_current_ids
+                    ]
+                    if _missing_sells:
+                        _checks.append("check official selling prices for " + ", ".join(_missing_sells))
+                    else:
+                        _checks.append("check official selling prices in FPL")
+                reason_line += (" To unlock an actionable recommendation, "
+                                + ("; ".join(_checks) if _checks else "confirm the transfer budget in FPL")
+                                + ".")
+            else:
+                decision_label = "VERIFY DATA"
+                reason_line = ("The current squad or player matching is incomplete, so a safe transfer suggestion "
+                               "cannot be ranked yet. Confirm the roster in the sidebar first.")
 
         _provisional = (_model_status == "Fallback" or bool(unmatched) or squad_source == "prior"
                         or (auto_controls and (not latest_bank_known or not auto_ft_confident))
