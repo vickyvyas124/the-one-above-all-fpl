@@ -376,7 +376,7 @@ class DashboardNavigationAppTests(unittest.TestCase):
             # only the XI should be marked as starters.
             self.assertEqual(_reference_markup.count("class='player-tile'"), 15)
             self.assertEqual(_reference_markup.count("Starting XI ·"), 11)
-            self.assertEqual(_reference_markup.count("class='bench-card'"), 4)
+            self.assertEqual(_reference_markup.count("<span class='tile-status'>Bench</span>"), 4)
             self.assertTrue(any(
                 {"Position", "Player", "Captain", "Vice"}.issubset(item.value.columns)
                 for item in app.tabs[3].dataframe
