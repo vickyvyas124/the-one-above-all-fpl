@@ -105,13 +105,15 @@ def transfer_plan_action_threshold(paid_transfers):
     return 6.0 if int(paid_transfers) > 0 else 4.0
 
 
-def select_actionable_transfer_plan(plans):
+def select_actionable_transfer_plan(plans, *, require_verified_budget=True):
     """Choose the strongest plan that clears both total and incremental gates.
 
     A larger transfer plan must improve on the best plan with one fewer move
     by the same action margin used for the plan's free/paid marginal move.
     This prevents a weak second move from being recommended just because the
-    first move already made the combined plan look attractive.
+    first move already made the combined plan look attractive. Set
+    ``require_verified_budget=False`` only to build a clearly provisional
+    projected suggestion while the dashboard asks the manager to verify inputs.
     """
     if not plans:
         return None
@@ -119,7 +121,7 @@ def select_actionable_transfer_plan(plans):
     selected = hold
     for count in sorted(key for key in plans if key > 0):
         plan = plans[count]
-        if plan.get("affordable") is not True:
+        if (require_verified_budget and plan.get("affordable") is not True) or plan.get("affordable") is False:
             continue
         total_gain = float(plan.get("cumulative_net_gain", float("-inf")))
         if total_gain < transfer_plan_action_threshold(plan.get("paid_transfers", 0)):
