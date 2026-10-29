@@ -11,6 +11,7 @@ import fpl_learning
 from fpl_availability import availability_adjustment
 from fpl_ui_labels import status_chip_labels
 from fpl_lineup import score_starting_xi, select_model_lineup
+from fpl_chip_strategy import chip_half, chip_history_for_half, chip_planning_gameweeks
 from fpl_visuals import club_badge_url, player_headshot_url, player_initials
 from fpl_squad import load_public_squad, validate_squad_ids
 from fpl_transfer import (
@@ -830,26 +831,10 @@ except Exception:
     previous_history = {}
 
 # Use public chip history when it is available, while keeping a manual status fallback.
-chip_period_key = "first_half" if int(gw) < 20 else "second_half"
-chip_period_label = "First-half chips (before GW19 deadline)" if int(gw) < 20 else "Second-half chips (GW20 onwards)"
+chip_period_key = chip_half(gw)
+chip_period_label = "First-half chips (before GW19 deadline)" if chip_period_key == "first_half" else "Second-half chips (GW20 onwards)"
 _chip_history = history_payload.get("chips", []) if isinstance(history_payload, dict) else []
-_chip_used_events = {"wildcard": [], "bench_boost": [], "free_hit": [], "triple_captain": []}
-_chip_aliases = {
-    "wildcard": "wildcard", "wc": "wildcard",
-    "bboost": "bench_boost", "benchboost": "bench_boost", "bench_boost": "bench_boost",
-    "freehit": "free_hit", "free_hit": "free_hit",
-    "3xc": "triple_captain", "triplecaptain": "triple_captain", "triple_captain": "triple_captain",
-}
-for _chip in _chip_history if isinstance(_chip_history, list) else []:
-    try:
-        _chip_name = "".join(ch for ch in str(_chip.get("name", "")).lower() if ch.isalnum() or ch == "_")
-        _chip_type = _chip_aliases.get(_chip_name)
-        _chip_event = int(_chip.get("event"))
-        in_period = (_chip_event < 20) if int(gw) < 20 else (_chip_event >= 20)
-        if _chip_type and in_period:
-            _chip_used_events[_chip_type].append(_chip_event)
-    except (TypeError, ValueError, AttributeError):
-        continue
+_chip_used_events = chip_history_for_half(_chip_history, gw)
 wildcard_used_event = max(_chip_used_events["wildcard"], default=None)
 bench_boost_used_event = max(_chip_used_events["bench_boost"], default=None)
 free_hit_used_event = max(_chip_used_events["free_hit"], default=None)
@@ -858,19 +843,20 @@ with st.sidebar:
     st.divider()
     with st.expander(f"🎟️ Chip status · {chip_period_label}", expanded=False):
         st.caption("Chip status is prefilled from public manager history where available. Verify it in the FPL app if a chip is pending or history has not updated; manual editing remains available.")
-        wildcard_options = ["Available", "Played in GW6", "Played in another Gameweek", "Unknown / verify"]
+        wildcard_options = ["Available", "Played in this half", "Unknown / verify"]
         if wildcard_used_event is not None:
-            wildcard_default = 1 if wildcard_used_event == 6 else 2
+            wildcard_default = 1
         else:
-            wildcard_default = 1 if int(gw) < 20 else 0
+            wildcard_default = 0 if isinstance(_chip_history, list) else 2
         wildcard_status = st.selectbox(
             "Wildcard", wildcard_options, index=wildcard_default,
             key=f"chip_wildcard_{chip_period_key}_{wildcard_used_event or 'none'}"
         )
-        chip_options = ["Available", "Played in a previous Gameweek", "Unknown / verify"]
-        bench_default = 1 if bench_boost_used_event is not None else 0
-        freehit_default = 1 if free_hit_used_event is not None else 0
-        triple_default = 1 if triple_captain_used_event is not None else 0
+        chip_options = ["Available", "Played in this half", "Unknown / verify"]
+        history_known = isinstance(_chip_history, list)
+        bench_default = 1 if bench_boost_used_event is not None else (0 if history_known else 2)
+        freehit_default = 1 if free_hit_used_event is not None else (0 if history_known else 2)
+        triple_default = 1 if triple_captain_used_event is not None else (0 if history_known else 2)
         bench_boost_status = st.selectbox(
             "Bench Boost", chip_options, index=bench_default,
             key=f"chip_bb_{chip_period_key}_{bench_boost_used_event or 'none'}"
@@ -1739,13 +1725,16 @@ with fixtures_tab:
         )
     })
 
-    # Compare this Gameweek with the best currently known later opportunity for chips.
-    # These are fixture/projection comparisons, not guaranteed points or perfect future forecasts.
+    # Compare only within the selected projection horizon and the current chip half.
+    # Re-select the same 15-player squad's XI for each future GW using that week's
+    # projections, rather than carrying today's starters/bench into the future.
     future_chip_options = []
+    chip_plan_gws = chip_planning_gameweeks(gw, horizon)
     all_chip_ids = sorted(set(chip_starter_ids + chip_bench_ids))
-    for future_gw in sorted({int(x) for x in target_gws if int(x) > int(gw)}):
+    for future_gw in [event for event in chip_plan_gws if event > int(gw)]:
         future_points_by_id = {}
         future_fixture_counts = {}
+        future_candidates = []
         for player_id in all_chip_ids:
             player = elements_by_id_chip.get(int(player_id))
             if not player:
@@ -1754,9 +1743,24 @@ with fixtures_tab:
             future_pts, _, future_fx_count = estimate_points(player, club_code, fixtures, horizon=1, start_gw=future_gw)
             future_points_by_id[int(player_id)] = float(future_pts)
             future_fixture_counts[int(player_id)] = int(future_fx_count)
-        future_bench_total = sum(future_points_by_id.get(pid, 0.0) for pid in chip_bench_ids)
-        future_best_captain = max((future_points_by_id.get(pid, 0.0) for pid in chip_starter_ids), default=0.0)
-        future_blanks = sum(1 for pid in chip_starter_ids if future_fixture_counts.get(pid, 0) == 0)
+            current_record = next((row for row in resolved if int(row["id"]) == int(player_id)), None)
+            if current_record:
+                future_candidates.append({
+                    "Player": str(current_record["Player"]),
+                    "Position": str(current_record["Position"]),
+                    "Club": str(current_record["Club"]),
+                    "Price (£m)": float(current_record["Price (£m)"]),
+                    "GW projected pts": float(future_pts),
+                    "id": int(player_id),
+                })
+        future_lineup = select_model_lineup(future_candidates, future_points_by_id)
+        if not future_lineup:
+            continue
+        future_bench_ids = [int(player["id"]) for player in future_lineup["bench"]]
+        future_starter_ids = [int(player["id"]) for player in future_lineup["starters"]]
+        future_bench_total = sum(future_points_by_id.get(pid, 0.0) for pid in future_bench_ids)
+        future_best_captain = float(future_lineup["captain"].get("GW projected pts", 0.0))
+        future_blanks = sum(1 for pid in future_starter_ids if future_fixture_counts.get(pid, 0) == 0)
         future_chip_options.append({
             "gameweek": future_gw,
             "bench_points": future_bench_total,
@@ -1807,10 +1811,16 @@ with fixtures_tab:
         wc_detail = f"{wildcard_distress} potential starting-XI issues flagged by public minutes/status/fixture signals. This is a rough rebuild-need indicator, not a full squad optimization."
         chip_recommendations.append(("Wildcard", wildcard_status, f"{wildcard_score}% readiness", wc_action, wc_detail))
     else:
-        if int(gw) < 20:
-            wc_detail = "First-half Wildcard is already marked as played. The second Wildcard set unlocks from GW20 under the 2026/27 rules."
+        if wildcard_status == "Played in this half" and int(gw) < 20:
+            wc_detail = f"First-half Wildcard used in GW{wildcard_used_event}. The second Wildcard set unlocks from GW20 under the 2026/27 rules."
+        elif wildcard_status == "Played in this half":
+            wc_detail = f"Second-half Wildcard used in GW{wildcard_used_event}. This set is available from GW20."
+        elif wildcard_status == "Unknown / verify":
+            wc_detail = "Wildcard availability is unknown. Check chip history in the FPL app before planning a use."
+        elif int(gw) < 20:
+            wc_detail = "First-half Wildcard is marked as used. The second Wildcard set unlocks from GW20 under the 2026/27 rules."
         else:
-            wc_detail = "Wildcard is marked as played or unverified for this half. Update status in the sidebar if needed."
+            wc_detail = "Wildcard is marked as used. Update its status in the sidebar if this is incorrect."
         chip_recommendations.append(("Wildcard", wildcard_status, "—", "Not available now", wc_detail))
 
     if chip_state_is_available(bench_boost_status):
@@ -1908,6 +1918,28 @@ with fixtures_tab:
         ("Triple Captain", triple_captain_status, tc_score_text, tc_action, tc_detail),
         ("Free Hit", free_hit_status, fh_score_text, fh_action, fh_detail),
     ]
+    # Chip cards may each find a plausible use, but FPL permits only one chip
+    # in a Gameweek. Keep the strongest heuristic use-now signal actionable.
+    use_now_labels = {"Consider this GW", "Potential use this GW", "Consider rebuild"}
+    chip_score_by_name = {
+        "Wildcard": wildcard_score,
+        "Bench Boost": bench_score,
+        "Triple Captain": tc_score,
+        "Free Hit": freehit_score,
+    }
+    actionable_chip_cards = [
+        card for card in chip_cards
+        if card[1] == "Available" and card[3] in use_now_labels
+    ]
+    if len(actionable_chip_cards) > 1:
+        priority_chip = max(actionable_chip_cards, key=lambda card: chip_score_by_name[card[0]])
+        chip_cards = [
+            card if card is priority_chip else (
+                card[0], card[1], card[2], "Hold — another chip ranks higher this GW",
+                f"{priority_chip[0]} has the strongest current heuristic suitability signal. Only one chip can be active per Gameweek; compare both estimates before deciding."
+            ) if card in actionable_chip_cards else card
+            for card in chip_cards
+        ]
     if not selected_lineup:
         chip_cards = [
             (name, status, "—", "Not available", "Confirm a current roster in the sidebar before using a chip estimate.")
@@ -1924,9 +1956,19 @@ with fixtures_tab:
         if squad_dgw_gws_chip else
         "No Double Gameweek is currently assigned to your squad in the visible calendar. The panel will update after FPL assigns any postponed fixtures to a Gameweek."
     )
+    if int(gw) < 20:
+        if int(gw) >= 19:
+            chip_deadline_msg = "This is the final first-half Gameweek: any unused first-set chips expire at the GW19 deadline."
+        elif int(gw) >= 17:
+            chip_deadline_msg = "First-set chips expire at the GW19 deadline; the comparison stops at GW19 and does not treat a GW20 chip as a save option."
+        else:
+            chip_deadline_msg = "First-set chips expire at the GW19 deadline; the second set becomes available from GW20."
+    else:
+        chip_deadline_msg = "This is the second chip set, available from GW20."
     st.markdown(
         f"<div class='manager-overview-note'><strong>Chip timing:</strong> {html.escape(future_dgw_msg)} "
-        f"Current window: {html.escape(chip_period_label)}. First-half chips must be used by the GW19 deadline and do not carry over; the second set unlocks from GW20. Only one chip can be active in one Gameweek. Scores are heuristic suitability indexes, not probabilities of future points.</div>",
+        f"Current set: {html.escape(chip_period_label)}. {html.escape(chip_deadline_msg)} "
+        f"Selected {len(chip_plan_gws)}-Gameweek comparison: GW{chip_plan_gws[0]}–GW{chip_plan_gws[-1]}. No special December free-transfer allowance is assumed. Only one chip can be active in one Gameweek. Scores are heuristic suitability indexes, not probabilities of future points.</div>",
         unsafe_allow_html=True
     )
 
