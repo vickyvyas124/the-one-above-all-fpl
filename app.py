@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import requests
+import base64
 import html
 import json
 import re
@@ -12,7 +13,7 @@ from fpl_availability import availability_adjustment
 from fpl_ui_labels import status_chip_labels
 from fpl_lineup import score_starting_xi, select_model_lineup
 from fpl_chip_strategy import chip_half, chip_history_for_half, chip_planning_gameweeks
-from fpl_visuals import club_badge_url, player_headshot_url, player_initials
+from fpl_visuals import club_badge_url, player_headshot_urls, player_initials
 from fpl_squad import load_public_squad, validate_squad_ids
 from fpl_transfer import (
     gameweek_projection_series,
@@ -34,6 +35,26 @@ from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="The-One-Above-All | FPL Manager Hub", layout="wide")
 APP_VERSION = "3.0"
+
+
+@st.cache_data(ttl=3600, max_entries=600, show_spinner=False)
+def cached_headshot_data_uri(url):
+    """Fetch and cache official player photos so broken image tags never reach the browser."""
+    try:
+        response = requests.get(
+            url, timeout=(1.5, 3.0),
+            headers={"User-Agent": "The-One-Above-All-FPL/3.0"},
+        )
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        image_bytes = response.content
+        if not content_type.startswith("image/") or not image_bytes or len(image_bytes) > 1_000_000:
+            return None
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        return f"data:{content_type};base64,{encoded}"
+    except Exception:
+        # An unavailable or malformed image source must not interrupt the squad view.
+        return None
 FORECAST_LOG_PATH = Path(__file__).resolve().parent / "forecast_log.csv"
 FORECAST_REMOTE_URL = "https://raw.githubusercontent.com/vickyvyas124/the-one-above-all-fpl/fpl-data/forecast_log.csv"
 HISTORICAL_SUMMARY_URL = "https://raw.githubusercontent.com/vickyvyas124/the-one-above-all-fpl/fpl-data/historical_backtest_summary.csv"
@@ -1210,6 +1231,22 @@ with squad_tab:
                 import html
                 return html.escape(str(value))
             squad_lookup = {norm(r["Player"]): r for _, r in squad.iterrows()}
+            _headshot_data_uri_by_id = {}
+            if display_mode == "Pitch view" and resolved:
+                def _load_squad_headshot(record):
+                    player_id = int(record["id"])
+                    player_data = _players_by_id.get(player_id, {})
+                    for image_url in player_headshot_urls(player_data):
+                        image_uri = cached_headshot_data_uri(image_url)
+                        if image_uri:
+                            return player_id, image_uri
+                    return player_id, None
+
+                with ThreadPoolExecutor(max_workers=min(8, len(resolved))) as _photo_pool:
+                    for _photo_id, _photo_uri in _photo_pool.map(_load_squad_headshot, resolved):
+                        if _photo_uri:
+                            _headshot_data_uri_by_id[_photo_id] = _photo_uri
+
             def get_squad_record(alias):
                 return squad_lookup.get(norm(alias))
             def tile(alias, squad_status):
@@ -1226,16 +1263,17 @@ with squad_tab:
                 pts = lineup_projection_by_id.get(int(r["id"]), 0.0)
                 club = str(r["Club"])
                 _player_data = _players_by_id.get(int(r["id"]), {})
-                _headshot_url = player_headshot_url(_player_data)
+                _headshot_uri = _headshot_data_uri_by_id.get(int(r["id"]))
                 _badge_url = club_badge_url(teams, _player_data.get("team"))
-                _headshot = (f"<img class='player-headshot' src='{_headshot_url}' alt='' loading='lazy' decoding='async' fetchpriority='low' onload=\"this.previousElementSibling.style.display='none'\" onerror=\"this.style.display='none'\">"
-                             if _headshot_url else "")
+                _headshot = (f"<img class='player-headshot' src='{_headshot_uri}' alt='{esc(short)}' loading='lazy' decoding='async' fetchpriority='low'>"
+                             if _headshot_uri else "")
                 _badge = (f"<img class='player-badge' src='{_badge_url}' alt='' loading='lazy' decoding='async' fetchpriority='low' onload=\"this.previousElementSibling.style.display='none'\" onerror=\"this.style.display='none'\">"
                           if _badge_url else "")
                 _initials = esc(player_initials(_player_data))
+                _initials_markup = "" if _headshot_uri else f"<span class='player-initials'>{_initials}</span>"
                 _badge_fallback = esc(club[:3].upper() if club and club != "?" else "⚽")
                 return (f"<div class='player-tile'><div class='tile-top'>{esc(short)}{(' · ' + _role) if _role else ''}</div>"
-                        f"<div class='tile-avatar'><div class='player-headshot-wrap'><span class='player-initials'>{_initials}</span>{_headshot}"
+                        f"<div class='tile-avatar'><div class='player-headshot-wrap'>{_initials_markup}{_headshot}"
                         f"<span class='player-badge-fallback'>{_badge_fallback}</span>{_badge}</div></div>"
                         f"<div class='tile-meta'>{esc(club)} · £{float(r['Price (£m)']):.1f}m<br>"
                         f"<span class='tile-pts'>{float(pts):.1f} pts</span><br><span class='tile-status'>{esc(squad_status)}</span></div></div>")
