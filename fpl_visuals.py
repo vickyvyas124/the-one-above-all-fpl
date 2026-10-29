@@ -22,6 +22,27 @@ def player_headshot_url(player):
             f"110x140/p{match.group(1)}.png")
 
 
+def player_headshot_urls(player):
+    """Return current FPL-photo and official player-code URLs in preference order."""
+    primary = player_headshot_url(player)
+    if not primary:
+        return []
+    urls = [primary]
+    if not isinstance(player, dict):
+        return urls
+    try:
+        code = int(player.get("code"))
+    except (TypeError, ValueError, OverflowError):
+        return urls
+    photo_id = int(_PLAYER_PHOTO_ID.fullmatch(str(player.get("photo", "")).strip()).group(1))
+    if code > 0 and code != photo_id:
+        urls.append(
+            "https://resources.premierleague.com/premierleague/photos/players/"
+            f"110x140/p{code}.png"
+        )
+    return urls
+
+
 def club_badge_url(teams_by_id, team_id):
     """Map an FPL team ID to its official Premier League badge URL."""
     if not isinstance(teams_by_id, dict):
