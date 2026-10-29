@@ -10,12 +10,31 @@ from fpl_transfer import (
     transfer_projection_comparison,
     optimize_transfer_plans,
     transfer_plan_action_threshold,
+    select_actionable_transfer_plan,
     pounds_millions_to_tenths,
 )
 from fpl_lineup import score_starting_xi
 
 
 class TransferProjectionTests(unittest.TestCase):
+    def test_second_move_must_clear_its_own_incremental_value_gate(self):
+        plans = {
+            0: {"affordable": True, "cumulative_net_gain": 0.0, "paid_transfers": 0},
+            1: {"affordable": True, "cumulative_net_gain": 8.0, "paid_transfers": 0},
+            2: {"affordable": True, "cumulative_net_gain": 10.0, "paid_transfers": 0},
+        }
+        self.assertIs(select_actionable_transfer_plan(plans), plans[1])
+        plans[2]["cumulative_net_gain"] = 12.0
+        self.assertIs(select_actionable_transfer_plan(plans), plans[2])
+
+    def test_transfer_plan_selector_requires_verified_budget_and_total_threshold(self):
+        plans = {
+            0: {"affordable": True, "cumulative_net_gain": 0.0, "paid_transfers": 0},
+            1: {"affordable": None, "cumulative_net_gain": 20.0, "paid_transfers": 0},
+            2: {"affordable": True, "cumulative_net_gain": 3.0, "paid_transfers": 0},
+        }
+        self.assertIs(select_actionable_transfer_plan(plans), plans[0])
+
     def test_official_selling_price_uses_half_profit_rounded_down(self):
         self.assertEqual(official_selling_price_tenths(100, 107), 103)
         self.assertEqual(official_selling_price_tenths(100, 101), 100)

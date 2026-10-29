@@ -105,6 +105,37 @@ def transfer_plan_action_threshold(paid_transfers):
     return 6.0 if int(paid_transfers) > 0 else 4.0
 
 
+def select_actionable_transfer_plan(plans):
+    """Choose the strongest plan that clears both total and incremental gates.
+
+    A larger transfer plan must improve on the best plan with one fewer move
+    by the same action margin used for the plan's free/paid marginal move.
+    This prevents a weak second move from being recommended just because the
+    first move already made the combined plan look attractive.
+    """
+    if not plans:
+        return None
+    hold = plans.get(0)
+    selected = hold
+    for count in sorted(key for key in plans if key > 0):
+        plan = plans[count]
+        if plan.get("affordable") is not True:
+            continue
+        total_gain = float(plan.get("cumulative_net_gain", float("-inf")))
+        if total_gain < transfer_plan_action_threshold(plan.get("paid_transfers", 0)):
+            continue
+        previous_count = max((key for key in plans if key < count), default=None)
+        previous = plans.get(previous_count) if previous_count is not None else None
+        if previous is not None:
+            incremental_gain = total_gain - float(previous.get("cumulative_net_gain", 0.0))
+            marginal_paid = max(0, int(plan.get("paid_transfers", 0))
+                                - int(previous.get("paid_transfers", 0)))
+            if incremental_gain < transfer_plan_action_threshold(marginal_paid):
+                continue
+        selected = plan
+    return selected
+
+
 def optimize_transfer_plans(squad, candidates, free_transfers, bank_tenths, *,
                             horizon=5, start_gw=1, beam_width=500,
                             candidate_limit=40, paid_transfer_limit=2,
