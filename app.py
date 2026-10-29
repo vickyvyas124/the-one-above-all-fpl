@@ -21,6 +21,7 @@ from fpl_transfer import (
     transfer_projection_comparison,
     optimize_transfer_plans,
     transfer_plan_action_threshold,
+    select_actionable_transfer_plan,
     verified_player_price_tenths,
     exact_fpl_tenths,
     pounds_millions_to_tenths,
@@ -2290,19 +2291,34 @@ with decide_tab:
             threshold = transfer_plan_action_threshold(_best_projection_only["paid_transfers"])
             reason_line = _best_projection_only.get("budget_reason") or "The higher-projected plan has unverified affordability; confirm its prices before acting."
         elif _optimization_plans and transfer_inputs_verified and not unmatched:
-            _preferred_plan = _best_verified_plan
+            _preferred_plan = select_actionable_transfer_plan(
+                {count: plan for count, plan in _optimization_plans.items()
+                 if plan.get("affordable") is True}
+            )
             if _preferred_plan is None:
                 decision_label = "VERIFY DATA"
                 reason_line = "Only projection-only transfer plans are available; confirm bank and manager-specific prices before acting."
             else:
                 _preferred_gain = float(_preferred_plan["cumulative_net_gain"])
                 _preferred_threshold = transfer_plan_action_threshold(_preferred_plan["paid_transfers"])
-                if _preferred_plan["transfer_count"] == 0 or _preferred_gain < _preferred_threshold:
+                if _preferred_plan["transfer_count"] == 0:
                     decision_label = "HOLD / ROLL"
                     candidate_summary = "Retain free transfers"
                     gain = _preferred_gain
+                    _one_move = _optimization_plans.get(1)
+                    _two_move = _optimization_plans.get(2)
+                    if _two_move and _one_move:
+                        _incremental = (float(_two_move["cumulative_net_gain"])
+                                        - float(_one_move["cumulative_net_gain"]))
+                        _marginal_paid = max(0, int(_two_move["paid_transfers"])
+                                             - int(_one_move["paid_transfers"]))
+                        _marginal_gate = transfer_plan_action_threshold(_marginal_paid)
+                        reason_line = (f"HOLD: best verified plan does not clear its total threshold, "
+                                       f"or the second move adds only {_incremental:+.1f} net points "
+                                       f"(needs {_marginal_gate:.1f} beyond the best single plan).")
+                    else:
+                        reason_line = "The best verified plan does not clear the engine's projected advantage threshold over hold."
                     threshold = _preferred_threshold
-                    reason_line = "The best verified plan does not clear the engine's projected advantage threshold over hold."
                 elif hours_to_deadline_now is not None and hours_to_deadline_now > 24:
                     decision_label = "HOLD FOR NOW"
                     candidate_summary = " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _preferred_plan["transfers"])
@@ -2321,6 +2337,17 @@ with decide_tab:
                     gain = _preferred_gain
                     threshold = _preferred_threshold
                     reason_line = f"Best verified plan uses {_preferred_plan['free_transfers_used']} free transfer(s) and improves projected starting-XI points over hold."
+                if _preferred_plan["transfer_count"] == 1 and 2 in _optimization_plans:
+                    _two_move = _optimization_plans[2]
+                    _incremental = (float(_two_move["cumulative_net_gain"])
+                                    - _preferred_gain)
+                    _marginal_paid = max(0, int(_two_move["paid_transfers"])
+                                         - int(_preferred_plan["paid_transfers"]))
+                    _marginal_gate = transfer_plan_action_threshold(_marginal_paid)
+                    if _incremental < _marginal_gate:
+                        reason_line += (f" The second transfer adds only {_incremental:+.1f} net "
+                                        f"starting-XI points (needs {_marginal_gate:.1f}), so the "
+                                        "single transfer is preferred.")
         elif _optimization_plans and not transfer_inputs_verified:
             decision_label = "VERIFY DATA"
             reason_line = "Projected plans are shown below, but current bank, free-transfer count, or selling-price inputs are uncertain; affordability is unverified."
@@ -2410,7 +2437,7 @@ with decide_tab:
 
         if _optimization_plans:
             st.markdown("#### Multi-transfer plans")
-            st.caption("Bounded beam search: at most 30 incoming candidates and 120 states per transfer count; plans use the expected XI plus captain bonus each Gameweek. The preferred-plan threshold is +4 cumulative points over the selected horizon for free-transfer plans, or +6 after paid-transfer hits. Up to two paid transfers are compared and require hit acceptance. The search is approximate and does not prove a global optimum.")
+            st.caption("Bounded beam search: at most 30 incoming candidates and 120 states per transfer count; plans use the expected XI plus captain bonus each Gameweek. A plan needs +4 net points over hold if all moves are free, or +6 when it includes paid transfers. Each additional move must also add at least +4 net points over the previous transfer count, or +6 when that added move is paid. Gross XI gain and net gain after hits are shown separately. Up to two paid transfers are compared; the search is approximate and does not prove a global optimum.")
             _plan_rows = []
             for _count, _plan in sorted(_optimization_plans.items()):
                 _table_plans = [_plan, *_plan.get("projection_only_alternatives", [])]
@@ -2420,8 +2447,16 @@ with decide_tab:
                         f"{m['in']['Player']}: {int(m['in'].get('Minutes', 0))} min · {m['in'].get('Status', '?')} · {m['in'].get('Chance (%)') if pd.notna(m['in'].get('Chance (%)')) else 'chance n/a'}%"
                         for m in _shown_plan["transfers"]
                     ) or "No incoming-player risk"
+                    _price_text = " · ".join(
+                        f"{m['out']['Player']} sell £{m['out']['sell_tenths'] / 10:.1f}m → "
+                        f"{m['in']['Player']} buy £{m['in']['price_tenths'] / 10:.1f}m"
+                        if m['out'].get('sell_tenths') is not None and m['in'].get('price_tenths') is not None
+                        else f"{m['out']['Player']} → {m['in']['Player']}: price unverified"
+                        for m in _shown_plan["transfers"]
+                    ) or "No transfer prices"
                     _plan_rows.append({
                         "Transfers": _move_text,
+                        "Verified sell / buy prices": _price_text,
                         "Free used": _shown_plan["free_transfers_used"],
                         "Paid": _shown_plan["paid_transfers"],
                         "Hit": f"-{_shown_plan['hit_cost']} pts" if _shown_plan["hit_cost"] else "None",
@@ -2434,6 +2469,16 @@ with decide_tab:
                                         else "Verified budget"),
                         "Minutes / availability": _risk_text,
                         "Net gain vs hold": f"{_shown_plan['cumulative_net_gain']:+.1f}",
+                        "Gross XI gain vs hold": f"{sum(r['plan_points'] - r['hold_points'] for r in _shown_plan['gameweeks']):+.1f}",
+                        "Incremental vs previous transfer count": (
+                            "—" if _count == 0 or (_count - 1) not in _optimization_plans else
+                            f"{_shown_plan['cumulative_net_gain'] - _optimization_plans[_count - 1]['cumulative_net_gain']:+.1f}"
+                        ),
+                        "Action gate": (
+                            "HOLD baseline" if _count == 0 else
+                            f"Total ≥ {transfer_plan_action_threshold(_shown_plan['paid_transfers']):.0f}; "
+                            f"increment ≥ {transfer_plan_action_threshold(max(0, int(_shown_plan['paid_transfers']) - int(_optimization_plans.get(_count - 1, {}).get('paid_transfers', 0)))):.0f}"
+                        ),
                         "By Gameweek": " · ".join(f"GW{r['gameweek']} {r['plan_points']:.1f} vs {r['hold_points']:.1f}" for r in _shown_plan["gameweeks"]),
                     })
             st.dataframe(pd.DataFrame(_plan_rows), use_container_width=True, hide_index=True)

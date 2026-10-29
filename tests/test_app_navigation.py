@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import requests
 import streamlit as st
+from fpl_lineup import score_starting_xi, select_model_lineup
 
 try:
     import streamlit as st
@@ -192,6 +193,12 @@ def _values(elements):
 
 @unittest.skipIf(AppTest is None, "Streamlit is not installed in this environment")
 class DashboardNavigationAppTests(unittest.TestCase):
+    def test_app_lineup_imports_are_available_from_the_checked_out_module(self):
+        self.assertTrue(callable(score_starting_xi))
+        self.assertTrue(callable(select_model_lineup))
+        app_source = (Path(__file__).parents[1] / "app.py").read_text(encoding="utf-8")
+        self.assertIn("from fpl_lineup import score_starting_xi, select_model_lineup", app_source)
+
     def test_dashboard_tabs_recommendation_and_existing_controls_render(self):
         app_path = Path(__file__).parents[1] / "app.py"
         with patch("requests.get", side_effect=mocked_fpl_get) as network:
