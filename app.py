@@ -43,7 +43,11 @@ def cached_headshot_data_uri(url):
     try:
         response = requests.get(
             url, timeout=(1.5, 3.0),
-            headers={"User-Agent": "The-One-Above-All-FPL/3.0"},
+            headers={
+                "User-Agent": "Mozilla/5.0 The-One-Above-All-FPL/3.0",
+                "Referer": "https://fantasy.premierleague.com/",
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            },
         )
         response.raise_for_status()
         content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
