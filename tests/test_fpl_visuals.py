@@ -11,16 +11,30 @@ class SquadVisualAssetTests(unittest.TestCase):
             "https://resources.premierleague.com/premierleague/photos/players/110x140/p223094.png",
         )
 
-    def test_headshot_uses_current_photo_then_official_player_code_fallback(self):
+    def test_headshot_prefers_official_player_code_then_fpl_photo_fallback(self):
         player = {"id": 411, "code": 223095, "photo": "223094.jpg"}
         self.assertEqual(
             player_headshot_urls(player),
             [
-                "https://resources.premierleague.com/premierleague/photos/players/110x140/p223094.png",
                 "https://resources.premierleague.com/premierleague/photos/players/110x140/p223095.png",
+                "https://resources.premierleague.com/premierleague/photos/players/110x140/p223094.png",
             ],
         )
-        self.assertEqual(player_headshot_urls({"photo": "bad.jpg", "code": 223095}), [])
+        self.assertEqual(
+            player_headshot_urls({"photo": "bad.jpg", "code": 223095}),
+            ["https://resources.premierleague.com/premierleague/photos/players/110x140/p223095.png"],
+        )
+
+    def test_duplicate_player_code_and_photo_identifier_are_requested_once(self):
+        player = {"code": 223094, "photo": "223094.jpg"}
+        self.assertEqual(
+            player_headshot_urls(player),
+            ["https://resources.premierleague.com/premierleague/photos/players/110x140/p223094.png"],
+        )
+        self.assertEqual(
+            player_headshot_urls({"photo": "223094.jpg"}),
+            ["https://resources.premierleague.com/premierleague/photos/players/110x140/p223094.png"],
+        )
 
     def test_headshot_missing_or_malformed_metadata_uses_fallback(self):
         self.assertIsNone(player_headshot_url({"id": 411}))

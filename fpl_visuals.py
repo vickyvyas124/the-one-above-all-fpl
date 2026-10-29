@@ -23,23 +23,22 @@ def player_headshot_url(player):
 
 
 def player_headshot_urls(player):
-    """Return current FPL-photo and official player-code URLs in preference order."""
-    primary = player_headshot_url(player)
-    if not primary:
-        return []
-    urls = [primary]
+    """Return current Premier League player-code image before the FPL photo fallback."""
     if not isinstance(player, dict):
-        return urls
+        return []
+    urls = []
     try:
         code = int(player.get("code"))
     except (TypeError, ValueError, OverflowError):
-        return urls
-    photo_id = int(_PLAYER_PHOTO_ID.fullmatch(str(player.get("photo", "")).strip()).group(1))
-    if code > 0 and code != photo_id:
+        code = 0
+    if code > 0:
         urls.append(
             "https://resources.premierleague.com/premierleague/photos/players/"
             f"110x140/p{code}.png"
         )
+    photo_url = player_headshot_url(player)
+    if photo_url and photo_url not in urls:
+        urls.append(photo_url)
     return urls
 
 
