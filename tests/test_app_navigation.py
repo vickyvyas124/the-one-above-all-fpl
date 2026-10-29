@@ -375,7 +375,7 @@ class DashboardNavigationAppTests(unittest.TestCase):
             # The pitch renders the model-selected XI and the bench as player tiles;
             # only the XI should be marked as starters.
             self.assertEqual(_reference_markup.count("class='player-tile'"), 15)
-            self.assertEqual(_reference_markup.count("Starting XI"), 11)
+            self.assertEqual(_reference_markup.count("Starting XI ·"), 11)
             self.assertEqual(_reference_markup.count("class='bench-card'"), 4)
             self.assertTrue(any(
                 {"Position", "Player", "Captain", "Vice"}.issubset(item.value.columns)
