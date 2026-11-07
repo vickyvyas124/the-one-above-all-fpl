@@ -2920,14 +2920,23 @@ with decide_tab:
             _compare_rows = [{"Plan": "HOLD / ROLL", "Moves": "0 (HOLD)", "Hit": "0 pts",
                               "Net points vs HOLD": "+0.0", "Bank after (£m)":
                               f"£{bank_tenths_current / 10:.1f}m" if bank_tenths_current is not None else "UNKNOWN",
+                              "Price checks": "Not applicable",
                               "Status": "HOLD BASELINE"}]
+            _seen_custom_plan_signatures = {}
+            def _compare_price_text(price):
+                verified_price = verified_player_price_tenths(price)
+                return f"£{verified_price / 10:.1f}m" if verified_price is not None else "VERIFY PRICE"
+
             for _plan_number in (1, 2):
                 st.markdown(f"**Plan {_plan_number}**")
                 _chosen_moves = []
+                _chosen_out_ids = set()
+                _chosen_in_ids = set()
+                _incomplete_plan = False
                 for _slot in (1, 2):
                     _out_col, _in_col = st.columns(2)
                     with _out_col:
-                        _out_options = [None, *list(_squad_by_id)]
+                        _out_options = [None, *[pid for pid in _squad_by_id if pid not in _chosen_out_ids]]
                         _out_id = st.selectbox(
                             f"Plan {_plan_number}, transfer {_slot}: sell",
                             _out_options,
@@ -2939,7 +2948,8 @@ with decide_tab:
                         )
                     _out_pos = str(_squad_by_id[int(_out_id)]["position"]) if _out_id is not None else None
                     _in_options = ([pid for pid, player in _incoming_by_id.items()
-                                    if str(player["position"]) == _out_pos] if _out_pos else [])
+                                    if str(player["position"]) == _out_pos and pid not in _chosen_in_ids]
+                                   if _out_pos else [])
                     with _in_col:
                         if _in_options:
                             _in_id = st.selectbox(
@@ -2948,13 +2958,23 @@ with decide_tab:
                                 format_func=lambda pid, pool=_incoming_by_id: f"{pool[pid]['Player']} · {pool[pid]['club']} · ID {pid}",
                                 key=f"plan_compare_{_plan_number}_{_slot}_in_id",
                             )
-                            _chosen_moves.append({"out_id": int(_out_id), "in": _incoming_by_id[int(_in_id)]})
+                            _chosen_in_id = int(_in_id)
+                            _chosen_moves.append({"out_id": int(_out_id), "in": _incoming_by_id[_chosen_in_id]})
+                            _chosen_out_ids.add(int(_out_id))
+                            _chosen_in_ids.add(_chosen_in_id)
+                        elif _out_id is not None:
+                            _incomplete_plan = True
+                            st.caption("No unused incoming player is available at this position.")
                 _evaluation = evaluate_transfer_plan(
                     _optimization_squad, _chosen_moves, bank_tenths_current, free_transfers,
                     _lineup_points_for_roster, int(horizon),
                     actionable_transfers_ready=account_snapshot.actionable_transfers_ready,
                     start_gw=int(gw),
                 )
+                if _incomplete_plan:
+                    _evaluation["legal"] = False
+                    _evaluation["status"] = "PROVISIONAL"
+                    _evaluation["reason"] = "Complete each selected outgoing transfer with a valid incoming player."
                 _compare_rows.append({
                     "Plan": f"Custom plan {_plan_number}",
                     "Moves": (" · ".join(f"{m[0]['Player']} → {m[1]['Player']}" for m in _evaluation.get("moves", []))
@@ -2962,8 +2982,19 @@ with decide_tab:
                     "Hit": f"-{_evaluation['hit_cost']} pts" if _evaluation.get("hit_cost") else "0 pts",
                     "Net points vs HOLD": (f"{_evaluation['net_gain_vs_hold']:+.1f}" if _evaluation.get("net_gain_vs_hold") is not None else "UNKNOWN"),
                     "Bank after (£m)": (f"£{_evaluation['bank_after_tenths'] / 10:.1f}m" if _evaluation.get("bank_after_tenths") is not None else "UNKNOWN"),
+                    "Price checks": "; ".join(
+                        f"{_squad_by_id[int(move['out_id'])]['Player']} sale {_compare_price_text(_squad_by_id[int(move['out_id'])].get('sell_tenths'))} → "
+                        f"{move['in']['Player']} buy {_compare_price_text(move['in'].get('price_tenths'))}"
+                        for move in _chosen_moves
+                    ) or "No transfers selected",
                     "Status": _evaluation["status"] if _evaluation["legal"] else f"VERIFY PLAN · {_evaluation['reason']}",
                 })
+                _signature = tuple(sorted((int(move["out_id"]), int(move["in"]["id"])) for move in _chosen_moves))
+                if _signature:
+                    if _signature in _seen_custom_plan_signatures:
+                        _compare_rows[-1]["Status"] = f"DUPLICATE OF CUSTOM PLAN {_seen_custom_plan_signatures[_signature]} · {_compare_rows[-1]['Status']}"
+                    else:
+                        _seen_custom_plan_signatures[_signature] = _plan_number
             st.dataframe(pd.DataFrame(_compare_rows), width="stretch", hide_index=True)
             st.caption(f"Each custom plan uses player IDs, the verified 15-player squad, the same {horizon}-Gameweek projections, XI scorer, and free-transfer/hit rules. AFFORDABLE is shown only when account inputs are verified.")
 
