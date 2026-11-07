@@ -13,11 +13,48 @@ from fpl_transfer import (
     select_actionable_transfer_plan,
     transfer_plan_gate_assessment,
     pounds_millions_to_tenths,
+    build_transfer_candidate_pool,
+    evaluate_transfer_plan,
 )
 from fpl_lineup import score_starting_xi
 
 
 class TransferProjectionTests(unittest.TestCase):
+    def test_paid_plan_is_excluded_when_hit_toggle_is_off(self):
+        squad = [{"id": i + 1, "position": "GK" if i < 2 else "DEF" if i < 7 else "MID" if i < 12 else "FWD",
+                  "club": f"C{i // 3}", "sell_tenths": 100, "price_tenths": 100,
+                  "projections": [1]} for i in range(15)]
+        candidate = {"id": 100, "position": "GK", "club": "NEW", "price_tenths": 100,
+                     "projections": [10]}
+        plans = optimize_transfer_plans(squad, [candidate], 0, 0, horizon=1, allow_hit=False)
+        self.assertEqual(set(plans), {0})
+        self.assertEqual(select_actionable_transfer_plan(plans, allow_paid_transfers=False), plans[0])
+
+    def test_position_value_pool_retains_goalkeeper_and_affordable_cheap_defender(self):
+        roles = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3
+        squad = [{"id": i + 1, "position": pos, "club": f"C{i // 3}",
+                  "sell_tenths": 100, "projections": [2, 2]} for i, pos in enumerate(roles)]
+        candidates = [
+            {"id": 100, "position": "GK", "club": "GK-CLUB", "price_tenths": 50, "projections": [4, 4]},
+            {"id": 101, "position": "DEF", "club": "CHEAP", "price_tenths": 50, "projections": [5, 5]},
+        ] + [{"id": 200 + i, "position": "FWD", "club": f"P{i}", "price_tenths": 500,
+              "projections": [20, 20]} for i in range(40)]
+        pool = build_transfer_candidate_pool(candidates, squad, 0, candidate_limit=12, budget_verified=True)
+        ids = {p["id"] for p in pool}
+        self.assertIn(100, ids)
+        self.assertIn(101, ids)
+
+    def test_evaluate_plan_checks_club_limit_affordability_and_verified_status(self):
+        roles = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3
+        squad = [{"id": i + 1, "position": pos, "club": "C0" if 2 <= i < 5 else f"C{i}",
+                  "sell_tenths": 100, "price_tenths": 100, "projections": [2]} for i, pos in enumerate(roles)]
+        incoming = {"id": 100, "position": "GK", "club": "C0", "price_tenths": 101, "projections": [5]}
+        scorer = lambda roster, _index: sum(p["projections"][0] for p in roster)
+        result = evaluate_transfer_plan(squad, [{"out_id": 1, "in": incoming}], 0, 1, scorer, 1,
+                                        actionable_transfers_ready=True)
+        self.assertEqual(result["status"], "UNAFFORDABLE")
+        self.assertFalse(result["club_limit_valid"])
+
     def test_total_gain_pass_is_distinguished_from_failed_incremental_gate(self):
         plans = {
             0: {"cumulative_net_gain": 0.0, "paid_transfers": 0},

@@ -1,6 +1,6 @@
 import unittest
 
-from fpl_account import build_account_snapshot
+from fpl_account import build_account_snapshot, parse_selling_price_import
 
 
 def legal_players():
@@ -47,6 +47,27 @@ class AccountSnapshotTests(unittest.TestCase):
         )
         self.assertIsNone(snapshot.bank_tenths)
         self.assertFalse(snapshot.actionable_transfers_ready)
+
+    def test_price_import_requires_all_ids_exact_prices_and_value_reconciliation(self):
+        players = legal_players()
+        for player in players.values():
+            player["now_cost"] = 100
+        ids = list(players)
+        text = "player_id,sell_tenths\n" + "\n".join(f"{pid},100" for pid in ids)
+        prices, reason = parse_selling_price_import(text, ids, players, 20, 1520)
+        self.assertEqual(set(prices), set(ids))
+        self.assertIn("reconciled", reason)
+        self.assertIsNone(parse_selling_price_import(text.replace(",100", ",100.5", 1), ids, players, 20, 1520)[0])
+        self.assertIsNone(parse_selling_price_import(text, ids, players, 20, 1519)[0])
+
+    def test_price_import_rejects_duplicate_or_out_of_squad_player(self):
+        players = legal_players()
+        for player in players.values():
+            player["now_cost"] = 100
+        ids = list(players)
+        text = "player_id,sell_tenths\n" + "\n".join(f"{pid},100" for pid in ids)
+        duplicate = text + f"\n{ids[0]},100"
+        self.assertIsNone(parse_selling_price_import(duplicate, ids, players, 20, 1520)[0])
 
 
 if __name__ == "__main__":

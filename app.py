@@ -16,8 +16,11 @@ from fpl_chip_strategy import chip_half, chip_history_for_half, chip_planning_ga
 from fpl_visuals import club_badge_url, player_headshot_urls, player_initials
 from fpl_squad import load_public_squad, validate_squad_ids
 from fpl_account import build_account_snapshot
+from fpl_account import parse_selling_price_import
 from fpl_transfer import (
     gameweek_projection_series,
+    build_transfer_candidate_pool,
+    evaluate_transfer_plan,
     is_affordable_tenths,
     official_selling_price_tenths,
     transfer_budget_tenths,
@@ -25,6 +28,7 @@ from fpl_transfer import (
     transfer_projection_comparison,
     optimize_transfer_plans,
     transfer_plan_action_threshold,
+    transfer_plan_gate_assessment,
     select_actionable_transfer_plan,
     verified_player_price_tenths,
     exact_fpl_tenths,
@@ -633,7 +637,7 @@ with st.sidebar:
                                 help="If enabled, subtracts four points from the projected gain before ranking. A hit should only be considered for a clear multi-week advantage.")
     risk = st.select_slider("Risk appetite", options=["Conservative","Moderate","Aggressive"], value="Moderate",
                              help="Conservative favors established minutes; Moderate balances projected gain and differential upside; Aggressive gives more weight to low-ownership upside.")
-    if st.button("↻ Refresh rank & squad", use_container_width=True):
+    if st.button("↻ Refresh rank & squad", width="stretch"):
         get_trained_model_payload.clear()
         fpl_engine.TRAINED_MODEL = get_trained_model_payload()
         get_manager_profile.clear()
@@ -987,6 +991,39 @@ if squad_load.get("needs_confirmation"):
             purchase_price_current_ids.add(int(_pid))
             purchase_price_source_by_id[int(_pid)] = "Manager-verified FPL purchase price"
 
+manual_sell_price_overrides = {}
+manual_sell_price_source_by_id = {}
+_profile_team_value = control_profile.get("last_deadline_value") if isinstance(control_profile, dict) else None
+if _profile_team_value is None:
+    _profile_history_rows = control_history.get("current", []) if isinstance(control_history, dict) else []
+    if _profile_history_rows:
+        _profile_team_value = sorted(_profile_history_rows, key=lambda row: int(row.get("event", 0)))[-1].get("value")
+_team_value_default_tenths = exact_fpl_tenths(_profile_team_value)
+with st.sidebar.expander("Import official selling prices", expanded=False):
+    st.caption("Paste CSV from your verified FPL transfer view with headers `player_id,sell_tenths`; include all 15 squad players. Prices use exact £0.1m units. Screenshot OCR is unavailable.")
+    _sell_price_csv = st.text_area("Player IDs and official selling prices", key="official_sell_price_csv", height=130)
+    _team_value_m = st.number_input("Official team value (£m)", min_value=0.0, max_value=130.0,
+                                    value=(_team_value_default_tenths / 10 if _team_value_default_tenths is not None else 0.0),
+                                    step=0.1, key="official_team_value_override")
+    _confirm_price_import = st.checkbox("I copied these selling prices and team value from FPL", key="confirm_price_import")
+if _confirm_price_import and squad_load.get("available"):
+    _team_value_tenths = pounds_millions_to_tenths(_team_value_m)
+    manual_sell_price_overrides, _price_import_note = parse_selling_price_import(
+        _sell_price_csv, roster_ids, elements_by_id, bank_tenths_current, _team_value_tenths,
+    )
+    if manual_sell_price_overrides is None:
+        manual_sell_price_overrides = {}
+        st.sidebar.warning(f"Price import not verified: {_price_import_note}")
+    else:
+        manual_sell_price_source_by_id = {pid: "Manager-confirmed FPL selling-price import" for pid in manual_sell_price_overrides}
+        st.sidebar.success("All 15 selling prices passed ID, exact-tenth and team-value checks.")
+
+def _has_verified_selling_price(player_id):
+    player_id = int(player_id)
+    return (player_id in manual_sell_price_overrides or
+            (player_id in purchase_price_current_ids and
+             verified_player_price_tenths(purchase_price_by_id.get(player_id)) is not None))
+
 account_snapshot = build_account_snapshot(
     manager_id=int(team_id), gameweek=int(gw),
     squad_ids=roster_ids if squad_load.get("available") else [],
@@ -998,6 +1035,7 @@ account_snapshot = build_account_snapshot(
     free_transfers=free_transfers,
     free_transfers_verified=(auto_ft_confident if auto_controls else manual_ft_confirmed),
     prices_by_id={pid: purchase_price_by_id.get(pid) for pid in (roster_ids if squad_load.get("available") else [])},
+    selling_prices_by_id=manual_sell_price_overrides,
     synced_at=(datetime.now(timezone.utc) if all(control_sync_parts.values()) and squad_load.get("available") else None),
 )
 squad_recommendations_allowed = account_snapshot.recommendations_ready
@@ -1032,13 +1070,15 @@ for row in squad_rows:
             "Player": p.get("web_name"), "Position": pos_name(p,types), "Club": teamname,
             "Team ID": int(p.get("team")) if p.get("team") is not None else None,
             "Price (£m)": round((p.get("now_cost") or 0)/10,1),
-            "Sell price (£m)": (round(official_selling_price_tenths(
+            "Sell price (£m)": (round(manual_sell_price_overrides[int(p["id"])] / 10, 1)
+                if int(p["id"]) in manual_sell_price_overrides else round(official_selling_price_tenths(
                 purchase_price_by_id[int(p["id"])], int(p.get("now_cost"))
             ) / 10, 1) if verified_player_price_tenths(purchase_price_by_id.get(int(p["id"]))) is not None and verified_player_price_tenths(p.get("now_cost")) is not None else None),
-            "Sell price (tenths)": (official_selling_price_tenths(
+            "Sell price (tenths)": (manual_sell_price_overrides[int(p["id"])]
+                if int(p["id"]) in manual_sell_price_overrides else official_selling_price_tenths(
                 purchase_price_by_id[int(p["id"])], int(p.get("now_cost"))
             ) if verified_player_price_tenths(purchase_price_by_id.get(int(p["id"]))) is not None and verified_player_price_tenths(p.get("now_cost")) is not None else None),
-            "Selling price source": purchase_price_source_by_id.get(int(p["id"]), "VERIFY PRICE · purchase price unavailable"),
+            "Selling price source": manual_sell_price_source_by_id.get(int(p["id"]), purchase_price_source_by_id.get(int(p["id"]), "VERIFY PRICE · purchase price unavailable")),
             "Form": float(p.get("form") or 0), "PPG": float(p.get("points_per_game") or 0),
             "Minutes": int(p.get("minutes") or 0), "Status": p.get("status","?"),
             "Chance (%)": p.get("chance_of_playing_next_round"),
@@ -1370,12 +1410,12 @@ with squad_tab:
                         "Published bench reference" if reference_lineup else "Unassigned"
                     )
                 )
-                st.dataframe(_list_squad.drop(columns=["id"]), use_container_width=True, hide_index=True)
+                st.dataframe(_list_squad.drop(columns=["id"]), width="stretch", hide_index=True)
             total_current_cost = squad["Price (£m)"].sum()
             st.caption(f"Public prices sum to £{total_current_cost:.1f}m for matched players. This is not necessarily your squad's purchase/selling value.")
             if display_mode == "Pitch view":
                 with st.expander("View full squad statistics"):
-                    st.dataframe(squad.drop(columns=["id"]), use_container_width=True, hide_index=True)
+                    st.dataframe(squad.drop(columns=["id"]), width="stretch", hide_index=True)
 
             _resolved_detail_by_id = {int(row["id"]): row for row in resolved}
             _detail_ids = list(_resolved_detail_by_id)
@@ -1409,7 +1449,7 @@ with squad_tab:
                     "Last published vice-captain" if not selected_lineup and _detail_vice and _detail_id == int(_detail_vice["id"]) else
                     "No captain marker"
                 )
-                _price_verified = (_detail_id in purchase_price_current_ids
+                _price_verified = (_has_verified_selling_price(_detail_id)
                                    and verified_player_price_tenths(_detail_row.get("Sell price (tenths)")) is not None)
                 _sale_text = (f"£{float(_detail_row['Sell price (£m)']):.1f}m · verified"
                               if _price_verified else "VERIFY PRICE · unknown")
@@ -1438,7 +1478,7 @@ with squad_tab:
                     st.dataframe(pd.DataFrame([
                         {"Gameweek": f"GW{row['gameweek']}", "Projected points": round(float(row["points"]), 1)}
                         for row in _detail_series
-                    ]), use_container_width=True, hide_index=True)
+                    ]), width="stretch", hide_index=True)
                 _detail_fixtures = []
                 for _fixture in fixtures:
                     _event = _fixture.get("event")
@@ -1456,7 +1496,7 @@ with squad_tab:
                     })
                 if _detail_fixtures:
                     st.caption("Upcoming fixtures across the selected projection horizon")
-                    st.dataframe(pd.DataFrame(_detail_fixtures), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(_detail_fixtures), width="stretch", hide_index=True)
                 else:
                     st.caption("No upcoming fixtures are currently assigned in the selected horizon.")
         else:
@@ -1571,7 +1611,7 @@ with squad_tab:
             st.markdown("#### Captaincy shortlist")
             st.dataframe(
                 captain_df.drop(columns=["Element ID"]).head(7),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
             st.markdown(
@@ -1660,7 +1700,7 @@ with fixtures_tab:
 
     if fixture_matrix_rows:
         fixture_df = pd.DataFrame(fixture_matrix_rows)
-        st.dataframe(fixture_df, use_container_width=True, hide_index=True)
+        st.dataframe(fixture_df, width="stretch", hide_index=True)
         dgw_players = [f"{r['Player']} ({r['Double GWs']})" for r in fixture_matrix_rows if r["Double GWs"] != "—"]
         if dgw_players:
             st.success("Double-Gameweek watch for your squad: " + "; ".join(dgw_players))
@@ -1702,7 +1742,7 @@ with fixtures_tab:
             })
         if all_fixtures:
             all_fixtures_df = pd.DataFrame(all_fixtures).sort_values(["Gameweek", "Kick-off"])
-            st.dataframe(all_fixtures_df, use_container_width=True, hide_index=True)
+            st.dataframe(all_fixtures_df, width="stretch", hide_index=True)
         else:
             st.info("No unpublished fixtures have been assigned to this horizon yet.")
 
@@ -2086,7 +2126,7 @@ with model_tab:
         st.caption(forecast_snapshot_note)
     if not next_week_df.empty:
         st.markdown(f"**Top projected players for GW{gw}**")
-        st.dataframe(next_week_df.head(15).drop(columns=["id"]), use_container_width=True, hide_index=True)
+        st.dataframe(next_week_df.head(15).drop(columns=["id"]), width="stretch", hide_index=True)
 
     # The same verified XI is rendered in Squad, used for captain advice and chips.
     if selected_lineup:
@@ -2107,12 +2147,12 @@ with model_tab:
             xi_frame = pd.DataFrame(best_xi)
             xi_frame["Captain"] = xi_frame["id"].eq(captain_pick["id"]).map({True: "C", False: ""})
             xi_frame["Vice"] = xi_frame["id"].eq(vice_pick["id"]).map({True: "VC", False: ""})
-            st.dataframe(xi_frame[["Position", "Player", "Club", "GW projected pts", "Captain", "Vice"]].rename(columns={"GW projected pts": f"GW{gw} pts"}), use_container_width=True, hide_index=True)
+            st.dataframe(xi_frame[["Position", "Player", "Club", "GW projected pts", "Captain", "Vice"]].rename(columns={"GW projected pts": f"GW{gw} pts"}), width="stretch", hide_index=True)
         with bench_tab:
             st.markdown("**Suggested bench order**")
             bench_frame = pd.DataFrame(bench_ordered)
             bench_frame["Order"] = ["Goalkeeper bench", "Outfield 1", "Outfield 2", "Outfield 3"]
-            st.dataframe(bench_frame[["Order", "Player", "Position", "GW projected pts"]].rename(columns={"GW projected pts": f"GW{gw} pts"}), use_container_width=True, hide_index=True)
+            st.dataframe(bench_frame[["Order", "Player", "Position", "GW projected pts"]].rename(columns={"GW projected pts": f"GW{gw} pts"}), width="stretch", hide_index=True)
         st.caption("Projection source is the current v3.0 one-Gameweek forecast when available, otherwise the live prediction engine. These estimates do not guarantee points or submit changes to FPL.")
     elif resolved and not squad_recommendations_allowed:
         st.info("A projected XI is withheld because current picks and public transfer history do not provide a complete, consistent roster. Correct the roster in the sidebar to continue.")
@@ -2159,7 +2199,7 @@ with model_tab:
                     _gw_metrics[_metric_col] = pd.to_numeric(_gw_metrics[_metric_col], errors="coerce").round(3)
             st.markdown("**Current-season validation · one Gameweek**")
             st.caption("Model, baseline and FPL ep_next are compared against actual points for the same pre-deadline snapshot. ep_next metrics use only rows where the benchmark was captured. Captain regret is reported only when a complete public squad was visible before the deadline, so the model XI/captain were logged without hindsight.")
-            st.dataframe(_gw_metrics.sort_values(["season", "gameweek"], ascending=[False, False]), use_container_width=True, hide_index=True)
+            st.dataframe(_gw_metrics.sort_values(["season", "gameweek"], ascending=[False, False]), width="stretch", hide_index=True)
             _usable = _gw_metrics[pd.to_numeric(_gw_metrics.get("Players", 0), errors="coerce") >= 20]
             if not _usable.empty:
                 _agg = {
@@ -2188,7 +2228,7 @@ with model_tab:
                         _h_metrics[_metric_col] = pd.to_numeric(_h_metrics[_metric_col], errors="coerce").round(3)
                 st.markdown("**Five-Gameweek validation · transfer horizon**")
                 st.caption("These results appear only after all Gameweeks in a forecast's horizon have finished. Historical points are summed for each player over the same horizon.")
-                st.dataframe(_h_metrics.sort_values(["season", "gameweek"], ascending=[False, False]), use_container_width=True, hide_index=True)
+                st.dataframe(_h_metrics.sort_values(["season", "gameweek"], ascending=[False, False]), width="stretch", hide_index=True)
             else:
                 st.info("No complete five-Gameweek outcome is available yet. Those metrics will populate automatically when each forecast horizon finishes.")
         else:
@@ -2201,7 +2241,7 @@ with model_tab:
             for _col in _numeric_cols:
                 _historic[_col] = pd.to_numeric(_historic[_col], errors="coerce").round(3)
             st.caption("Historical proxy replay uses only prior Gameweeks to build each prediction. It is not an exact replay of archived live API snapshots; do not compare it directly with the current-season ep_next benchmark.")
-            st.dataframe(_historic, use_container_width=True, hide_index=True)
+            st.dataframe(_historic, width="stretch", hide_index=True)
         else:
             st.info("Historical backtest not run yet. After adding the manual Historical FPL Backtest workflow, run it once from GitHub Actions to test archived 2023–24, 2024–25 and 2025–26 Gameweeks.")
 
@@ -2288,9 +2328,8 @@ with decide_tab:
         # the dashboard, so bench upgrades do not masquerade as XI gains.
         _optimization_plans = {}
         if selected_lineup:
-            _candidate_rows = candidates.sort_values(f"Projected {horizon}GW pts", ascending=False).head(30)
             _optimization_players = {}
-            for _, _row in _candidate_rows.iterrows():
+            for _, _row in candidates.iterrows():
                 _p = _players_by_id.get(int(_row["id"]))
                 if not _p:
                     continue
@@ -2324,13 +2363,19 @@ with decide_tab:
                 _projection_map = {int(p["id"]): float(p["projections"][_gw_index]) for p in _roster}
                 return score_starting_xi(_roster, _projection_map)
 
+            _optimization_players = build_transfer_candidate_pool(
+                list(_optimization_players.values()), _optimization_squad, bank_tenths_current,
+                candidate_limit=30, budget_verified=account_snapshot.actionable_transfers_ready,
+                minimum_goalkeepers=4,
+            ) if len(_optimization_squad) == 15 else []
             if len(_optimization_squad) == 15:
                 _optimization_plans = optimize_transfer_plans(
-                    _optimization_squad, list(_optimization_players.values()),
+                    _optimization_squad, _optimization_players,
                     free_transfers, bank_tenths_current,
                     horizon=int(horizon),
-                    start_gw=int(gw), beam_width=120, candidate_limit=30,
-                    budget_verified=(bank_tenths_current is not None and all(int(r["id"]) in purchase_price_current_ids for r in resolved)),
+                    start_gw=int(gw), beam_width=120, candidate_limit=60,
+                    paid_transfer_limit=(2 if transfer_hit else 0), allow_hit=transfer_hit,
+                    budget_verified=account_snapshot.actionable_transfers_ready,
                     score_roster=_lineup_points_for_roster,
                 )
         # AUTOMATIC TRANSFER SCAN: evaluate every possible player-out / player-in pair.
@@ -2338,8 +2383,8 @@ with decide_tab:
         club_counts_auto = df["Club"].value_counts().to_dict()
         hit_cost_auto = transfer_hit_cost(free_transfers, transfer_hit)
         _sale_prices_verified = all(
-            int(row["id"]) in purchase_price_current_ids
-            and verified_player_price_tenths(purchase_price_by_id.get(int(row["id"]))) is not None
+            _has_verified_selling_price(row["id"])
+            and verified_player_price_tenths(row.get("Sell price (tenths)")) is not None
             and verified_player_price_tenths(row.get("Sell price (tenths)")) is not None
             for row in resolved
         )
@@ -2552,7 +2597,7 @@ with decide_tab:
         elif _optimization_plans and transfer_inputs_verified and not unmatched:
             _preferred_plan = select_actionable_transfer_plan(
                 {count: plan for count, plan in _optimization_plans.items()
-                 if plan.get("affordable") is True}
+                 if plan.get("affordable") is True}, allow_paid_transfers=transfer_hit
             )
             if _preferred_plan is None:
                 decision_label = "VERIFY DATA"
@@ -2567,14 +2612,21 @@ with decide_tab:
                     _one_move = _optimization_plans.get(1)
                     _two_move = _optimization_plans.get(2)
                     if _two_move and _one_move:
-                        _incremental = (float(_two_move["cumulative_net_gain"])
-                                        - float(_one_move["cumulative_net_gain"]))
-                        _marginal_paid = max(0, int(_two_move["paid_transfers"])
-                                             - int(_one_move["paid_transfers"]))
-                        _marginal_gate = transfer_plan_action_threshold(_marginal_paid)
-                        reason_line = (f"HOLD: best verified plan does not clear its total threshold, "
-                                       f"or the second move adds only {_incremental:+.1f} net points "
-                                       f"(needs {_marginal_gate:.1f} beyond the best single plan).")
+                        _rejected = max((p for count, p in _optimization_plans.items() if count > 0),
+                                        key=lambda p: p["cumulative_net_gain"])
+                        _assessment = transfer_plan_gate_assessment(_optimization_plans, _rejected["transfer_count"])
+                        if not _assessment["total_pass"]:
+                            reason_line = (f"HOLD: net gain {_assessment['total_gain']:+.2f} vs HOLD is below "
+                                           f"the +{_assessment['total_gate']:.2f} total gate.")
+                        elif not _assessment["incremental_pass"]:
+                            reason_line = (f"HOLD: total gate clears ({_assessment['total_gain']:+.2f} vs "
+                                           f"+{_assessment['total_gate']:.2f}), but the plan adds only "
+                                           f"{_assessment['incremental_gain']:+.2f} vs the best smaller plan "
+                                           f"(+{_assessment['incremental_gate']:.2f} required).")
+                        else:
+                            reason_line = (f"HOLD: total and best-smaller-plan gates clear, but the weakest "
+                                           f"move adds only {_assessment['nested_incremental_gain']:+.2f} "
+                                           f"(+{_assessment['nested_incremental_gate']:.2f} required).")
                     else:
                         reason_line = "The best verified plan does not clear the engine's projected advantage threshold over hold."
                     threshold = _preferred_threshold
@@ -2633,7 +2685,8 @@ with decide_tab:
                             > _prior["cumulative_net_gain"]):
                         _projected_plan_by_count[_count] = _candidate_plan
             _best_projected_action = select_actionable_transfer_plan(
-                _projected_plan_by_count, require_verified_budget=False
+                _projected_plan_by_count, require_verified_budget=False,
+                allow_paid_transfers=transfer_hit,
             )
             _best_projected_idea = max(
                 (plan for count, plan in _projected_plan_by_count.items() if count > 0),
@@ -2703,7 +2756,7 @@ with decide_tab:
                 if not _sale_prices_verified:
                     _missing_sells = [
                         move["out"]["Player"] for move in _display_plan["transfers"]
-                        if int(move["out"]["id"]) not in purchase_price_current_ids
+                        if not _has_verified_selling_price(move["out"]["id"])
                     ]
                     if _missing_sells:
                         _checks.append("check official selling prices for " + ", ".join(_missing_sells))
@@ -2773,7 +2826,7 @@ with decide_tab:
                 "Needed": best_each["Minimum gain to act"].map(lambda value: f"{float(value):.1f}"),
                 "Reliability": best_each.apply(lambda row: f"{int(row['Minutes reliability (%)'])}% min · {int(row['Availability reliability (%)'])}% avail", axis=1),
             })
-            st.dataframe(_default_transfer_table, use_container_width=True, hide_index=True)
+            st.dataframe(_default_transfer_table, width="stretch", hide_index=True)
             with st.expander("Transfer vs hold · Gameweek by Gameweek", expanded=False):
                 _transfer_labels = [f"{row['Sell']} → {row['Buy']}" for _, row in best_each.iterrows()]
                 _selected_transfer_index = st.selectbox(
@@ -2801,11 +2854,11 @@ with decide_tab:
                     _comparison_frame["Net difference"] = _comparison_frame["Net difference"].map(lambda value: f"{value:+.1f}")
                     _comparison_frame["Cumulative net"] = _comparison_frame["Cumulative net"].map(lambda value: f"{value:+.1f}")
                     _comparison_frame["Transfer hit"] = _comparison_frame["Transfer hit"].map(lambda value: f"-{value:.0f}" if value else "—")
-                    st.dataframe(_comparison_frame, use_container_width=True, hide_index=True)
+                    st.dataframe(_comparison_frame, width="stretch", hide_index=True)
                     st.caption(f"Hold = keep {html.escape(str(_detail['Sell']))}. Candidate = buy {html.escape(str(_detail['Buy']))}. Projection source: {_transfer_projection_source}. Current FPL price budget: sale £{float(_detail['Budget ceiling (£m)']) - float(bank_m):.1f}m + bank £{float(bank_m):.1f}m; hit cost {hit_cost_auto} points, charged once. All values are model estimates, not guaranteed returns.")
             with st.expander("More columns", expanded=False):
                 st.caption(f"Risk mode: {risk} · Horizon: {horizon} GWs · Transfer hit applied: {hit_cost_auto} points.")
-                st.dataframe(best_each[["Sell","Sell club","Selling price source","Buy","Buy club","Position","Buy price (£m)","Budget ceiling (£m)","Club count after transfer","Outgoing projected pts","Incoming projected pts","Projected gain","Minimum gain to act","Expected minutes this GW","Availability factor","Minutes reliability (%)","Availability reliability (%)","Captaincy exposure","Actionable","Ownership (%)","Decision score","Verdict"]], use_container_width=True, hide_index=True)
+                st.dataframe(best_each[["Sell","Sell club","Selling price source","Buy","Buy club","Position","Buy price (£m)","Budget ceiling (£m)","Club count after transfer","Outgoing projected pts","Incoming projected pts","Projected gain","Minimum gain to act","Expected minutes this GW","Availability factor","Minutes reliability (%)","Availability reliability (%)","Captaincy exposure","Actionable","Ownership (%)","Decision score","Verdict"]], width="stretch", hide_index=True)
                 st.caption("PR #53 expected minutes scale the fallback projection; the trained v3.0 model does not use that estimate as a prediction feature. Current availability adjusts the nearest Gameweek only. The separate reliability score uses season minutes and availability flags; today's injury status is not assumed to persist across later weeks.")
 
         if _optimization_plans:
@@ -2843,80 +2896,75 @@ with decide_tab:
                         "Minutes / availability": _risk_text,
                         "Net gain vs hold": f"{_shown_plan['cumulative_net_gain']:+.1f}",
                         "Gross XI gain vs hold": f"{sum(r['plan_points'] - r['hold_points'] for r in _shown_plan['gameweeks']):+.1f}",
-                        "Incremental vs previous transfer count": (
+                        "Incremental vs best smaller plan": (
                             "—" if _count == 0 or (_count - 1) not in _optimization_plans else
                             f"{_shown_plan['cumulative_net_gain'] - _optimization_plans[_count - 1]['cumulative_net_gain']:+.2f}"
                         ),
+                        "Weakest move increment": (f"{_shown_plan['nested_marginal_gain']:+.2f}"
+                                                  if _shown_plan.get("nested_marginal_gain") is not None else "—"),
                         "Action gate": (
                             "HOLD baseline" if _count == 0 else
                             f"Total ≥ {transfer_plan_action_threshold(_shown_plan['paid_transfers']):.2f}; "
-                            f"increment ≥ {transfer_plan_action_threshold(max(0, int(_shown_plan['paid_transfers']) - int(_optimization_plans.get(_count - 1, {}).get('paid_transfers', 0)))):.2f}"
+                            f"increment ≥ {transfer_plan_action_threshold(max(0, int(_shown_plan['paid_transfers']) - int(_optimization_plans.get(_count - 1, {}).get('paid_transfers', 0)))):.2f}; "
+                            f"weakest ≥ {_shown_plan.get('nested_marginal_gate', 0):.2f}"
                         ),
                         "By Gameweek": " · ".join(f"GW{r['gameweek']} {r['plan_points']:.1f} vs {r['hold_points']:.1f}" for r in _shown_plan["gameweeks"]),
                     })
-            st.dataframe(pd.DataFrame(_plan_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(_plan_rows), width="stretch", hide_index=True)
             if not transfer_inputs_verified:
                 st.warning("These projections do not establish affordability because a required budget or transfer input is unverified.")
 
-            st.markdown("#### Compare the reported plans on the same squad and horizon")
-            _name_to_player = {str(p.get("web_name", "")).casefold(): p for p in players}
-            _comparison_specs = [
-                ("Your proposed plan", [("Hall", "Konsa"), ("Schade", "Manzambi")]),
-                ("Optimizer example", [("Hall", "Gabriel"), ("Davis", "Van Hecke")]),
-            ]
-            _plan_comparison_rows = [{"Plan": "HOLD / ROLL", "Transfers": "Keep squad; retain free transfers",
-                                 "Moves": 0, "Hit": "0 pts", "Net points vs HOLD": "+0.0",
-                                 "Bank after (£m)": f"£{bank_tenths_current / 10:.1f}m" if bank_tenths_current is not None else "Unverified",
-                                 "Budget status": "VERIFIED" if account_snapshot.actionable_transfers_ready else "VERIFY DATA"}]
-            _roster_by_id = {int(p["id"]): p for p in _optimization_squad}
-            for _plan_title, _pairs in _comparison_specs:
-                _next_roster = [dict(p) for p in _optimization_squad]
-                _plan_labels, _sale_total, _buy_total, _projection_valid = [], 0, 0, True
-                for _out_name, _in_name in _pairs:
-                    _out_player = _name_to_player.get(_out_name.casefold())
-                    _in_player = _name_to_player.get(_in_name.casefold())
-                    if not _out_player or not _in_player:
-                        _projection_valid = False
-                        _plan_labels.append(f"{_out_name} → {_in_name} (player not matched)")
-                        continue
-                    _out_id, _in_id = int(_out_player["id"]), int(_in_player["id"])
-                    _out_member = _roster_by_id.get(_out_id)
-                    if not _out_member or any(int(p["id"]) == _in_id for p in _next_roster):
-                        _projection_valid = False
-                        _plan_labels.append(f"{_out_name} → {_in_name} (not legal for current squad)")
-                        continue
-                    _sell = verified_player_price_tenths(_out_member.get("sell_tenths"))
-                    _buy = verified_player_price_tenths(_in_player.get("now_cost"))
-                    if _sell is None or _buy is None:
-                        _projection_valid = False
-                    else:
-                        _sale_total += _sell
-                        _buy_total += _buy
-                    _in_pos = str(pos_name(_in_player, types))
-                    if str(_out_member["position"]) != _in_pos:
-                        _projection_valid = False
-                    _next_roster = [p for p in _next_roster if int(p["id"]) != _out_id]
-                    _incoming = {"id": _in_id, "position": _in_pos, "club": teams.get(_in_player.get("team"), {}).get("short_name", "?"),
-                                 "projections": [float(r["points"]) for r in _projection_series_for(_in_player)]}
-                    _next_roster.append(_incoming)
-                    _plan_labels.append(f"{_out_name} → {_in_name}")
-                _bank_after = (bank_tenths_current + _sale_total - _buy_total) if bank_tenths_current is not None and _projection_valid else None
-                _affordable = _bank_after is not None and _bank_after >= 0
-                _score_rows = []
-                if _projection_valid and len(_next_roster) == 15:
-                    for _gw_i in range(int(horizon)):
-                        _score_rows.append(_lineup_points_for_roster(_next_roster, _gw_i) - _lineup_points_for_roster(_optimization_squad, _gw_i))
-                _net_points = sum(_score_rows) if len(_score_rows) == int(horizon) else None
-                _hit = max(0, len(_pairs) - int(free_transfers)) * 4
-                if _net_points is not None:
-                    _net_points -= _hit
-                _plan_comparison_rows.append({"Plan": _plan_title, "Transfers": " · ".join(_plan_labels), "Moves": len(_pairs),
-                                         "Hit": f"-{_hit} pts" if _hit else "0 pts",
-                                         "Net points vs HOLD": f"{_net_points:+.1f}" if _net_points is not None else "VERIFY DATA",
-                                         "Bank after (£m)": f"£{_bank_after / 10:.1f}m" if _bank_after is not None else "VERIFY PRICE / BANK",
-                                         "Budget status": "AFFORDABLE" if _affordable else "UNAFFORDABLE" if _bank_after is not None else "PROVISIONAL"})
-            st.dataframe(pd.DataFrame(_plan_comparison_rows), use_container_width=True, hide_index=True)
-            st.caption(f"All plans use the current squad snapshot, the same {horizon}-Gameweek forecasts and the same legal starting-XI scorer. A plan is actionable only with verified prices, bank, squad and transfer state.")
+            st.markdown("#### Compare custom plans on the same squad and horizon")
+            _squad_by_id = {int(p["id"]): p for p in _optimization_squad}
+            _incoming_by_id = {int(p["id"]): p for p in _optimization_players}
+            _compare_rows = [{"Plan": "HOLD / ROLL", "Moves": 0, "Hit": "0 pts",
+                              "Net points vs HOLD": "+0.0", "Bank after (£m)":
+                              f"£{bank_tenths_current / 10:.1f}m" if bank_tenths_current is not None else "UNKNOWN",
+                              "Status": "HOLD BASELINE"}]
+            for _plan_number in (1, 2):
+                st.markdown(f"**Plan {_plan_number}**")
+                _chosen_moves = []
+                for _slot in (1, 2):
+                    _out_col, _in_col = st.columns(2)
+                    with _out_col:
+                        _out_options = [None, *list(_squad_by_id)]
+                        _out_id = st.selectbox(
+                            f"Plan {_plan_number}, transfer {_slot}: sell",
+                            _out_options,
+                            format_func=lambda pid, roster=_squad_by_id: (
+                                "No transfer" if pid is None else
+                                f"{roster[pid]['Player']} · {roster[pid]['position']} · ID {pid}"
+                            ),
+                            key=f"plan_compare_{_plan_number}_{_slot}_out_id",
+                        )
+                    _out_pos = str(_squad_by_id[int(_out_id)]["position"]) if _out_id is not None else None
+                    _in_options = ([pid for pid, player in _incoming_by_id.items()
+                                    if str(player["position"]) == _out_pos] if _out_pos else [])
+                    with _in_col:
+                        if _in_options:
+                            _in_id = st.selectbox(
+                                f"Plan {_plan_number}, transfer {_slot}: buy",
+                                _in_options,
+                                format_func=lambda pid, pool=_incoming_by_id: f"{pool[pid]['Player']} · {pool[pid]['club']} · ID {pid}",
+                                key=f"plan_compare_{_plan_number}_{_slot}_in_id",
+                            )
+                            _chosen_moves.append({"out_id": int(_out_id), "in": _incoming_by_id[int(_in_id)]})
+                _evaluation = evaluate_transfer_plan(
+                    _optimization_squad, _chosen_moves, bank_tenths_current, free_transfers,
+                    _lineup_points_for_roster, int(horizon),
+                    actionable_transfers_ready=account_snapshot.actionable_transfers_ready,
+                    start_gw=int(gw),
+                )
+                _compare_rows.append({
+                    "Plan": f"Custom plan {_plan_number}",
+                    "Moves": " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _evaluation.get("moves", [])) or "Select valid transfers",
+                    "Hit": f"-{_evaluation['hit_cost']} pts" if _evaluation.get("hit_cost") else "0 pts",
+                    "Net points vs HOLD": (f"{_evaluation['net_gain_vs_hold']:+.1f}" if _evaluation.get("net_gain_vs_hold") is not None else "UNKNOWN"),
+                    "Bank after (£m)": (f"£{_evaluation['bank_after_tenths'] / 10:.1f}m" if _evaluation.get("bank_after_tenths") is not None else "UNKNOWN"),
+                    "Status": _evaluation["status"] if _evaluation["legal"] else f"VERIFY PLAN · {_evaluation['reason']}",
+                })
+            st.dataframe(pd.DataFrame(_compare_rows), width="stretch", hide_index=True)
+            st.caption(f"Each custom plan uses player IDs, the verified 15-player squad, the same {horizon}-Gameweek projections, XI scorer, and free-transfer/hit rules. AFFORDABLE is shown only when account inputs are verified.")
 
         with st.expander("Manual transfer comparison (optional)", expanded=False):
 
@@ -2926,7 +2974,7 @@ with decide_tab:
             sell = df[df["Player"]==sell_name].iloc[0]
             sale_price_tenths = verified_player_price_tenths(sell.get("Sell price (tenths)"))
             _manual_budget_verified = account_snapshot.actionable_transfers_ready
-            if (sale_price_tenths is None or bank_tenths_current is None or int(sell["id"]) not in purchase_price_current_ids
+            if (sale_price_tenths is None or bank_tenths_current is None or not _has_verified_selling_price(sell["id"])
                     or not _manual_budget_verified):
                 max_price_tenths = None
                 max_price = None
@@ -2935,7 +2983,7 @@ with decide_tab:
                     st.info("VERIFY PRICE · The selected player's official purchase price is unavailable, so selling price and affordability are unknown.")
                 if bank_tenths_current is None:
                     st.info("Current bank is unavailable. This comparison is withheld; switch to manual override and enter the FPL bank.")
-                if int(sell["id"]) not in purchase_price_current_ids:
+                if not _has_verified_selling_price(sell["id"]):
                     st.info("The selected player's official current purchase price is unavailable, so the selling-price budget cannot be verified.")
                 if not _manual_budget_verified:
                     st.info("This prior-squad fallback does not verify current bank or free transfers. Switch to Manual override and confirm both before comparing transfers.")
@@ -3012,7 +3060,7 @@ with decide_tab:
                 st.caption(f"Ranking mode: {risk}. Horizon: {horizon} GWs. Hit penalty: {4 if (transfer_hit and free_transfers == 0) else 0} points. Decision score weights minutes reliability, availability, differential ownership and xG+xA/90.")
                 options["Minutes reliability (%)"] = (minutes_reliability * 100).round(0).astype(int)
                 options["Availability reliability (%)"] = (availability_reliability * 100).round(0).astype(int)
-                st.dataframe(options[["Player","Club","Price (£m)","Current club count","Club count after transfer","Form","PPG","Minutes","Minutes reliability (%)","Status","Chance (%)","Availability reliability (%)","xG","xA","xG/90","xA/90",f"Projected {horizon}GW pts","Selected (%)","Projected gain","Decision score"]], use_container_width=True, hide_index=True)
+                st.dataframe(options[["Player","Club","Price (£m)","Current club count","Club count after transfer","Form","PPG","Minutes","Minutes reliability (%)","Status","Chance (%)","Availability reliability (%)","xG","xA","xG/90","xA/90",f"Projected {horizon}GW pts","Selected (%)","Projected gain","Decision score"]], width="stretch", hide_index=True)
                 best=options.iloc[0]
                 if free_transfers == 0 and not transfer_hit:
                     st.info(f"No transfer is actionable with the -4 hit disabled. The highest-ranked comparison is {best['Player']} ({best['Club']}) at {best['Projected gain']:+.1f} estimated points over {horizon} GWs before any hit.")
