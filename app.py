@@ -2778,7 +2778,8 @@ with decide_tab:
                 _transfer_labels = [f"{row['Sell']} → {row['Buy']}" for _, row in best_each.iterrows()]
                 _selected_transfer_index = st.selectbox(
                     "Transfer to inspect", range(len(_transfer_labels)),
-                    format_func=lambda index: _transfer_labels[index], key="transfer_projection_detail",
+                    format_func=lambda index, _labels=tuple(_transfer_labels): _labels[index],
+                    key="transfer_projection_detail",
                 )
                 _detail = best_each.iloc[int(_selected_transfer_index)]
                 _sell_player = _players_by_id.get(int(_detail["Sell ID"]))
@@ -2863,26 +2864,26 @@ with decide_tab:
                 ("Your proposed plan", [("Hall", "Konsa"), ("Schade", "Manzambi")]),
                 ("Optimizer example", [("Hall", "Gabriel"), ("Davis", "Van Hecke")]),
             ]
-            _comparison_rows = [{"Plan": "HOLD / ROLL", "Transfers": "Keep squad; retain free transfers",
+            _plan_comparison_rows = [{"Plan": "HOLD / ROLL", "Transfers": "Keep squad; retain free transfers",
                                  "Moves": 0, "Hit": "0 pts", "Net points vs HOLD": "+0.0",
                                  "Bank after (£m)": f"£{bank_tenths_current / 10:.1f}m" if bank_tenths_current is not None else "Unverified",
                                  "Budget status": "VERIFIED" if account_snapshot.actionable_transfers_ready else "VERIFY DATA"}]
             _roster_by_id = {int(p["id"]): p for p in _optimization_squad}
             for _plan_title, _pairs in _comparison_specs:
                 _next_roster = [dict(p) for p in _optimization_squad]
-                _transfer_labels, _sale_total, _buy_total, _projection_valid = [], 0, 0, True
+                _plan_labels, _sale_total, _buy_total, _projection_valid = [], 0, 0, True
                 for _out_name, _in_name in _pairs:
                     _out_player = _name_to_player.get(_out_name.casefold())
                     _in_player = _name_to_player.get(_in_name.casefold())
                     if not _out_player or not _in_player:
                         _projection_valid = False
-                        _transfer_labels.append(f"{_out_name} → {_in_name} (player not matched)")
+                        _plan_labels.append(f"{_out_name} → {_in_name} (player not matched)")
                         continue
                     _out_id, _in_id = int(_out_player["id"]), int(_in_player["id"])
                     _out_member = _roster_by_id.get(_out_id)
                     if not _out_member or any(int(p["id"]) == _in_id for p in _next_roster):
                         _projection_valid = False
-                        _transfer_labels.append(f"{_out_name} → {_in_name} (not legal for current squad)")
+                        _plan_labels.append(f"{_out_name} → {_in_name} (not legal for current squad)")
                         continue
                     _sell = verified_player_price_tenths(_out_member.get("sell_tenths"))
                     _buy = verified_player_price_tenths(_in_player.get("now_cost"))
@@ -2898,7 +2899,7 @@ with decide_tab:
                     _incoming = {"id": _in_id, "position": _in_pos, "club": teams.get(_in_player.get("team"), {}).get("short_name", "?"),
                                  "projections": [float(r["points"]) for r in _projection_series_for(_in_player)]}
                     _next_roster.append(_incoming)
-                    _transfer_labels.append(f"{_out_name} → {_in_name}")
+                    _plan_labels.append(f"{_out_name} → {_in_name}")
                 _bank_after = (bank_tenths_current + _sale_total - _buy_total) if bank_tenths_current is not None and _projection_valid else None
                 _affordable = _bank_after is not None and _bank_after >= 0
                 _score_rows = []
@@ -2909,12 +2910,12 @@ with decide_tab:
                 _hit = max(0, len(_pairs) - int(free_transfers)) * 4
                 if _net_points is not None:
                     _net_points -= _hit
-                _comparison_rows.append({"Plan": _plan_title, "Transfers": " · ".join(_transfer_labels), "Moves": len(_pairs),
+                _plan_comparison_rows.append({"Plan": _plan_title, "Transfers": " · ".join(_plan_labels), "Moves": len(_pairs),
                                          "Hit": f"-{_hit} pts" if _hit else "0 pts",
                                          "Net points vs HOLD": f"{_net_points:+.1f}" if _net_points is not None else "VERIFY DATA",
                                          "Bank after (£m)": f"£{_bank_after / 10:.1f}m" if _bank_after is not None else "VERIFY PRICE / BANK",
                                          "Budget status": "AFFORDABLE" if _affordable else "UNAFFORDABLE" if _bank_after is not None else "PROVISIONAL"})
-            st.dataframe(pd.DataFrame(_comparison_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(_plan_comparison_rows), use_container_width=True, hide_index=True)
             st.caption(f"All plans use the current squad snapshot, the same {horizon}-Gameweek forecasts and the same legal starting-XI scorer. A plan is actionable only with verified prices, bank, squad and transfer state.")
 
         with st.expander("Manual transfer comparison (optional)", expanded=False):
