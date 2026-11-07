@@ -58,7 +58,7 @@ class AccountSnapshotTests(unittest.TestCase):
         self.assertEqual(set(prices), set(ids))
         self.assertIn("reconciled", reason)
         self.assertIsNone(parse_selling_price_import(text.replace(",100", ",100.5", 1), ids, players, 20, 1520)[0])
-        self.assertIsNone(parse_selling_price_import(text, ids, players, 20, 1519)[0])
+        self.assertIsNone(parse_selling_price_import(text, ids, players, 20, 1518)[0])
 
     def test_price_import_rejects_duplicate_or_out_of_squad_player(self):
         players = legal_players()

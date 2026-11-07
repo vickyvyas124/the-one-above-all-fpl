@@ -1,4 +1,3 @@
-streamlit>=1.50,<2
 # Dependencies for the headless scheduled workflows (FPL Auto Learning Log and
 # Historical FPL Backtest). These run fpl_background_worker.py / historical_backtest.py
 # and the unit-test suite without the Streamlit dashboard.

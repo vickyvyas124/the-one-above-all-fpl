@@ -2917,7 +2917,7 @@ with decide_tab:
             st.markdown("#### Compare custom plans on the same squad and horizon")
             _squad_by_id = {int(p["id"]): p for p in _optimization_squad}
             _incoming_by_id = {int(p["id"]): p for p in _optimization_players}
-            _compare_rows = [{"Plan": "HOLD / ROLL", "Moves": 0, "Hit": "0 pts",
+            _compare_rows = [{"Plan": "HOLD / ROLL", "Moves": "0 (HOLD)", "Hit": "0 pts",
                               "Net points vs HOLD": "+0.0", "Bank after (£m)":
                               f"£{bank_tenths_current / 10:.1f}m" if bank_tenths_current is not None else "UNKNOWN",
                               "Status": "HOLD BASELINE"}]
@@ -2957,7 +2957,8 @@ with decide_tab:
                 )
                 _compare_rows.append({
                     "Plan": f"Custom plan {_plan_number}",
-                    "Moves": " · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _evaluation.get("moves", [])) or "Select valid transfers",
+                    "Moves": (" · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _evaluation.get("moves", []))
+                              or ("0 (HOLD)" if _evaluation["legal"] else "INVALID PLAN")),
                     "Hit": f"-{_evaluation['hit_cost']} pts" if _evaluation.get("hit_cost") else "0 pts",
                     "Net points vs HOLD": (f"{_evaluation['net_gain_vs_hold']:+.1f}" if _evaluation.get("net_gain_vs_hold") is not None else "UNKNOWN"),
                     "Bank after (£m)": (f"£{_evaluation['bank_after_tenths'] / 10:.1f}m" if _evaluation.get("bank_after_tenths") is not None else "UNKNOWN"),
