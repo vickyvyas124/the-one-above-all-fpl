@@ -11,12 +11,28 @@ from fpl_transfer import (
     optimize_transfer_plans,
     transfer_plan_action_threshold,
     select_actionable_transfer_plan,
+    transfer_plan_gate_assessment,
     pounds_millions_to_tenths,
 )
 from fpl_lineup import score_starting_xi
 
 
 class TransferProjectionTests(unittest.TestCase):
+    def test_total_gain_pass_is_distinguished_from_failed_incremental_gate(self):
+        plans = {
+            0: {"cumulative_net_gain": 0.0, "paid_transfers": 0},
+            1: {"cumulative_net_gain": 3.04, "paid_transfers": 0},
+            2: {"cumulative_net_gain": 7.0, "paid_transfers": 0},
+        }
+        assessment = transfer_plan_gate_assessment(plans, 2)
+        self.assertTrue(assessment["total_pass"])
+        self.assertEqual(assessment["total_gain"], 7.0)
+        self.assertEqual(assessment["total_gate"], 4.0)
+        self.assertFalse(assessment["incremental_pass"])
+        self.assertAlmostEqual(assessment["incremental_gain"], 3.96)
+        self.assertEqual(assessment["incremental_gate"], 4.0)
+        self.assertIs(select_actionable_transfer_plan(plans), plans[0])
+
     def test_second_move_must_clear_its_own_incremental_value_gate(self):
         plans = {
             0: {"affordable": True, "cumulative_net_gain": 0.0, "paid_transfers": 0},

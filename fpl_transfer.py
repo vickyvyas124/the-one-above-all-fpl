@@ -105,6 +105,29 @@ def transfer_plan_action_threshold(paid_transfers):
     return 6.0 if int(paid_transfers) > 0 else 4.0
 
 
+def transfer_plan_gate_assessment(plans, transfer_count):
+    """Return auditable total and marginal gate values for one plan size."""
+    plan = plans.get(int(transfer_count))
+    if not plan or int(transfer_count) <= 0:
+        return {"total_gain": 0.0, "total_gate": 0.0, "total_pass": True,
+                "incremental_gain": None, "incremental_gate": None, "incremental_pass": True}
+    total = float(plan.get("cumulative_net_gain", float("nan")))
+    total_gate = transfer_plan_action_threshold(plan.get("paid_transfers", 0))
+    prior_count = int(transfer_count) - 1
+    prior = plans.get(prior_count)
+    incremental = None
+    incremental_gate = None
+    incremental_pass = True
+    if prior is not None:
+        incremental = total - float(prior.get("cumulative_net_gain", 0.0))
+        marginal_paid = max(0, int(plan.get("paid_transfers", 0)) - int(prior.get("paid_transfers", 0)))
+        incremental_gate = transfer_plan_action_threshold(marginal_paid)
+        incremental_pass = incremental >= incremental_gate
+    return {"total_gain": total, "total_gate": total_gate, "total_pass": total >= total_gate,
+            "incremental_gain": incremental, "incremental_gate": incremental_gate,
+            "incremental_pass": incremental_pass}
+
+
 def select_actionable_transfer_plan(plans, *, require_verified_budget=True):
     """Choose the strongest plan that clears both total and incremental gates.
 
