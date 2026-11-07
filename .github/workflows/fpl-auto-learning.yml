@@ -29,12 +29,16 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
+          cache-dependency-path: requirements-worker.txt
 
       - name: Install worker dependencies
-        run: python -m pip install --disable-pip-version-check numpy requests pandas
+        run: python -m pip install --disable-pip-version-check -r requirements-worker.txt
 
+      # Code-correctness gate only. -b hides output from passing tests so deliberate
+      # negative-path tests cannot be mistaken for real operational diagnostics, which
+      # are logged later as DIAGNOSTIC[model-artifact] / DIAGNOSTIC[data-source].
       - name: Run engine validation tests
-        run: python -m unittest discover -s tests -v
+        run: python -m unittest discover -s tests -v -b
 
       - name: Prepare persistent forecast branch
         env:

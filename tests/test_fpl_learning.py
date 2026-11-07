@@ -139,6 +139,101 @@ class FutureModelTests(unittest.TestCase):
             path.write_text(json.dumps(model), encoding="utf-8")
             self.assertTrue(fpl_learning.validate_model(fpl_learning.load_model(path)))
 
+    def _write(self, directory, name, text):
+        path = Path(directory) / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_inspect_model_reports_the_specific_reason_for_every_failure(self):
+        model = fpl_learning.fit_ridge_model(self.training_frame(), source_seasons=["2023-24"])
+        nan_coefficients = dict(model, coefficients=dict(model["coefficients"], fixture_count=float("nan")))
+        cases = [
+            (None, "missing", "no artifact file"),
+            ("{broken", "malformed", "not valid JSON"),
+            ("[1, 2]", "malformed", "expected an object"),
+            (json.dumps(dict(model, model_version="2.9")), "incompatible", "model_version"),
+            (json.dumps({k: v for k, v in model.items() if k != "feature_policy"}), "incompatible", "feature_policy"),
+            (json.dumps(dict(model, model_type="unknown")), "incompatible", "model_type"),
+            (json.dumps(dict(model, features=list(reversed(model["features"])))), "incompatible", "feature list"),
+            (json.dumps(dict(model, training_rows=10)), "invalid", "training_rows"),
+            (json.dumps(dict(model, source_seasons=[])), "invalid", "source_seasons"),
+            (json.dumps(dict(model, coefficients={"wrong": 1.0})), "invalid", "coefficients"),
+            (json.dumps(nan_coefficients, allow_nan=True), "invalid", "non-finite"),
+        ]
+        with TemporaryDirectory(dir=Path.cwd()) as temp:
+            for text, status, fragment in cases:
+                with self.subTest(status=status, fragment=fragment):
+                    path = Path(temp) / "model.json"
+                    path.unlink(missing_ok=True)
+                    if text is not None:
+                        path.write_text(text, encoding="utf-8")
+                    result = fpl_learning.inspect_model(path)
+                    self.assertEqual(result.status, status)
+                    self.assertIn(fragment, result.reason)
+                    self.assertFalse(result.is_valid)
+                    self.assertIsNone(result.model)  # a failed load never yields a usable model
+                    self.assertIn(status, fpl_learning.REMEDIATION)
+                    self.assertIsNone(fpl_learning.load_model(path))
+            directory = Path(temp) / "as_directory"
+            directory.mkdir()
+            self.assertEqual(fpl_learning.inspect_model(directory).status, "unreadable")
+            good = self._write(temp, "good.json", json.dumps(model))
+            result = fpl_learning.inspect_model(good)
+            self.assertTrue(result.is_valid)
+            self.assertEqual(result.status, "valid")
+            self.assertEqual(result.model, model)
+
+    def test_inspect_model_agrees_with_validate_model(self):
+        model = fpl_learning.fit_ridge_model(self.training_frame(), source_seasons=["2023-24"])
+        variants = [model, dict(model, model_version="2.9"), dict(model, training_rows=499),
+                    dict(model, training_rows=500), dict(model, intercept=float("inf")),
+                    dict(model, scales=dict(model["scales"], home_share=0.0)), {}, None, "text", []]
+        for variant in variants:
+            with self.subTest(variant=str(variant)[:40]):
+                self.assertEqual(fpl_learning.validate_model(variant), fpl_learning.model_problem(variant) is None)
+
+    def test_check_command_reports_status_and_strict_mode_gates_publishing(self):
+        import contextlib
+        import io
+
+        model = fpl_learning.fit_ridge_model(self.training_frame(), source_seasons=["2023-24"])
+        with TemporaryDirectory(dir=Path.cwd()) as temp:
+            good = self._write(temp, "good.json", json.dumps(model))
+            bad = self._write(temp, "bad.json", json.dumps(dict(model, model_version="2.9")))
+            missing = Path(temp) / "absent.json"
+
+            def run(*args):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code = fpl_learning.main(list(args))
+                return code, out.getvalue()
+
+            code, out = run("check", str(good), "--strict")
+            self.assertEqual((code, "status=valid" in out), (0, True))
+            code, out = run("check", str(bad), "--strict")
+            self.assertEqual(code, 3)
+            self.assertIn("status=incompatible", out)
+            self.assertIn("Action:", out)
+            code, out = run("check", str(missing), "--strict")
+            self.assertEqual(code, 3)
+            self.assertIn("status=missing", out)
+            code, out = run("check", str(bad))  # advisory mode never blocks
+            self.assertEqual(code, 0)
+            self.assertIn("status=incompatible", out)
+
+    def test_save_model_refuses_an_invalid_model_and_keeps_the_existing_artifact(self):
+        model = fpl_learning.fit_ridge_model(self.training_frame(), source_seasons=["2023-24"])
+        with TemporaryDirectory(dir=Path.cwd()) as temp:
+            path = Path(temp) / "trained_fpl_model.json"
+            fpl_learning.save_model(model, path)
+            known_good = path.read_text(encoding="utf-8")
+            with self.assertRaises(ValueError):
+                fpl_learning.save_model(dict(model, model_version="2.9"), path)
+            with self.assertRaises(ValueError):
+                fpl_learning.save_model(dict(model, training_rows=3), path)
+            self.assertEqual(path.read_text(encoding="utf-8"), known_good)
+            self.assertTrue(fpl_learning.inspect_model(path).is_valid)
+
     def test_history_aggregates_fixture_records_into_gameweeks(self):
         base = datetime(2025, 8, 1, tzinfo=timezone.utc)
         rows = [

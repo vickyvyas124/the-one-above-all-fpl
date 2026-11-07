@@ -24,7 +24,7 @@ jobs:
           cache: pip
 
       - name: Install application and test dependencies
-        run: python -m pip install --disable-pip-version-check -r requirements.txt numpy
+        run: python -m pip install --disable-pip-version-check -r requirements.txt -r requirements-worker.txt
 
       - name: Verify Streamlit AppTest is available
         run: python -c "import streamlit; import streamlit.testing.v1"
@@ -37,3 +37,28 @@ jobs:
 
       - name: Check PR diff whitespace
         run: git diff --check "${{ github.event.pull_request.base.sha }}"...HEAD
+
+  # Reproduces the environment of the scheduled workflows (no Streamlit) so a test
+  # that needs dashboard-only packages fails here, before merge, not on the schedule.
+  test-worker-env:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out pull request
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-worker.txt
+
+      - name: Install worker-only dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-worker.txt
+
+      - name: Confirm the dashboard framework is absent
+        run: python -c "import importlib.util, sys; sys.exit(1 if importlib.util.find_spec('streamlit') else 0)"
+
+      - name: Run unit tests in the worker environment
+        run: python -m unittest discover -s tests -v -b

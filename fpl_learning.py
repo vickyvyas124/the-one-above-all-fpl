@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -155,38 +156,122 @@ def save_model(model: Mapping[str, Any], path: str | Path) -> None:
 
 
 def load_model(path: str | Path) -> dict[str, Any] | None:
+    """Return a validated model, or None for any failure.
+
+    Use :func:`inspect_model` when the *reason* for a failure matters.
+    """
+    return inspect_model(path).model
+
+
+@dataclass(frozen=True)
+class ModelInspection:
+    """Outcome of loading a model artifact, with an actionable failure reason.
+
+    status is one of: valid, missing, unreadable, malformed, incompatible, invalid.
+    ``model`` is only set when status == "valid"; a failed load never yields a model.
+    """
+    status: str
+    reason: str
+    model: dict[str, Any] | None = None
+
+    @property
+    def is_valid(self) -> bool:
+        return self.status == "valid"
+
+
+REMEDIATION = {
+    "missing": "Run the 'Historical FPL Backtest' workflow on main to publish trained_fpl_model.json to the fpl-data branch.",
+    "unreadable": "Check that the artifact path is a readable UTF-8 file on the fpl-data branch checkout.",
+    "malformed": "Re-run the 'Historical FPL Backtest' workflow on main to replace the corrupted artifact.",
+    "incompatible": "The artifact was built for a different model contract; re-run the 'Historical FPL Backtest' workflow on main with the current code.",
+    "invalid": "Re-run the 'Historical FPL Backtest' workflow on main to regenerate the artifact.",
+}
+
+
+def inspect_model(path: str | Path) -> ModelInspection:
+    """Load an artifact and say exactly why it cannot be used, if it cannot."""
+    target = Path(path)
     try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        return payload if validate_model(payload) else None
-    except (OSError, ValueError, TypeError):
-        return None
+        text = target.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ModelInspection("missing", f"no artifact file at {target}")
+    except (OSError, UnicodeDecodeError) as exc:
+        return ModelInspection("unreadable", f"{target} could not be read ({type(exc).__name__}: {exc})")
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        return ModelInspection("malformed", f"{target.name} is not valid JSON ({exc})")
+    problem = model_problem(payload)
+    if problem is not None:
+        return ModelInspection(problem[0], problem[1])
+    return ModelInspection("valid", f"v{MODEL_VERSION} model, {int(payload['training_rows'])} training rows from {payload['source_seasons']}", payload)
 
 
 def validate_model(model: Mapping[str, Any] | None) -> bool:
     """Validate the complete deployable artifact contract before serving it."""
+    return model_problem(model) is None
+
+
+def model_problem(model: Any) -> tuple[str, str] | None:
+    """Return (category, reason) for the first contract violation, or None if valid.
+
+    Categories: "malformed" (not a JSON object), "incompatible" (a different
+    version/policy/type/target/feature set) and "invalid" (right contract, bad content).
+    """
     if not isinstance(model, Mapping):
-        return False
-    if (str(model.get("model_version")) != MODEL_VERSION
-            or model.get("feature_policy") != FEATURE_POLICY
-            or model.get("model_type") != "standardized_ridge_regression"
-            or model.get("target") != "total FPL points in target Gameweek"
-            or model.get("features") != FEATURES):
-        return False
+        return "malformed", f"top-level JSON value is {type(model).__name__}, expected an object"
+    expected = (
+        ("model_version", MODEL_VERSION, str(model.get("model_version"))),
+        ("feature_policy", FEATURE_POLICY, model.get("feature_policy")),
+        ("model_type", "standardized_ridge_regression", model.get("model_type")),
+        ("target", "total FPL points in target Gameweek", model.get("target")),
+    )
+    for name, want, got in expected:
+        if got != want:
+            return "incompatible", f"{name} is {got!r}, this code requires {want!r}"
+    if model.get("features") != FEATURES:
+        return "incompatible", "feature list differs from the features this code scores with"
     try:
         for name in ("means", "scales", "coefficients"):
             values = model[name]
             if not isinstance(values, Mapping) or set(values) != set(FEATURES):
-                return False
+                return "invalid", f"{name} must contain exactly the model features"
             if not all(math.isfinite(float(values[key])) for key in FEATURES):
-                return False
+                return "invalid", f"{name} contains a non-finite value"
         if any(float(model["scales"][key]) <= 0 for key in FEATURES):
-            return False
+            return "invalid", "scales must all be positive"
         if not math.isfinite(float(model["intercept"])):
-            return False
+            return "invalid", "intercept is not finite"
         if int(model.get("training_rows", 0)) < 500:
-            return False
+            return "invalid", f"training_rows is {model.get('training_rows')!r}, need at least 500"
         if not isinstance(model.get("source_seasons"), list) or not model["source_seasons"]:
-            return False
-    except (KeyError, TypeError, ValueError, OverflowError):
-        return False
-    return True
+            return "invalid", "source_seasons must be a non-empty list"
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        return "invalid", f"artifact content is unusable ({type(exc).__name__}: {exc})"
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``python fpl_learning.py check PATH [--strict]`` - report whether an artifact is usable.
+
+    Exit status is 0 for a valid artifact. For an unusable one it is 0 by default
+    (advisory) and 3 with --strict, so publish steps can refuse to ship it.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Inspect a trained FPL model artifact.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    check = sub.add_parser("check", help="validate a trained_fpl_model.json file")
+    check.add_argument("path")
+    check.add_argument("--strict", action="store_true", help="exit 3 when the artifact is unusable")
+    args = parser.parse_args(argv)
+    result = inspect_model(args.path)
+    if result.is_valid:
+        print(f"MODEL-ARTIFACT: status=valid; {result.reason}")
+        return 0
+    print(f"MODEL-ARTIFACT: status={result.status}; {result.reason}. Action: {REMEDIATION[result.status]}")
+    return 3 if args.strict else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

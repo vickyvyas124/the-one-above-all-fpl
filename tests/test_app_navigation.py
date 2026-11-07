@@ -5,9 +5,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import requests
-import streamlit as st
 from fpl_lineup import score_starting_xi, select_model_lineup
 
+# Streamlit is a dashboard dependency, not a worker dependency. It must only be
+# imported inside this guard so the lightweight scheduled worker environment
+# (requirements-worker.txt) skips these tests instead of failing at import time.
+# tests/test_workflow_dependencies.py enforces this.
 try:
     import streamlit as st
     from streamlit.testing.v1 import AppTest
@@ -332,6 +335,10 @@ class DashboardNavigationAppTests(unittest.TestCase):
             free_transfers = next(item for item in app.selectbox if item.label == "Free transfers available")
             self.assertIn(free_transfers.value, [0, 1, 2, 3, 4, 5])
 
+            # Manual bank and free transfers are unverified until the manager confirms them
+            # (PR #67), so confirm both to exercise the verified transfer-candidate path.
+            for _label in ("I confirm this is my current FPL bank", "I confirm this free-transfer count in FPL"):
+                next(item for item in app.checkbox if item.label == _label).set_value(True)
             next(item for item in app.slider if item.label == "Projection horizon (Gameweeks)").set_value(3)
             next(item for item in app.checkbox if item.label == "Allow a -4 hit if model sees a gain").set_value(True)
             next(item for item in app.select_slider if item.label == "Risk appetite").set_value("Aggressive")

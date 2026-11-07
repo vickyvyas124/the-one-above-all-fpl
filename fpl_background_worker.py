@@ -24,6 +24,21 @@ import fpl_learning
 import fpl_snapshot_store
 
 BASE = "https://fantasy.premierleague.com/api"
+
+
+def diagnostic(category: str, message: str) -> None:
+    """Log an operational problem under an explicit category.
+
+    Categories keep operational failures separable from unit-test failures in the
+    workflow log: ``model-artifact`` (trained model unusable) and ``data-source``
+    (FPL API or snapshot store unavailable). Under GitHub Actions the line is also
+    surfaced as a workflow warning annotation.
+    """
+    print(f"DIAGNOSTIC[{category}]: {message}")
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        title = {"model-artifact": "Model artifact unavailable", "data-source": "Data source unavailable"}.get(category, category)
+        print(f"::warning title={title}::{escaped}")
 MODEL_VERSION = "3.0"
 COLUMNS = [
     "season", "gameweek", "player_id", "player", "position", "club",
@@ -404,11 +419,15 @@ def main() -> int:
     args = parser.parse_args()
     log_path = Path(args.csv_path)
     model_path = log_path.with_name("trained_fpl_model.json")
-    fpl_engine.TRAINED_MODEL = fpl_learning.load_model(model_path)
+    model_check = fpl_learning.inspect_model(model_path)
+    fpl_engine.TRAINED_MODEL = model_check.model  # None unless the artifact fully validated
     if fpl_engine.TRAINED_MODEL:
         print(f"Loaded trained model v3.0: {fpl_engine.TRAINED_MODEL.get('training_rows', 0)} historical player-GWs from {fpl_engine.TRAINED_MODEL.get('source_seasons', [])}.")
     else:
-        print("DIAGNOSTIC: new v3.0 forecast snapshots are disabled because the trained model artifact is missing, invalid, or incompatible. Existing forecast rows will still be reconciled.")
+        diagnostic("model-artifact", (
+            f"status={model_check.status}; {model_check.reason}. New v3.0 forecast snapshots are disabled; "
+            f"existing forecast rows are preserved and will still be reconciled. "
+            f"Action: {fpl_learning.REMEDIATION[model_check.status]}"))
     team_id = int(os.environ.get("FPL_TEAM_ID", "2311669"))
     changed = False
     log = read_log(log_path)
@@ -422,7 +441,7 @@ def main() -> int:
             message="Could not load bootstrap-static or fixtures; capture cannot be assigned to an event.",
             at_utc=datetime.now(timezone.utc),
         )
-        print("DIAGNOSTIC: source payload unavailable; snapshot capture skipped. Existing forecast rows will still be reconciled only if usable bootstrap data is available.")
+        diagnostic("data-source", "FPL bootstrap-static payload unavailable; snapshot capture skipped and nothing was written. Existing forecast rows are untouched.")
         return 1
     fixtures_available = isinstance(fixtures, list)
     if not fixtures_available:
@@ -504,7 +523,9 @@ def main() -> int:
                     if not fixtures_available else
                     ("Model artifact is missing; context captured without projections."
                      if not model_path.exists() else
-                     "Model artifact is invalid, incompatible or unreadable; context captured without projections.")
+                     (f"Model artifact {model_check.status}: {model_check.reason}; context captured without projections."
+                      if not model_check.is_valid else
+                      "Model artifact could not be re-read for hashing; context captured without projections."))
                 )
                 capture_completed_at = datetime.now(timezone.utc)
                 if capture_completed_at >= deadline:
@@ -516,7 +537,7 @@ def main() -> int:
                     )
                     forecast_rows = None
                     model_reason = "Source collection completed after deadline; snapshot rejected."
-                    print(f"DIAGNOSTIC: {model_reason}")
+                    diagnostic("data-source", model_reason)
                     continue_snapshot = False
                 else:
                     continue_snapshot = True
@@ -573,7 +594,7 @@ def main() -> int:
             elif window_label in remote_manifests and not (snapshot_path / "manifest.json").exists():
                 print(f"Snapshot already exists in persistent branch for {season} GW{gameweek} {window_label}; preserving it.")
             elif window_label in remote_errors:
-                print(f"DIAGNOSTIC: could not verify the persistent {window_label} snapshot identity; skipping capture.")
+                diagnostic("data-source", f"could not verify the persistent {window_label} snapshot identity; skipping capture.")
         # Check on every workflow run, including when the current immutable
         # window already exists or a moved deadline is outside both windows.
         fpl_snapshot_store.record_deadline_move(
@@ -684,9 +705,9 @@ def main() -> int:
                 changed = True
                 print(f"Saved v{MODEL_VERSION} pre-deadline forecast for {season} GW{gameweek}: {len(rows)} players; ep_next coverage={new['projection_ep_next'].notna().mean():.1%}; history coverage={new['history_enriched'].map(bool).mean():.1%}.")
         elif 0 < hours_to_deadline <= 6 and not fpl_engine.TRAINED_MODEL:
-            print(f"DIAGNOSTIC: skipped new forecast for {season} GW{gameweek}; trained v3.0 artifact is unavailable or invalid. Existing rows are preserved and will still be reconciled.")
+            diagnostic("model-artifact", f"skipped new forecast for {season} GW{gameweek}; artifact status={model_check.status} ({model_check.reason}). Existing rows are preserved and will still be reconciled.")
         elif 0 < hours_to_deadline <= 6 and not fixtures_available:
-            print(f"DIAGNOSTIC: skipped new forecast for {season} GW{gameweek}; fixture source is unavailable. Existing rows are preserved.")
+            diagnostic("data-source", f"skipped new forecast for {season} GW{gameweek}; fixture source is unavailable. Existing rows are preserved.")
         elif already_saved:
             print(f"Forecast already exists for {season} GW{gameweek}; preserving the first snapshot.")
         elif hours_to_deadline > 6:
