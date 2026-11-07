@@ -5,9 +5,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import requests
-import streamlit as st
 from fpl_lineup import score_starting_xi, select_model_lineup
 
+# Streamlit is a dashboard dependency, not a worker dependency. It must only be
+# imported inside this guard so the lightweight scheduled worker environment
+# (requirements-worker.txt) skips these tests instead of failing at import time.
+# tests/test_workflow_dependencies.py enforces this.
 try:
     import streamlit as st
     from streamlit.testing.v1 import AppTest

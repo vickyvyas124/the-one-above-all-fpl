@@ -25,12 +25,13 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
+          cache-dependency-path: requirements-worker.txt
 
       - name: Install backtest dependencies
-        run: python -m pip install --disable-pip-version-check numpy pandas requests
+        run: python -m pip install --disable-pip-version-check -r requirements-worker.txt
 
       - name: Validate engine and metrics
-        run: python -m unittest discover -s tests -v
+        run: python -m unittest discover -s tests -v -b
 
       - name: Replay historical seasons using lagged-only features
         id: replay-historical
@@ -44,6 +45,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Never publish an artifact the worker would refuse to load.
+          python fpl_learning.py check "$RUNNER_TEMP/historical-output/trained_fpl_model.json" --strict
           REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           DATA_DIR="$RUNNER_TEMP/fpl-data"
           if ! git ls-remote --exit-code --heads "$REMOTE_URL" fpl-data >/dev/null 2>&1; then

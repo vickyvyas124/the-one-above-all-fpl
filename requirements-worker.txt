@@ -1,0 +1,10 @@
+# Dependencies for the headless scheduled workflows (FPL Auto Learning Log and
+# Historical FPL Backtest). These run fpl_background_worker.py / historical_backtest.py
+# and the unit-test suite without the Streamlit dashboard.
+#
+# Keep specifiers for shared packages identical to requirements.txt; the PR workflow
+# installs both files and tests/test_workflow_dependencies.py enforces the rule.
+# numpy is imported directly by fpl_learning.py, so it is listed explicitly.
+numpy
+pandas>=2.0
+requests>=2.31
