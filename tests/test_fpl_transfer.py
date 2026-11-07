@@ -59,6 +59,20 @@ class TransferProjectionTests(unittest.TestCase):
                                         actionable_transfers_ready=True)
         self.assertFalse(result["club_limit_valid"])
 
+    def test_evaluated_moves_are_outgoing_incoming_player_pairs(self):
+        roles = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3
+        squad = [{"id": i + 1, "position": pos, "club": f"C{i // 3}",
+                  "sell_tenths": 100, "price_tenths": 100, "projections": [2]}
+                 for i, pos in enumerate(roles)]
+        incoming = {"id": 100, "position": "GK", "club": "NEW", "price_tenths": 100,
+                    "projections": [5]}
+        scorer = lambda roster, _index: sum(p["projections"][0] for p in roster)
+        result = evaluate_transfer_plan(squad, [{"out_id": 1, "in": incoming}], 0, 1, scorer, 1,
+                                        actionable_transfers_ready=True)
+        self.assertEqual(result["status"], "AFFORDABLE")
+        self.assertEqual(result["moves"][0][0]["id"], 1)
+        self.assertEqual(result["moves"][0][1]["id"], 100)
+
     def test_total_gain_pass_is_distinguished_from_failed_incremental_gate(self):
         plans = {
             0: {"cumulative_net_gain": 0.0, "paid_transfers": 0},

@@ -2957,7 +2957,7 @@ with decide_tab:
                 )
                 _compare_rows.append({
                     "Plan": f"Custom plan {_plan_number}",
-                    "Moves": (" · ".join(f"{m['out']['Player']} → {m['in']['Player']}" for m in _evaluation.get("moves", []))
+                    "Moves": (" · ".join(f"{m[0]['Player']} → {m[1]['Player']}" for m in _evaluation.get("moves", []))
                               or ("0 (HOLD)" if _evaluation["legal"] else "INVALID PLAN")),
                     "Hit": f"-{_evaluation['hit_cost']} pts" if _evaluation.get("hit_cost") else "0 pts",
                     "Net points vs HOLD": (f"{_evaluation['net_gain_vs_hold']:+.1f}" if _evaluation.get("net_gain_vs_hold") is not None else "UNKNOWN"),
