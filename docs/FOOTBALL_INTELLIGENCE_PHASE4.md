@@ -17,4 +17,3 @@ Before adding a scheduled source, select a source with documented rights for the
 ## Attribution and sharing
 
 The dashboard names StatsBomb Open Data and links to its public repository. This is attribution context, not a grant of rights for every use. Before publicly sharing derived output, review the current source terms and attribution/branding requirements. Raw source files remain local and are not displayed or published by this dashboard.
-

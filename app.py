@@ -3297,4 +3297,3 @@ with intelligence_tab:
         "This dashboard does not publish raw source files. Before publicly sharing analysis derived "
         "from StatsBomb Open Data, review the source attribution, branding, and usage requirements."
     )
-
