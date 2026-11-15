@@ -121,13 +121,14 @@ def mocked_fpl_get(url, **_kwargs):
         return MockResponse({"history": [], "fixtures": []})
     if "/entry/2311669/event/" in url and url.endswith("/picks/"):
         picks = []
-        for position, player_id in enumerate(range(1, 16), 1):
+        published_order = [1, 3, 4, 5, 8, 9, 10, 11, 13, 14, 15, 2, 6, 7, 12]
+        for position, player_id in enumerate(published_order, 1):
             pick = {
                 "element": player_id,
                 "position": position,
                 "multiplier": 2 if player_id == 15 else (0 if position > 11 else 1),
                 "is_captain": player_id == 15,
-                "is_vice_captain": player_id == 8,
+                "is_vice_captain": player_id == 11,
                 "purchase_price": 60,
             }
             picks.append(pick)
@@ -230,6 +231,9 @@ class DashboardNavigationAppTests(unittest.TestCase):
             self.assertCountEqual(xi_names + bench_names, [row[2] for row in SQUAD])
             self.assertEqual(xi_table.value["Captain"].eq("C").sum(), 1)
             self.assertEqual(xi_table.value["Vice"].eq("VC").sum(), 1)
+            self.assertIn("Selection reason", xi_table.value.columns)
+            self.assertIn("Expected minutes", xi_table.value.columns)
+            self.assertIn("Availability factor", xi_table.value.columns)
             self.assertIn("Kostoulas", xi_names + bench_names)
             _captain_xi_row = xi_table.value.loc[xi_table.value["Captain"].eq("C")].iloc[0]
             _xi_base_total = float(xi_table.value["GW2 pts"].sum())
@@ -252,6 +256,17 @@ class DashboardNavigationAppTests(unittest.TestCase):
             _formation_metric = next(item for item in model_tab.metric if item.label == "Model-best formation")
             _defenders, _midfielders, _forwards = map(int, _formation_metric.value.split("-"))
             self.assertTrue(3 <= _defenders <= 5 and 2 <= _midfielders <= 5 and 1 <= _forwards <= 3)
+            self.assertTrue(any(item.label == "Second-best formation" for item in model_tab.metric))
+            _published_formation = next(item for item in model_tab.metric if item.label == "Published formation")
+            self.assertEqual(_published_formation.value, "3-4-3")
+            self.assertTrue(any(item.label == "Optimized XI + captain" for item in model_tab.metric))
+            _captain_table = next(
+                item for item in app.tabs[1].dataframe
+                if "Captaincy rationale" in item.value.columns
+            )
+            self.assertTrue(_captain_table.value["Captaincy rationale"].iloc[0].startswith("Highest projected points"))
+            comparison_note = next(item for item in model_tab.caption if "Captain change:" in str(item.value))
+            self.assertIn("Vice-captain change:", comparison_note.value)
             _forecast_metric = next(item for item in model_tab.metric if item.label == "Forecast record")
             self.assertEqual(_forecast_metric.value, "Not saved")
             fixture_text = "\n".join(str(item.value) for item in app.tabs[2].markdown)
@@ -399,6 +414,10 @@ class DashboardNavigationAppTests(unittest.TestCase):
             verdict = next(item.value for item in app.tabs[0].markdown if "verdict-card" in str(item.value))
             self.assertIn("Provisional", verdict)
             self.assertIn("HOLD FOR NOW", verdict)
+            self.assertTrue(any(
+                "Current-versus-optimized comparison unavailable" in str(item.value)
+                for item in app.tabs[3].info
+            ))
             plan_table = next(
                 item for item in app.tabs[0].dataframe
                 if {"Transfers", "Free used", "Paid", "Hit", "Affordability", "By Gameweek"}.issubset(item.value.columns)
