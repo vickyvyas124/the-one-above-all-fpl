@@ -149,4 +149,3 @@ def validate_observation(observation: PlayerMatchObservation) -> None:
             raise ValueError(f"Unknown missing-field marker: {name}.")
         if getattr(observation, name) is not None:
             raise ValueError(f"Field {name} is marked missing but has a value.")
-
