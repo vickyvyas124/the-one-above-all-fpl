@@ -21,3 +21,7 @@ Phase 1 adds a local, provenance-preserving StatsBomb Open Data adapter for rese
 Phase 2 adds explainable, provenance-linked match trend indicators and an exploratory emerging-player shortlist. It remains disconnected from FPL points and decisions until Phase 3 validates point-in-time joins and incremental predictive value. See [the Phase 2 indicator and evidence contract](docs/FOOTBALL_INTELLIGENCE_PHASE2.md).
 
 Phase 3 adds a deadline-safe context bridge to the existing FPL baseline, while keeping adjustments disabled until time-aligned data and walk-forward validation exist. See [the Phase 3 integration gate](docs/FOOTBALL_INTELLIGENCE_PHASE3.md).
+
+## Phase 4: dashboard and collection status
+
+Phase 4 adds a read-only dashboard for optional locally collected football intelligence. It does not change FPL recommendations or schedule data collection; current source coverage is historical and incomplete. See [the Phase 4 dashboard and collection limits](docs/FOOTBALL_INTELLIGENCE_PHASE4.md).

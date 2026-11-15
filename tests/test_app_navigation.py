@@ -208,15 +208,18 @@ class DashboardNavigationAppTests(unittest.TestCase):
 
     def test_dashboard_tabs_recommendation_and_existing_controls_render(self):
         app_path = Path(__file__).parents[1] / "app.py"
-        with patch("requests.get", side_effect=mocked_fpl_get) as network:
+        missing_intelligence_store = Path(__file__).parents[1] / ".missing-intelligence-store"
+        with patch.dict("os.environ", {"FPL_INTELLIGENCE_STORE": str(missing_intelligence_store)}), \
+                patch("requests.get", side_effect=mocked_fpl_get) as network:
             app = AppTest.from_file(str(app_path), default_timeout=60).run()
             initial_network_call_count = network.call_count
 
             self.assertFalse(app.exception, [item.message for item in app.exception])
             self.assertEqual(
                 [tab.label for tab in app.tabs],
-                ["Decide", "Squad", "Fixtures", "Model"],
+                ["Decide", "Squad", "Fixtures", "Model", "Football Intelligence"],
             )
+            self.assertTrue(any("No local football intelligence dataset" in item.value for item in app.tabs[4].info))
             model_tab = app.tabs[3]
             xi_table = next(
                 item for item in model_tab.dataframe

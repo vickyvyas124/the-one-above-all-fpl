@@ -34,6 +34,7 @@ from fpl_transfer import (
     exact_fpl_tenths,
     pounds_millions_to_tenths,
 )
+from fpl_intelligence.dashboard import load_dashboard_snapshot
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -1216,7 +1217,9 @@ with st.expander("How decisions are made", expanded=False):
     - Current public picks are preferred. Before deadline, the last completed picks and complete public transfer history are used to reconstruct a provisional squad. Manual correction appears only if that evidence is missing, inconsistent or ambiguous.
     """)
 
-decide_tab, squad_tab, fixtures_tab, model_tab = st.tabs(["Decide", "Squad", "Fixtures", "Model"])
+decide_tab, squad_tab, fixtures_tab, model_tab, intelligence_tab = st.tabs(
+    ["Decide", "Squad", "Fixtures", "Model", "Football Intelligence"]
+)
 
 captain_pick = None
 vice_pick = None
@@ -3171,3 +3174,127 @@ with decide_tab:
             unsafe_allow_html=True,
         )
         st.info("No transfer, captain or chip recommendation is generated without a verified current 15-player FPL squad.")
+
+
+@st.cache_data(ttl=300, max_entries=2, show_spinner=False)
+def _cached_football_intelligence_snapshot(store_path):
+    return load_dashboard_snapshot(store_path)
+
+
+with intelligence_tab:
+    st.subheader("Football Intelligence")
+    st.caption(
+        "Evidence-linked match trends from the optional local intelligence store. "
+        "This section does not alter FPL points, transfers, captaincy, or HOLD decisions."
+    )
+    _intelligence_store = os.environ.get("FPL_INTELLIGENCE_STORE", "").strip()
+    _intelligence_snapshot = _cached_football_intelligence_snapshot(_intelligence_store or None)
+    st.caption(
+        "Source: [StatsBomb Open Data](https://github.com/hudl/open-data). "
+        "The available source is selected historical coverage, not a live full Premier League feed. "
+        "Collection is opt-in and no scheduled fetch is configured."
+    )
+    if _intelligence_snapshot.status == "NO_LOCAL_DATASET":
+        st.info(
+            "No local football intelligence dataset is available in this deployment. "
+            "The dashboard will not substitute sample data or fetch matches automatically."
+        )
+    elif _intelligence_snapshot.status == "INVALID_STORE_PATH":
+        st.warning("The configured football intelligence store path is invalid.")
+    elif _intelligence_snapshot.status == "NO_ANALYZABLE_OBSERVATIONS":
+        st.info("The local store has collection records but no validated player observations to analyze.")
+    elif _intelligence_snapshot.status == "ANALYSIS_FAILED":
+        st.error("The local observations failed identity or integrity validation; no insights are shown.")
+    else:
+        _intelligence_top = st.columns(4)
+        _intelligence_top[0].metric("Store status", _intelligence_snapshot.status)
+        _intelligence_top[1].metric("Fixtures analyzed", _intelligence_snapshot.fixture_count)
+        _intelligence_top[2].metric("Player profiles", _intelligence_snapshot.analyzed_player_count)
+        _intelligence_top[3].metric(
+            "Evidence insights",
+            len(_intelligence_snapshot.analysis.insights) if _intelligence_snapshot.analysis else 0,
+        )
+        st.caption(
+            "Latest successful source retrieval: "
+            + (_intelligence_snapshot.last_data_retrieved_utc or "Unavailable")
+            + " · Analysis generated: "
+            + datetime.now(timezone.utc).isoformat(timespec="seconds")
+        )
+        if _intelligence_snapshot.collection_status_counts:
+            st.write("Collection status counts")
+            st.dataframe(
+                pd.DataFrame([
+                    {"Collection status": name, "Fixtures": count}
+                    for name, count in sorted(_intelligence_snapshot.collection_status_counts.items())
+                ]),
+                width="stretch", hide_index=True,
+            )
+        _intelligence_result = _intelligence_snapshot.analysis
+        if _intelligence_result and _intelligence_result.metric_coverage:
+            st.write("Measured-data coverage")
+            st.dataframe(
+                pd.DataFrame([
+                    {"Indicator": name, "Coverage": f"{share:.0%}"}
+                    for name, share in sorted(_intelligence_result.metric_coverage.items())
+                ]),
+                width="stretch", hide_index=True,
+            )
+        if _intelligence_result and _intelligence_result.emerging_opportunities:
+            st.write("Exploratory emerging-player shortlist")
+            st.caption(
+                "Shortlist rule: improvement in at least two distinct attacking domains. "
+                "This is not a transfer recommendation or points ranking."
+            )
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Rank": item.rank,
+                        "Player": item.player_name,
+                        "Club": item.club,
+                        "Season": item.season,
+                        "Improving domains": ", ".join(item.improving_dimensions),
+                        "Evidence": item.evidence_quality.value,
+                        "Fixtures": ", ".join(item.fixture_ids),
+                        "Class": item.classification.value,
+                    }
+                    for item in _intelligence_result.emerging_opportunities[:25]
+                ]),
+                width="stretch", hide_index=True,
+            )
+        if _intelligence_result and _intelligence_result.insights:
+            st.write("Player trends")
+            _intelligence_rows = []
+            for _insight in _intelligence_result.insights:
+                _measurements = _insight.measurements
+                _baseline = _measurements.get("baseline_mean")
+                _recent = _measurements.get("recent_mean")
+                _change = _measurements.get("absolute_change")
+                if _measurements.get("indicator") == "listed_position_shift":
+                    _comparison = (
+                        f"{_measurements.get('baseline_dominant_position')} → "
+                        f"{_measurements.get('recent_dominant_position')}"
+                    )
+                elif _baseline is not None and _recent is not None:
+                    _comparison = f"{float(_baseline):.3f} → {float(_recent):.3f}"
+                else:
+                    _comparison = "Spread/position diagnostic"
+                _intelligence_rows.append({
+                    "Player": _measurements.get("player_name", "Unknown"),
+                    "Indicator": _measurements.get("indicator", "Unknown"),
+                    "Comparison": _comparison,
+                    "Change": f"{float(_change):+.3f}" if _change is not None else "—",
+                    "Quality": _insight.evidence_quality.value,
+                    "Class": _insight.classification.value,
+                    "Fixtures": ", ".join(_insight.fixture_ids),
+                    "Source time": _insight.source_timestamp or "Unknown",
+                })
+            st.dataframe(pd.DataFrame(_intelligence_rows[:200]), width="stretch", hide_index=True)
+    if _intelligence_snapshot.warnings:
+        with st.expander("Data-quality warnings", expanded=False):
+            for _warning in _intelligence_snapshot.warnings[:20]:
+                st.warning(_warning)
+    st.info(
+        "This dashboard does not publish raw source files. Before publicly sharing analysis derived "
+        "from StatsBomb Open Data, review the source attribution, branding, and usage requirements."
+    )
+
