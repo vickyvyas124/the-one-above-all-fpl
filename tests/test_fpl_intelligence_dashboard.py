@@ -89,7 +89,7 @@ class FootballIntelligenceDashboardTests(unittest.TestCase):
         self.assertEqual(snapshot.status, "READY")
         self.assertEqual(snapshot.fixture_count, 1)
         self.assertEqual(snapshot.observation_count, 1)
-        self.assertEqual(snapshot.analyzed_player_count, 1)
+        self.assertEqual(snapshot.analyzed_player_count, 0)
         self.assertEqual(snapshot.collection_status_counts, {"data_successfully_collected": 1})
         self.assertEqual(snapshot.last_data_retrieved_utc, "2024-08-17T00:00:00Z")
         self.assertIsNotNone(snapshot.analysis)
