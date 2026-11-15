@@ -1,0 +1,6 @@
+# Keep research-source payloads local; do not publish source-controlled raw data.
+.local/football-intelligence/
+
+# Python-generated files.
+__pycache__/
+*.py[cod]

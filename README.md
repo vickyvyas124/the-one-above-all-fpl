@@ -13,3 +13,7 @@ Then run **Actions → Historical FPL Backtest → Run workflow**. It should tes
 ## Model caveats
 
 This is a transparent, regularized regression model—not a guarantee of better FPL rank. Historical data files are not exact point-in-time copies of the public API, so the holdout evaluation reduces but does not eliminate possible dataset artifacts. The backtest must show improvement versus the baseline before we increase model complexity or make it the sole decision-maker. `ep_next` is collected prospectively in the live snapshot but excluded from historical training because the archives do not guarantee it was captured before kickoff/deadline.
+
+## Football intelligence foundation
+
+Phase 1 adds a local, provenance-preserving StatsBomb Open Data adapter for research on explicitly selected completed matches. It is isolated from FPL forecasts, recommendations, scheduled workflows, and the dashboard; it does not change FPL outputs. See [the Phase 1 source, rights, and architecture review](docs/FOOTBALL_INTELLIGENCE_PHASE1.md) before collecting or publishing any data.
