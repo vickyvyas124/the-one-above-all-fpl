@@ -17,4 +17,3 @@ This is a transparent, regularized regression model—not a guarantee of better 
 ## Football intelligence foundation
 
 Phase 1 adds a local, provenance-preserving StatsBomb Open Data adapter for research on explicitly selected completed matches. It is isolated from FPL forecasts, recommendations, scheduled workflows, and the dashboard; it does not change FPL outputs. See [the Phase 1 source, rights, and architecture review](docs/FOOTBALL_INTELLIGENCE_PHASE1.md) before collecting or publishing any data.
-
