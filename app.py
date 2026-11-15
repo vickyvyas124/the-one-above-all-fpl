@@ -11,7 +11,7 @@ import fpl_engine
 import fpl_learning
 from fpl_availability import availability_adjustment
 from fpl_ui_labels import status_chip_labels
-from fpl_lineup import score_starting_xi, select_model_lineup
+from fpl_lineup import published_lineup_from_picks, score_starting_xi, select_model_lineup
 from fpl_chip_strategy import chip_half, chip_history_for_half, chip_planning_gameweeks
 from fpl_visuals import club_badge_url, player_headshot_urls, player_initials
 from fpl_squad import load_public_squad, validate_squad_ids
@@ -1111,10 +1111,20 @@ for _resolved in resolved:
     lineup_candidates.append({
         "Player": str(_resolved["Player"]), "Position": str(_resolved["Position"]),
         "Club": str(_resolved["Club"]), "Price (£m)": float(_resolved["Price (£m)"]),
+        "Expected minutes": fpl_engine.estimate_expected_minutes(
+            _player, PLAYER_HISTORY_SIGNALS.get(_pid, {}),
+            fpl_engine.team_fixture_count(fixtures, _player.get("team"), int(gw)),
+        ),
+        "Availability factor": availability_adjustment(_player),
         "GW projected pts": float(_projection), "id": _pid,
     })
 selected_lineup = (select_model_lineup(lineup_candidates, lineup_projection_by_id)
                    if squad_recommendations_allowed else None)
+current_published_lineup = published_lineup_from_picks(
+    public_picks_for_display, lineup_candidates, lineup_projection_by_id,
+    verified=bool(squad_source == "current" and squad_load.get("target_verified")
+                  and squad_recommendations_allowed),
+)
 model_xi_start_ids = ({int(player["id"]) for player in selected_lineup["starters"]}
                       if selected_lineup else set())
 # Before confirmation, show the verified last-published roster's positional layout
@@ -1567,6 +1577,13 @@ with squad_tab:
             captain_df = pd.DataFrame(captain_rows).sort_values(
                 ["Projected GW points", "Minutes"], ascending=False
             ).reset_index(drop=True)
+            captain_df["Captaincy rationale"] = [
+                "Highest projected points in the selected XI; captain candidate." if index == 0 else
+                "Second-highest projected points in the selected XI; vice-captain candidate." if index == 1 else
+                "Third-highest projected points in the selected XI; alternative captain candidate." if index == 2 else
+                "Other member of the selected XI; lower projection than the top three."
+                for index in range(len(captain_df))
+            ]
             captain_pick = captain_df.loc[captain_df["Element ID"].eq(int(selected_lineup["captain"]["id"]))].iloc[0]
             vice_pick = captain_df.loc[captain_df["Element ID"].eq(int(selected_lineup["vice"]["id"]))].iloc[0]
 
@@ -2134,26 +2151,73 @@ with model_tab:
         bench_ordered = selected_lineup["bench"]
         captain_pick = selected_lineup["captain"]
         vice_pick = selected_lineup["vice"]
-        xi_a, xi_b, xi_c = st.columns([1.1, 1.1, 1.8])
+        xi_a, xi_b, xi_c, xi_d, xi_e = st.columns([1.0, 1.0, 1.0, 1.0, 1.7])
         xi_a.metric("Model-best formation", selected_lineup["formation"])
         xi_b.metric("XI + captain projected points", f"{selected_lineup['projected_points']:.1f}",
                     help=(f"Starter projections total {selected_lineup['base_xi_projected_points']:.1f}; "
                           f"the captain's extra 1× projection adds {selected_lineup['captain_extra_points']:.1f}. "
                           "Vice-captain points are conditional and are not added."))
-        xi_c.metric("Captain / vice-captain", f"{captain_pick['Player']} / {vice_pick['Player']}", help="These are selected from the same legal XI displayed on the Squad tab.")
+        xi_c.metric("Second-best formation", selected_lineup["second_best_formation"],
+                    help=f"Projected XI plus captain: {selected_lineup['second_best_projected_points']:.1f} points.")
+        xi_d.metric("Gap to second best", f"{selected_lineup['formation_gap_points']:.1f} pts")
+        xi_e.metric("Captain / vice-captain", f"{captain_pick['Player']} / {vice_pick['Player']}", help="These are selected from the same legal XI displayed on the Squad tab.")
         xi_tab, bench_tab = st.columns([1.4, 1])
         with xi_tab:
             st.markdown("**Model-selected starting XI**")
             xi_frame = pd.DataFrame(best_xi)
             xi_frame["Captain"] = xi_frame["id"].eq(captain_pick["id"]).map({True: "C", False: ""})
             xi_frame["Vice"] = xi_frame["id"].eq(vice_pick["id"]).map({True: "VC", False: ""})
-            st.dataframe(xi_frame[["Position", "Player", "Club", "GW projected pts", "Captain", "Vice"]].rename(columns={"GW projected pts": f"GW{gw} pts"}), width="stretch", hide_index=True)
+            st.dataframe(xi_frame[["Position", "Player", "Club", "GW projected pts", "Expected minutes", "Availability factor", "Selection reason", "Captain", "Vice"]].rename(columns={"GW projected pts": f"GW{gw} pts"}), width="stretch", hide_index=True)
         with bench_tab:
             st.markdown("**Suggested bench order**")
             bench_frame = pd.DataFrame(bench_ordered)
             bench_frame["Order"] = ["Goalkeeper bench", "Outfield 1", "Outfield 2", "Outfield 3"]
-            st.dataframe(bench_frame[["Order", "Player", "Position", "GW projected pts"]].rename(columns={"GW projected pts": f"GW{gw} pts"}), width="stretch", hide_index=True)
-        st.caption("Projection source is the current v3.0 one-Gameweek forecast when available, otherwise the live prediction engine. These estimates do not guarantee points or submit changes to FPL.")
+            st.dataframe(bench_frame[["Order", "Player", "Position", "GW projected pts", "Expected minutes", "Availability factor", "Selection reason"]].rename(columns={"GW projected pts": f"GW{gw} pts"}), width="stretch", hide_index=True)
+        st.caption("All eight legal formations are scored with the same one-Gameweek projection map. Minutes and availability are used where the forecast model supports them; lineup selection does not apply a second availability multiplier. Points are estimates, not guarantees.")
+
+        st.markdown("#### Current published XI vs optimized XI")
+        if current_published_lineup:
+            _current_points = float(current_published_lineup["projected_points"])
+            _optimized_points = float(selected_lineup["projected_points"])
+            _current_ids = {int(player["id"]) for player in current_published_lineup["starters"]}
+            _optimized_ids = {int(player["id"]) for player in selected_lineup["starters"]}
+            _current_names = {int(player["id"]): str(player["Player"]) for player in current_published_lineup["starters"]}
+            _model_by_id = {int(player["id"]): player for player in selected_lineup["starters"] + selected_lineup["bench"]}
+            _current_by_id = {int(player["id"]): player for player in current_published_lineup["starters"]}
+            _comparison_metrics = st.columns(4)
+            _comparison_metrics[0].metric("Published formation", current_published_lineup["formation"])
+            _comparison_metrics[1].metric("Recommended formation", selected_lineup["formation"])
+            _comparison_metrics[2].metric("Published XI + captain", f"{_current_points:.1f}")
+            _comparison_metrics[3].metric("Optimized XI + captain", f"{_optimized_points:.1f}", delta=f"{_optimized_points - _current_points:+.1f} pts")
+            _change_rows = []
+            for _player_id in sorted(_optimized_ids - _current_ids):
+                _player = _model_by_id[_player_id]
+                _change_rows.append({"Recommendation": "Bring into starting XI", "Player": _player["Player"],
+                                     f"GW{gw} projection": _player["GW projected pts"],
+                                     "Reason": _player["Selection reason"]})
+            for _player_id in sorted(_current_ids - _optimized_ids):
+                _player = _current_by_id[_player_id]
+                _change_rows.append({"Recommendation": "Move to bench", "Player": _player["Player"],
+                                     f"GW{gw} projection": _player["GW projected pts"],
+                                     "Reason": f"The recommended legal {selected_lineup['formation']} XI has a higher total projected score."})
+            _published_captain = current_published_lineup["captain"]
+            _published_vice = current_published_lineup["vice"]
+            _captain_change = (f"{_published_captain['Player']} → {captain_pick['Player']}"
+                               if int(_published_captain["id"]) != int(captain_pick["id"]) else "No change")
+            _vice_change = (f"{_published_vice['Player']} → {vice_pick['Player']}"
+                            if int(_published_vice["id"]) != int(vice_pick["id"]) else "No change")
+            st.caption(f"Captain change: {_captain_change}. Vice-captain change: {_vice_change}. Both XI totals use the same projections and include only the assigned captain's extra 1× points.")
+            if _change_rows:
+                st.dataframe(pd.DataFrame(_change_rows), width="stretch", hide_index=True)
+            else:
+                st.success("The published starting XI already matches the model's recommended starters.")
+        else:
+            _comparison_source = (
+                f"Last published GW{squad_load.get('baseline_gw')} picks are a reference only; current GW{gw} picks have not been verified."
+                if squad_source == "prior" else
+                "Current published picks, captain and vice-captain are unavailable or invalid."
+            )
+            st.info(f"Current-versus-optimized comparison unavailable. {_comparison_source} The model recommendation is not compared with a reconstructed or stale XI.")
     elif resolved and not squad_recommendations_allowed:
         st.info("A projected XI is withheld because current picks and public transfer history do not provide a complete, consistent roster. Correct the roster in the sidebar to continue.")
     elif resolved:
