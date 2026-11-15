@@ -180,4 +180,3 @@ def load_dashboard_snapshot(root: str | Path | None = None) -> DashboardSnapshot
         str(store), state, len(latest), result.fixture_count, result.observation_count,
         result.analyzed_player_count, statuses, last_success, result, tuple(warnings),
     )
-
