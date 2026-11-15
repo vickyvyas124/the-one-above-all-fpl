@@ -34,7 +34,19 @@ from fpl_transfer import (
     exact_fpl_tenths,
     pounds_millions_to_tenths,
 )
-from fpl_intelligence.dashboard import load_dashboard_snapshot
+from fpl_intelligence.dashboard import default_store_path, load_dashboard_snapshot
+from fpl_intelligence.copilot import (
+    CopilotStoreError,
+    combine_assessments,
+    evaluate_user_observation,
+    list_evaluations,
+    list_user_observations,
+    record_user_assessment,
+    record_user_observation,
+    record_verified_mapping,
+)
+from fpl_intelligence.ingest import collect_match
+from fpl_intelligence.sources.statsbomb_open_data import StatsBombOpenDataAdapter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -3289,6 +3301,149 @@ with intelligence_tab:
                     "Source time": _insight.source_timestamp or "Unknown",
                 })
             st.dataframe(pd.DataFrame(_intelligence_rows[:200]), width="stretch", hide_index=True)
+    st.divider()
+    st.subheader("FPL Co-Pilot · private observations")
+    st.caption(
+        "Notes and mapping records are append-only in the deployment's configured local store. "
+        "Persistence depends on the host; this is not encrypted private storage. Do not enter sensitive personal details. "
+        "Notes never alter FPL forecasts or transfer decisions."
+    )
+    _copilot_root = default_store_path()
+    _copilot_col1, _copilot_col2 = st.columns(2)
+    with _copilot_col1:
+        st.markdown("**Collect one selected historical StatsBomb match**")
+        st.caption("This runs only when submitted. No FPL endpoint is called by this collector; keep the local data store private.")
+        with st.form("copilot_statsbomb_ingest"):
+            _ingest_competition = st.number_input("StatsBomb competition ID", min_value=1, value=1, step=1)
+            _ingest_season = st.number_input("StatsBomb season ID", min_value=1, value=1, step=1)
+            _ingest_fixture = st.number_input("StatsBomb match ID", min_value=1, value=1, step=1)
+            _ingest_clicked = st.form_submit_button("Fetch and store selected match")
+        if _ingest_clicked:
+            try:
+                _ingest_result = collect_match(
+                    StatsBombOpenDataAdapter(), _copilot_root,
+                    competition_id=int(_ingest_competition), season_id=int(_ingest_season),
+                    match_id=int(_ingest_fixture),
+                )
+                _cached_football_intelligence_snapshot.clear()
+                st.success(
+                    f"{_ingest_result.status.value}: {_ingest_result.observations} player observations; "
+                    f"duplicate={_ingest_result.duplicate}."
+                )
+                st.rerun()
+                for _ingest_warning in _ingest_result.warnings:
+                    st.warning(_ingest_warning)
+            except Exception as _ingest_error:
+                st.error(f"Selected match collection failed: {type(_ingest_error).__name__}: {_ingest_error}")
+    with _copilot_col2:
+        st.markdown("**Verify a source-to-FPL identity**")
+        st.caption("No name matching is performed. Confirm the historical identity and season yourself; uncertain links must remain unmapped.")
+        _fpl_identity_options = {
+            int(_player["id"]): f"{_player.get('web_name', 'Unknown')} · ID {_player['id']}"
+            for _player in players if isinstance(_player, dict) and _player.get("id") is not None
+        }
+        with st.form("copilot_identity_mapping"):
+            _map_season = st.text_input("Source season label (exactly as in source data)", placeholder="2024/2025")
+            _map_source_player_id = st.text_input("Source player ID")
+            _map_source_player_name = st.text_input("Source player name")
+            _map_fpl_player_id = st.selectbox(
+                "FPL player", options=sorted(_fpl_identity_options),
+                format_func=lambda _pid: _fpl_identity_options[_pid],
+            )
+            _map_evidence = st.text_input("How did you verify this identity?")
+            _map_confirmed = st.checkbox("I manually verified this exact season-specific identity")
+            _map_clicked = st.form_submit_button("Save verified mapping")
+        if _map_clicked:
+            try:
+                record_verified_mapping(
+                    _copilot_root, source_id="statsbomb_open_data", season=_map_season,
+                    source_player_id=_map_source_player_id, fpl_player_id=int(_map_fpl_player_id),
+                    source_player_name=_map_source_player_name,
+                    fpl_player_name=_fpl_identity_options[int(_map_fpl_player_id)],
+                    verified_by="manager", evidence=_map_evidence, confirmed=_map_confirmed,
+                )
+                st.success("Verified season-specific mapping saved.")
+            except (ValueError, OSError, CopilotStoreError) as _mapping_error:
+                st.error(f"Mapping not saved: {_mapping_error}")
+    st.markdown("**Add a human observation**")
+    with st.form("copilot_observation_note"):
+        _note_col1, _note_col2 = st.columns(2)
+        with _note_col1:
+            _note_author = st.text_input("Author", value="Manager")
+            _note_season = st.text_input("Source season", placeholder="2024/2025")
+        with _note_col2:
+            _note_has_claim = st.checkbox("Attach a structured, testable metric claim")
+            _note_player_id = st.selectbox(
+                "Claimed FPL player", options=sorted(_fpl_identity_options),
+                format_func=lambda _pid: _fpl_identity_options[_pid], disabled=not _note_has_claim,
+            )
+        _note_text = st.text_area("Observation or hypothesis")
+        _note_metric = _note_operator = _note_threshold = None
+        if _note_has_claim:
+            _claim_col1, _claim_col2, _claim_col3 = st.columns(3)
+            with _claim_col1:
+                _note_metric = st.selectbox("Measured source metric", [
+                    "minutes", "shots", "shots_on_target", "xg", "xa", "key_passes",
+                    "chances_created", "touches_attacking_area", "touches_in_box", "defensive_actions",
+                ])
+            with _claim_col2:
+                _note_operator = st.selectbox("Claim", ["at_least", "at_most", "greater_than", "less_than", "equals"])
+            with _claim_col3:
+                _note_threshold = st.number_input("Threshold", min_value=0.0, value=1.0, step=0.1)
+        _note_clicked = st.form_submit_button("Save private observation")
+    if _note_clicked:
+        try:
+            _new_note_id = record_user_observation(
+                _copilot_root, text=_note_text, author=_note_author, season=_note_season,
+                fpl_player_id=int(_note_player_id) if _note_has_claim else None,
+                metric=_note_metric, operator=_note_operator, threshold=_note_threshold,
+            )
+            st.success(f"Observation saved · `{_new_note_id[:12]}`")
+        except (ValueError, OSError, CopilotStoreError) as _note_error:
+            st.error(f"Observation not saved: {_note_error}")
+    _saved_notes = list_user_observations(_copilot_root)
+    if _saved_notes:
+        st.markdown("**Evaluate a saved observation**")
+        # The content-addressed filename is the stable note ID used by the ledger.
+        _note_files = sorted((_copilot_root / "copilot" / "notes").glob("*.json"))
+        _note_ids = [path.stem for path in _note_files]
+        _note_labels = {path.stem: f"{json.loads(path.read_text(encoding='utf-8')).get('text', '')[:70]} · {path.stem[:10]}"
+                        for path in _note_files}
+        _evaluation_col1, _evaluation_col2 = st.columns([2, 1])
+        with _evaluation_col1:
+            _selected_note_id = st.selectbox("Observation", _note_ids,
+                                             format_func=lambda _note_id: _note_labels[_note_id])
+        with _evaluation_col2:
+            _user_verdict = st.selectbox("Your assessment", [
+                "AGREE", "PARTIALLY_AGREE", "DISAGREE", "INSUFFICIENT_DATA",
+            ])
+        if st.button("Compare evidence and record USER / AI / COMBINED", key="copilot_evaluate"):
+            try:
+                _fresh_snapshot = load_dashboard_snapshot(_copilot_root)
+                _ai_evaluation = evaluate_user_observation(
+                    _copilot_root, _selected_note_id, _fresh_snapshot.observations,
+                )
+                _user_evaluation_id = record_user_assessment(
+                    _copilot_root, note_id=_selected_note_id, verdict=_user_verdict,
+                )
+                _combined_evaluation = combine_assessments(
+                    _copilot_root, note_id=_selected_note_id, user_verdict=_user_verdict,
+                    ai_verdict=_ai_evaluation["verdict"],
+                    user_assessment_id=_user_evaluation_id,
+                    ai_assessment_id=_ai_evaluation["evaluation_id"],
+                )
+                st.write({
+                    "USER": _user_verdict,
+                    "AI · deterministic rules, not an LLM": _ai_evaluation["verdict"],
+                    "COMBINED": _combined_evaluation["verdict"],
+                    "matched evidence rows": _ai_evaluation["evidence_count"],
+                    "reason": _ai_evaluation["reason"],
+                })
+            except (ValueError, OSError, CopilotStoreError) as _evaluation_error:
+                st.error(f"Evaluation could not be saved: {_evaluation_error}")
+        _saved_evaluations = list_evaluations(_copilot_root)
+        if _saved_evaluations:
+            st.caption(f"Append-only evaluation ledger: {len(_saved_evaluations)} records.")
     if _intelligence_snapshot.warnings:
         with st.expander("Data-quality warnings", expanded=False):
             for _warning in _intelligence_snapshot.warnings[:20]:
