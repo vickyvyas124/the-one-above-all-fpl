@@ -201,7 +201,10 @@ class DashboardNavigationAppTests(unittest.TestCase):
         self.assertTrue(callable(score_starting_xi))
         self.assertTrue(callable(select_model_lineup))
         app_source = (Path(__file__).parents[1] / "app.py").read_text(encoding="utf-8")
-        self.assertIn("from fpl_lineup import score_starting_xi, select_model_lineup", app_source)
+        self.assertIn(
+            "from fpl_lineup import published_lineup_from_picks, score_starting_xi, select_model_lineup",
+            app_source,
+        )
 
     def test_dashboard_tabs_recommendation_and_existing_controls_render(self):
         app_path = Path(__file__).parents[1] / "app.py"
