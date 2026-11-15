@@ -9,7 +9,8 @@ from fpl_squad import apply_public_transfers, load_public_squad, validate_squad_
 def player_map():
     roles = [1, 1] + [2] * 5 + [3] * 5 + [4] * 3
     roles.append(4)
-    return {pid: {"id": pid, "element_type": role} for pid, role in enumerate(roles, 1)}
+    return {pid: {"id": pid, "element_type": role, "team": (pid - 1) // 3 + 1}
+            for pid, role in enumerate(roles, 1)}
 
 
 def picks():
@@ -55,7 +56,7 @@ class PreDeadlineSquadTests(unittest.TestCase):
         )
 
     def test_upcoming_404_uses_valid_prior_picks_and_applies_verified_transfer(self):
-        self.players[16] = {"id": 16, "element_type": 4}
+        self.players[16] = {"id": 16, "element_type": 4, "team": 6}
         result = self.load(
             rows=[{"event": 9, "time": "2026-10-29T10:00:00Z", "element_out": 13,
                    "element_in": 16, "element_in_cost": 65}],
@@ -72,8 +73,8 @@ class PreDeadlineSquadTests(unittest.TestCase):
         self.assertIn("provisional until GW9 picks publish", result["reason"])
 
     def test_transactions_are_applied_in_chronological_order(self):
-        self.players[16] = {"id": 16, "element_type": 4}
-        self.players[17] = {"id": 17, "element_type": 4}
+        self.players[16] = {"id": 16, "element_type": 4, "team": 6}
+        self.players[17] = {"id": 17, "element_type": 4, "team": 7}
         roster, applied, valid, _ = apply_public_transfers(
             list(range(1, 16)),
             [
@@ -134,7 +135,7 @@ class PreDeadlineSquadTests(unittest.TestCase):
         valid, _ = validate_squad_ids(ids, self.players)
         self.assertTrue(valid)
         corrected = ids[:-1] + [16]
-        self.players[16] = {"id": 16, "element_type": 4}
+        self.players[16] = {"id": 16, "element_type": 4, "team": 6}
         self.assertTrue(validate_squad_ids(corrected, self.players)[0])
         self.assertFalse(validate_squad_ids(corrected[:-1], self.players)[0])
 
