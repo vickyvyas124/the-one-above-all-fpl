@@ -134,7 +134,7 @@ class FootballIntelligenceCopilotTests(unittest.TestCase):
         self.assertEqual(combined["ai_assessment_id"], ai_result["evaluation_id"])
         self.assertEqual(combined["verdict"], "INSUFFICIENT_DATA")
         channels = {row["channel"] for row in list_evaluations(self.root)}
-        self.assertEqual(channels, {"USER", "COMBINED"})
+        self.assertEqual(channels, {"USER", "AI_RULE_BASED", "COMBINED"})
 
 
 if __name__ == "__main__":
