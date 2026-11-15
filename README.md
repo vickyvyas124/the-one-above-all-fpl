@@ -25,3 +25,5 @@ Phase 3 adds a deadline-safe context bridge to the existing FPL baseline, while 
 ## Phase 4: dashboard and collection status
 
 Phase 4 adds a read-only dashboard for optional locally collected football intelligence. It does not change FPL recommendations or schedule data collection; current source coverage is historical and incomplete. See [the Phase 4 dashboard and collection limits](docs/FOOTBALL_INTELLIGENCE_PHASE4.md).
+
+Phase 5 adds a time-safe walk-forward evaluator for future intelligence candidate forecasts. It compares candidates with the unchanged FPL baseline and `ep_next` on common cohorts, but does not train or promote a candidate because deadline-aligned intelligence data is not yet available. See [the Phase 5 validation and promotion gates](docs/FOOTBALL_INTELLIGENCE_PHASE5.md).
