@@ -133,14 +133,15 @@ def _validate_forecast(row: WalkForwardForecast) -> None:
 
 
 def _as_metrics(values: dict[str, object], prefix: str) -> dict[str, float | int | None]:
+    score_prefix = "Model" if prefix == "Candidate" else prefix
     selected = {
         "Players": values.get("Players"),
-        "MAE": values.get(f"{prefix} MAE"),
-        "RMSE": values.get(f"{prefix} RMSE"),
-        "Bias": values.get(f"{prefix} bias"),
-        "Spearman": values.get(f"{prefix} Spearman"),
-        "Top-10 capture": values.get(f"{prefix} top-10 capture"),
-        "Top-20 capture": values.get(f"{prefix} top-20 capture"),
+        "MAE": values.get(f"{score_prefix} MAE"),
+        "RMSE": values.get(f"{score_prefix} RMSE"),
+        "Bias": values.get(f"{score_prefix} bias"),
+        "Spearman": values.get(f"{score_prefix} Spearman"),
+        "Top-10 capture": values.get(f"{score_prefix} top-10 capture"),
+        "Top-20 capture": values.get(f"{score_prefix} top-20 capture"),
     }
     # The shared FPL scorer reports MAE, bias, rank and capture; add RMSE over
     # the same complete matched rows without changing its established metrics.
