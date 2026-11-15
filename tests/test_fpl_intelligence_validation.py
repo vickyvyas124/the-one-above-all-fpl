@@ -51,7 +51,7 @@ class FootballIntelligenceValidationTests(unittest.TestCase):
 
     def test_repeatable_walk_forward_gain_is_only_eligible_for_human_review(self):
         report = evaluate_walk_forward(forecasts())
-        self.assertEqual(report.status, "ELIGIBLE_FOR_HUMAN_REVIEW")
+        self.assertEqual(report.status, "ELIGIBLE_FOR_HUMAN_REVIEW", report.gate_reasons)
         self.assertFalse(report.promotion_allowed)
         self.assertEqual(report.season_count, 2)
         self.assertEqual(report.gameweek_count, 12)
