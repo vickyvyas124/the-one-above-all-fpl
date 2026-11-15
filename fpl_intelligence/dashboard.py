@@ -31,6 +31,7 @@ class DashboardSnapshot:
     last_data_retrieved_utc: str | None
     analysis: AnalysisResult | None
     warnings: tuple[str, ...]
+    observations: tuple[PlayerMatchObservation, ...] = ()
 
 
 def default_store_path() -> Path:
@@ -179,4 +180,5 @@ def load_dashboard_snapshot(root: str | Path | None = None) -> DashboardSnapshot
     return DashboardSnapshot(
         str(store), state, len(latest), result.fixture_count, result.observation_count,
         result.analyzed_player_count, statuses, last_success, result, tuple(warnings),
+        tuple(observations),
     )
